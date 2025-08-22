@@ -135,6 +135,10 @@ bool live_disconnect(LiveGraph* lg, int source_id, int dest_id);
 void process_live_block(LiveGraph* lg, int nframes);
 int find_live_output(LiveGraph* lg);
 
+// ===================== Live Engine Operations =====================
+
+void process_next_block(LiveGraph* lg, float* output_buffer, int nframes);
+
 // ===================== Global Engine Instance =====================
 
 extern Engine g_engine;

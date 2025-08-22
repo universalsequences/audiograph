@@ -725,3 +725,25 @@ int find_live_output(LiveGraph *lg) {
   }
   return -1;
 }
+
+// ===================== Live Engine Implementation =====================
+void process_next_block(LiveGraph *lg, float *output_buffer, int nframes) {
+  if (!lg || !output_buffer || nframes <= 0) {
+    // Clear output buffer if invalid input
+    if (output_buffer && nframes > 0) {
+      memset(output_buffer, 0, nframes * sizeof(float));
+    }
+    return;
+  }
+
+  process_live_block(lg, nframes);
+  int output_node = find_live_output(lg);
+  if (output_node >= 0 && lg->nodes[output_node].nInputs > 0) {
+    int master_edge = lg->nodes[output_node].inEdges[0];
+    memcpy(output_buffer, lg->edge_buffers[master_edge],
+           nframes * sizeof(float));
+  } else {
+    // handle case where theres no output node (silence)
+    memset(output_buffer, 0, nframes * sizeof(float));
+  }
+}
