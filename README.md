@@ -55,6 +55,126 @@ AudioGraph was created to address fundamental limitations in existing audio fram
                     └─────────────────┘
 ```
 
+## Node Kernel Design
+
+AudioGraph achieves its flexibility and performance through a simple **kernel abstraction**. Every audio processing node is represented by a lightweight kernel with a uniform interface:
+
+### The NodeVTable Interface
+
+```c
+typedef struct {
+    KernelFn  process;    // Core audio processing function
+    InitFn    init;       // Optional: initialize state  
+    ResetFn   reset;      // Optional: reset to initial state
+    MigrateFn migrate;    // Optional: copy state during hot-swap
+} NodeVTable;
+```
+
+### Kernel Function Signature
+
+```c
+void process(float* const* inputs,   // Array of input buffers
+             float* const* outputs,  // Array of output buffers  
+             int nframes,            // Number of samples to process
+             void* state);           // Node's private state
+```
+
+### Benefits of the Kernel Model
+
+**🔧 Simplicity**: Each node is just a function that processes audio buffers
+- No inheritance hierarchies or complex object models
+- Easy to understand, debug, and optimize
+- Minimal API surface area
+
+**⚡ Performance**: Direct function calls with zero virtual dispatch overhead
+- Compiles to efficient machine code  
+- Cache-friendly memory layout
+- No allocations in processing path
+
+**🔄 Hot-swappable**: Nodes can be replaced without stopping audio
+- State migration via optional `migrate()` function
+- Engine handles scheduling and buffer management
+- Zero-downtime graph updates
+
+**🧵 Thread-safe**: Kernels are pure functions (given same input → same output)
+- No shared mutable state between calls
+- Safe for parallel execution across worker threads
+- Deterministic behavior for testing
+
+### Example: Oscillator Kernel
+
+```c
+typedef struct {
+    float phase, inc;  // Private state
+} OscState;
+
+void osc_process(float* const* in, float* const* out, int n, void* st) {
+    OscState* s = (OscState*)st;
+    float* y = out[0];
+    
+    for(int i = 0; i < n; i++) {
+        y[i] = 2.0f * s->phase - 1.0f;  // Generate sawtooth
+        s->phase += s->inc;
+        if(s->phase >= 1.f) s->phase -= 1.f;
+    }
+}
+
+const NodeVTable OSC_VTABLE = {
+    .process = osc_process,
+    .init = osc_init,
+    .migrate = osc_migrate
+};
+```
+
+### AudioNode: High-Level Wrapper
+
+The `AudioNode` provides a user-friendly interface over the kernel system:
+
+```c
+typedef struct AudioNode {
+    uint64_t logical_id;     // Unique identifier for parameter targeting
+    NodeVTable vtable;       // Contains the actual processing kernel
+    void* state;             // Kernel's private state (OscState, GainState, etc.)
+    
+    // Connection tracking (build-time only) 
+    struct AudioNode** inputs;
+    struct AudioNode** outputs;
+    // ... connection management fields
+} AudioNode;
+```
+
+**Kernel ↔ AudioNode Relationship:**
+
+```c
+// 1. Create AudioNode with kernel
+AudioNode* osc = create_oscillator(gb, 440.0f, "A4");
+// Internally sets: osc->vtable = OSC_VTABLE, osc->state = OscState{...}
+
+// 2. Graph compilation converts AudioNode → RTNode
+GraphState* graph = compile_graph(gb, 48000, 128, "my_graph");
+// RTNode now contains the kernel for direct execution
+
+// 3. Engine calls kernel directly
+RTNode* node = &graph->nodes[i];
+node->vtable.process(inputs, outputs, nframes, node->state);
+```
+
+**The Two-Phase Design:**
+
+1. **Build Phase**: `AudioNode` provides Web Audio-style API (`connect()`, `create_oscillator()`)
+2. **Runtime Phase**: `RTNode` strips away build-time data, keeps only the kernel + state
+
+This separation enables:
+- **Easy graph construction** through intuitive AudioNode API
+- **Maximum performance** by removing abstraction overhead at runtime
+- **Memory efficiency** by discarding connection metadata after compilation
+
+This kernel model enables AudioGraph to:
+- **Scale processing** across multiple CPU cores
+- **Live-edit graphs** by swapping kernels while audio runs  
+- **Maintain real-time guarantees** through predictable execution
+- **Support any DSP algorithm** via the simple function interface
+
 ## Building
 
 ```bash
