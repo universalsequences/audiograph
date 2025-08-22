@@ -2,13 +2,36 @@
 
 A modular, real-time audio graph processing engine written in C11 with Swift integration support.
 
+## Motivation
+
+AudioGraph was created to address fundamental limitations in existing audio frameworks:
+
+### AVAudioEngine Limitations
+- **Graph Restart Required**: Disconnecting certain node types forces a complete engine restart, causing audio dropouts
+- **No Live Editing**: Cannot safely modify the graph structure while audio is playing
+- **Single-threaded Processing**: All nodes process sequentially, wasting multi-core CPU potential
+- **Limited Node Types**: Restricted to Apple's predefined node categories
+
+### JUCE Limitations  
+- **No Multi-threading**: Audio graph processing is fundamentally single-threaded
+- **Complex Live Editing**: Modifying graphs during playback requires careful manual synchronization
+- **Performance Bottlenecks**: Large graphs become CPU-bound on single cores
+
+### AudioGraph Solution
+- ✅ **True Live Editing**: Add, remove, and reconnect nodes while audio streams continuously
+- ✅ **Multi-threaded Engine**: Parallel node processing with lock-free scheduling
+- ✅ **Zero-dropout Hot-swapping**: Replace entire graphs with seamless crossfading  
+- ✅ **Web Audio-style API**: Intuitive `connect()` and `disconnect()` operations
+- ✅ **Real-time Safe**: No allocations or locks in audio callback path
+
 ## Features
 
 - **Modular Architecture**: Clean separation between API, engine, and DSP nodes
-- **Real-time Processing**: Lock-free scheduling with worker thread pool
+- **Real-time Processing**: Lock-free MPSC scheduling with configurable worker thread pool
 - **Live Editing**: Web Audio-style dynamic graph modification while audio is running
-- **Hot-swapping**: Seamless graph replacement with crossfading
+- **Hot-swapping**: Seamless graph replacement with crossfading (no dropouts)
 - **Swift Ready**: C API designed for easy Swift/Core Audio integration
+- **High Performance**: Parallel processing scales with CPU cores
 
 ## Architecture
 
