@@ -175,6 +175,110 @@ This kernel model enables AudioGraph to:
 - **Maintain real-time guarantees** through predictable execution
 - **Support any DSP algorithm** via the simple function interface
 
+## Parameter Updates
+
+AudioGraph provides **lock-free parameter updates** that allow real-time control of node parameters without blocking the audio thread.
+
+### SPSC Parameter Ring
+
+Parameters are sent via a **Single Producer, Single Consumer** lock-free ring buffer:
+
+```c
+typedef struct {
+    uint64_t idx;        // Parameter index (e.g., PARAM_SET_GAIN)
+    uint64_t logical_id; // Target node identifier  
+    float fvalue;        // New parameter value
+} ParamMsg;
+
+typedef struct ParamRing {
+    ParamMsg buf[PARAM_RING_CAP];  // Fixed-size ring buffer
+    _Atomic uint32_t head;         // Producer writes here
+    _Atomic uint32_t tail;         // Consumer reads here
+} ParamRing;
+```
+
+### Thread-Safe Parameter Flow
+
+```
+UI Thread                    Audio Thread
+─────────────                ────────────
+params_push() ──────────────→ apply_params()
+   │                             │
+   ├─ Write to ring buffer       ├─ Read from ring buffer  
+   ├─ Update head pointer        ├─ Update node state
+   └─ Never blocks               └─ Update tail pointer
+```
+
+### Usage Example
+
+```c
+// From UI/control thread (never blocks)
+ParamMsg msg = {
+    .idx = PARAM_SET_GAIN,
+    .logical_id = 0x3333,    // Target gain node
+    .fvalue = 0.8f           // New gain value
+};
+params_push(graph->params, msg);
+
+// In audio thread (before processing each block)
+apply_params(graph);  // Reads all pending parameters
+```
+
+### Parameter Application
+
+The audio thread processes parameters before each block:
+
+```c
+void apply_params(GraphState* g) {
+    ParamMsg m;
+    while(params_pop(g->params, &m)) {           // Drain all pending
+        for(int i = 0; i < g->nodeCount; i++) {
+            if(g->nodes[i].logical_id == m.logical_id) {
+                if(m.idx == PARAM_SET_GAIN) {
+                    GainState* st = (GainState*)g->nodes[i].state;
+                    st->g = m.fvalue;            // Update parameter
+                }
+            }
+        }
+    }
+}
+```
+
+### Key Benefits
+
+**🚫 No Locks**: Lock-free ring buffer never blocks either thread
+- Audio thread maintains real-time guarantees
+- UI thread never stalls waiting for audio
+
+**⚡ Low Latency**: Parameters apply within one audio block
+- Typical latency: 128 samples ≈ 2.7ms at 48kHz
+- Immediate response for live performance
+
+**🎯 Targeted Updates**: Each parameter targets specific nodes via `logical_id`
+- Efficient lookup using stable node identifiers
+- Multiple parameters can update simultaneously
+
+**🔒 Thread Safe**: Atomic operations ensure consistency
+- No torn reads/writes of parameter values
+- Safe concurrent access from multiple threads
+
+### Swift Integration
+
+```swift
+extension AudioGraphEngine {
+    func setGain(nodeId: UInt64, value: Float) {
+        let msg = ParamMsg(
+            idx: PARAM_SET_GAIN,
+            logical_id: nodeId,
+            fvalue: value
+        )
+        params_push(liveGraph.pointee.params, msg)
+    }
+}
+```
+
+This parameter system enables **smooth real-time control** without sacrificing audio thread performance or introducing dropouts.
+
 ## Building
 
 ```bash
