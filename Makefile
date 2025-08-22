@@ -47,4 +47,23 @@ valgrind: $(TARGET)
 profile: $(TARGET)
 	instruments -t "Time Profiler" ./$(TARGET)
 
-.PHONY: all debug release run clean valgrind profile
+# Test targets
+test: test_mpmc_queue test_engine_workers
+	./test_mpmc_queue
+	./test_engine_workers
+
+# Build MPMC queue unit tests
+test_mpmc_queue: test_mpmc_queue.c $(HEADERS) graph_engine.o graph_nodes.o
+	$(CC) $(CFLAGS) -o test_mpmc_queue test_mpmc_queue.c graph_engine.o graph_nodes.o
+
+# Build engine worker race condition tests (the real test!)
+test_engine_workers: test_engine_workers.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o
+	$(CC) $(CFLAGS) -o test_engine_workers test_engine_workers.c graph_engine.o graph_nodes.o graph_api.o
+
+# Clean up test artifacts
+clean: clean_tests
+
+clean_tests:
+	rm -f test_mpmc_queue test_livegraph_workers test_engine_workers
+
+.PHONY: all debug release run clean valgrind profile test clean_tests

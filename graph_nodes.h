@@ -30,6 +30,7 @@ void gain_process(float* const* in, float* const* out, int n, void* memory);
 // Mixer functions
 void mix2_process(float* const* in, float* const* out, int n, void* memory);
 void mix3_process(float* const* in, float* const* out, int n, void* memory);
+void mix8_process(float* const* in, float* const* out, int n, void* memory);
 
 // ===================== Node VTables =====================
 

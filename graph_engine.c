@@ -7,24 +7,13 @@ Engine g_engine; // single global for demo
 
 // ===================== Ready Queue Operations =====================
 
+// Legacy ring buffer functions (now use MPMC queue underneath)
 bool rb_push_mpsc(GraphState *g, int32_t v) {
-  uint32_t head = atomic_load_explicit(&g->head, memory_order_relaxed);
-  uint32_t next = head + 1;
-  if ((next - atomic_load_explicit(&g->tail, memory_order_acquire)) >
-      g->readyMask)
-    return false; // full
-  g->readyRing[head & g->readyMask] = v;
-  atomic_store_explicit(&g->head, next, memory_order_release);
-  return true;
+  return mpmc_push(g->readyQueue, v);
 }
 
 bool rb_pop_sc(GraphState *g, int32_t *out) {
-  uint32_t tail = atomic_load_explicit(&g->tail, memory_order_relaxed);
-  if (tail == atomic_load_explicit(&g->head, memory_order_acquire))
-    return false; // empty
-  *out = g->readyRing[tail & g->readyMask];
-  atomic_store_explicit(&g->tail, tail + 1, memory_order_release);
-  return true;
+  return mpmc_pop(g->readyQueue, out);
 }
 
 // ===================== Graph Management =====================
@@ -42,8 +31,12 @@ GraphState *alloc_graph(int nodeCount, int edgeCount, int maxBlock,
   for (int e = 0; e < edgeCount; e++) {
     g->edgeBufs[e] = (float *)alloc_aligned(64, maxBlock * sizeof(float));
   }
-  g->readyMask = 1024 - 1;
-  g->readyRing = (int32_t *)calloc(g->readyMask + 1, sizeof(int32_t));
+  // Create MPMC queue for work distribution (power of 2 capacity)
+  g->readyQueue = mpmc_create(1024);
+  if (!g->readyQueue) {
+    free_graph(g);
+    return NULL;
+  }
   g->params = (ParamRing *)calloc(1, sizeof(ParamRing));
   return g;
 }
@@ -62,7 +55,7 @@ void free_graph(GraphState *g) {
   }
   free(g->nodes);
   free(g->pending);
-  free(g->readyRing);
+  mpmc_destroy(g->readyQueue);
   free(g->params);
   free(g);
 }
@@ -108,16 +101,91 @@ void apply_params(GraphState *g) {
 
 void bind_and_run(GraphState *g, int nid, int nframes) {
   RTNode *node = &g->nodes[nid];
+  
+  // Debug output: Show which thread is processing which node
+  pthread_t thread_id = pthread_self();
+  printf("    [WORKER %lu] Processing node_id=%d (logical_id=%llu) for %d samples\n", 
+         (unsigned long)thread_id, nid, node->logical_id, nframes);
+  
+  // RACE DETECTION: Check if this node is already being processed
+  static _Atomic int processing_nodes[64] = {0}; // Assumes max 64 nodes
+  int expected = 0;
+  if (!atomic_compare_exchange_strong(&processing_nodes[nid], &expected, 1)) {
+    printf("    [RACE DETECTED] Node %d already being processed by another worker!\n", nid);
+  }
+  
+  printf("    [DEBUG] node_id=%d has %d inputs, %d outputs\n", nid, node->nInputs, node->nOutputs);
+  
+  // Skip processing nodes with no outputs - they're just master edge markers
+  if (node->nOutputs == 0) {
+    printf("    [WORKER %lu] Skipping node_id=%d (no outputs - master edge marker)\n", 
+           (unsigned long)thread_id, nid);
+    // RACE DETECTION: Reset processing flag
+    atomic_store(&processing_nodes[nid], 0);
+    return;
+  }
+  
   float *inPtrsStatic[MAX_IO];
   float *outPtrsStatic[MAX_IO];
+  if (g->edgeBufs == NULL) {
+    printf("    [ERROR] g->edgeBufs is NULL!\n");
+    return;
+  }
+  
   for (int i = 0; i < node->nInputs; i++) {
-    inPtrsStatic[i] = g->edgeBufs[node->inEdges[i]];
+    int edge_idx = node->inEdges[i];
+    printf("    [DEBUG] Input %d: edge_idx=%d\n", i, edge_idx);
+    if (edge_idx < 0 || edge_idx >= g->edgeCount) {
+      printf("    [ERROR] Invalid input edge index %d (edgeCount=%d)\n", edge_idx, g->edgeCount);
+      return;
+    }
+    if (g->edgeBufs[edge_idx] == NULL) {
+      printf("    [ERROR] Input edge buffer %d is NULL\n", edge_idx);
+      return;
+    }
+    inPtrsStatic[i] = g->edgeBufs[edge_idx];
   }
+  
   for (int i = 0; i < node->nOutputs; i++) {
-    outPtrsStatic[i] = g->edgeBufs[node->outEdges[i]];
+    int edge_idx = node->outEdges[i];
+    printf("    [DEBUG] Output %d: edge_idx=%d\n", i, edge_idx);
+    if (edge_idx < 0 || edge_idx >= g->edgeCount) {
+      printf("    [ERROR] Invalid output edge index %d (edgeCount=%d)\n", edge_idx, g->edgeCount);
+      return;
+    }
+    if (g->edgeBufs[edge_idx] == NULL) {
+      printf("    [ERROR] Output edge buffer %d is NULL\n", edge_idx);
+      return;
+    }
+    outPtrsStatic[i] = g->edgeBufs[edge_idx];
   }
+  // DEBUG: Verify state pointer integrity
+  printf("    [STATE_DEBUG] node_id=%d state_ptr=%p\n", nid, (void*)node->state);
+  if (node->state != NULL && node->vtable.process == osc_process) {
+    float* mem = (float*)node->state;
+    printf("    [STATE_DEBUG] Before process: phase=%.6f, inc=%.6f\n", mem[0], mem[1]);
+  }
+  
   node->vtable.process((float *const *)inPtrsStatic,
                        (float *const *)outPtrsStatic, nframes, node->state);
+                       
+  // DEBUG: Check state after processing
+  if (node->state != NULL && node->vtable.process == osc_process) {
+    float* mem = (float*)node->state;
+    printf("    [STATE_DEBUG] After process: phase=%.6f, inc=%.6f\n", mem[0], mem[1]);
+  }
+                       
+  // RACE DETECTION: Reset processing flag
+  atomic_store(&processing_nodes[nid], 0);
+  
+  // DEBUG: Show first few samples of each output buffer
+  for (int i = 0; i < node->nOutputs; i++) {
+    printf("    [OUTPUT] node_id=%d output[%d]: [%.6f, %.6f, %.6f, %.6f]\n", 
+           nid, i, outPtrsStatic[i][0], outPtrsStatic[i][1], outPtrsStatic[i][2], outPtrsStatic[i][3]);
+  }
+                       
+  printf("    [WORKER %lu] Completed node_id=%d (logical_id=%llu)\n", 
+         (unsigned long)thread_id, nid, node->logical_id);
 }
 
 static void *worker_main(void *arg) {
@@ -152,6 +220,8 @@ static void *worker_main(void *arg) {
       // Go back to top of worker loop to check for new work
       continue;
     }
+    printf("    [WORKER %lu] About to call bind_and_run(nid=%d, nframes=%d)\n", 
+           (unsigned long)pthread_self(), nid, g_engine.blockSize);
     bind_and_run(g, nid, g_engine.blockSize);
     RTNode *node = &g->nodes[nid];
     // loop through each node that depends on this node's output
@@ -179,10 +249,7 @@ static void *worker_main(void *arg) {
 }
 
 void process_block_parallel(GraphState *g, int nframes) {
-  // reset ring and pending
-  atomic_store_explicit(&g->head, 0, memory_order_relaxed);
-  atomic_store_explicit(&g->tail, 0, memory_order_relaxed);
-
+  // reset pending counts (MPMC queue doesn't need manual reset)
   for (int i = 0; i < g->nodeCount; i++) {
     atomic_store_explicit(&g->pending[i], g->nodes[i].faninBase,
                           memory_order_relaxed);
@@ -205,6 +272,11 @@ void process_block_parallel(GraphState *g, int nframes) {
     int32_t nid;
     // read a new job from the ready queue
     if (rb_pop_sc(g, &nid)) {
+      // TODO(human): This is the core issue - every thread processes the same nframes (128).
+      // In task-parallel design, each node should be processed once with full block size.
+      // But we're seeing 0-sample calls, suggesting job duplication or scheduling errors.
+      printf("    [AUDIO THREAD %lu] About to call bind_and_run(nid=%d, nframes=%d)\n", 
+             (unsigned long)pthread_self(), nid, nframes);
       bind_and_run(g, nid, nframes);
       RTNode *node = &g->nodes[nid];
       for (int i = 0; i < node->succCount; i++) {
@@ -226,8 +298,7 @@ void process_block_parallel(GraphState *g, int nframes) {
 }
 
 void process_block_single(GraphState *g, int nframes) {
-  atomic_store_explicit(&g->head, 0, memory_order_relaxed);
-  atomic_store_explicit(&g->tail, 0, memory_order_relaxed);
+  // Reset pending counts (MPMC queue doesn't need manual reset)
   for (int i = 0; i < g->nodeCount; i++) {
     atomic_store_explicit(&g->pending[i], g->nodes[i].faninBase,
                           memory_order_relaxed);
@@ -311,9 +382,22 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   lg->connection_capacity = initial_capacity * 8;
   lg->connections = calloc(lg->connection_capacity, sizeof(LiveConnection));
 
-  // Ready queue
-  lg->readyMask = 1024 - 1;
-  lg->readyRing = calloc(lg->readyMask + 1, sizeof(int32_t));
+  // Ready queue (MPMC for thread safety)
+  lg->readyQueue = mpmc_create(1024);
+  if (!lg->readyQueue) {
+    // Handle allocation failure
+    for (int i = 0; i < lg->edge_capacity; i++) {
+      free(lg->edge_buffers[i]);
+    }
+    free(lg->edge_buffers);
+    free(lg->edge_free);
+    free(lg->connections);
+    free(lg->nodes);
+    free(lg->pending);
+    free(lg->is_orphaned);
+    free(lg);
+    return NULL;
+  }
 
   // Parameter mailbox
   lg->params = calloc(1, sizeof(ParamRing));
@@ -548,23 +632,11 @@ bool live_disconnect(LiveGraph *lg, int source_id, int dest_id) {
 
 // Helper functions for live graph processing
 static inline bool rb_push_mpsc_live(LiveGraph *lg, int32_t v) {
-  uint32_t head = atomic_load_explicit(&lg->head, memory_order_relaxed);
-  uint32_t next = head + 1;
-  if ((next - atomic_load_explicit(&lg->tail, memory_order_acquire)) >
-      lg->readyMask)
-    return false; // full
-  lg->readyRing[head & lg->readyMask] = v;
-  atomic_store_explicit(&lg->head, next, memory_order_release);
-  return true;
+  return mpmc_push(lg->readyQueue, v);
 }
 
 static inline bool rb_pop_sc_live(LiveGraph *lg, int32_t *out) {
-  uint32_t tail = atomic_load_explicit(&lg->tail, memory_order_relaxed);
-  if (tail == atomic_load_explicit(&lg->head, memory_order_acquire))
-    return false; // empty
-  *out = lg->readyRing[tail & lg->readyMask];
-  atomic_store_explicit(&lg->tail, tail + 1, memory_order_release);
-  return true;
+  return mpmc_pop(lg->readyQueue, out);
 }
 
 static void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
@@ -625,10 +697,7 @@ static void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
 }
 
 void process_live_block(LiveGraph *lg, int nframes) {
-  // Reset scheduling state
-  atomic_store_explicit(&lg->head, 0, memory_order_relaxed);
-  atomic_store_explicit(&lg->tail, 0, memory_order_relaxed);
-
+  // Reset scheduling state (MPMC queue doesn't need manual reset)
   for (int i = 0; i < lg->node_count; i++) {
     if (lg->is_orphaned[i]) {
       // Orphaned nodes don't participate in scheduling

@@ -28,11 +28,8 @@ typedef struct GraphState {
 
     // per-block scheduling state
     atomic_int* pending;           // size=nodeCount
-    int32_t*    readyRing;         // ring buffer for ready node indices
-    uint32_t    readyMask;         // capacity = mask+1 (power of 2)
-    _Atomic uint32_t head;         // producers push
-    _Atomic uint32_t tail;         // consumers pop
-    _Atomic int      jobsInFlight;
+    MPMCQueue*  readyQueue;        // MPMC work queue for thread-safe job distribution
+    _Atomic int jobsInFlight;
 
     // parameter mailbox (SPSC) for this graph
     ParamRing* params;
@@ -69,10 +66,7 @@ typedef struct LiveGraph {
     
     // Scheduling state (same as GraphState)
     atomic_int* pending;
-    int32_t* readyRing;
-    uint32_t readyMask;
-    _Atomic uint32_t head;
-    _Atomic uint32_t tail;
+    MPMCQueue* readyQueue;         // MPMC work queue for thread-safe job distribution
     _Atomic int jobsInFlight;
     
     // Parameter mailbox
@@ -102,8 +96,9 @@ typedef struct Engine {
 
 // ===================== Ready Queue Operations =====================
 
-bool rb_push_mpsc(GraphState* g, int32_t v);
-bool rb_pop_sc(GraphState* g, int32_t* out);
+// Legacy ring buffer functions (replaced by MPMC queue)
+bool rb_push_mpsc(GraphState* g, int32_t v);  // Deprecated: use mpmc_push(g->readyQueue, v)
+bool rb_pop_sc(GraphState* g, int32_t* out);  // Deprecated: use mpmc_pop(g->readyQueue, out)
 
 // ===================== Graph Management =====================
 
