@@ -2,51 +2,55 @@
 
 // ===================== Oscillator Implementation =====================
 
-void osc_init(void* st, int sr, int maxBlock) {
+void osc_init(void* memory, int sr, int maxBlock) {
     (void)sr; 
     (void)maxBlock; 
-    OscState* s = (OscState*)st; 
-    s->phase = 0.f;
+    float* mem = (float*)memory;
+    mem[OSC_PHASE] = 0.0f;
+    // OSC_INC should be set during node creation
 }
 
-void osc_process(float* const* in, float* const* out, int n, void* st) {
+void osc_process(float* const* in, float* const* out, int n, void* memory) {
     (void)in; 
-    OscState* s = (OscState*)st; 
+    float* mem = (float*)memory;
     float* y = out[0];
+    
     for(int i = 0; i < n; i++) {
-        y[i] = 2.0f * s->phase - 1.0f; 
-        s->phase += s->inc; 
-        if(s->phase >= 1.f) s->phase -= 1.f;
+        y[i] = 2.0f * mem[OSC_PHASE] - 1.0f; 
+        mem[OSC_PHASE] += mem[OSC_INC]; 
+        if(mem[OSC_PHASE] >= 1.f) mem[OSC_PHASE] -= 1.f;
     }
 }
 
-void osc_migrate(void* newState, const void* oldState) {
-    const OscState* o = (const OscState*)oldState; 
-    OscState* n = (OscState*)newState; 
-    n->phase = o->phase;
+void osc_migrate(void* newMemory, const void* oldMemory) {
+    const float* oldMem = (const float*)oldMemory; 
+    float* newMem = (float*)newMemory; 
+    newMem[OSC_PHASE] = oldMem[OSC_PHASE];
+    // OSC_INC typically doesn't need migration (set during creation)
 }
 
 // ===================== Gain Implementation =====================
 
-void gain_process(float* const* in, float* const* out, int n, void* st) {
-    float g = ((GainState*)st)->g; 
+void gain_process(float* const* in, float* const* out, int n, void* memory) {
+    float* mem = (float*)memory;
+    float gain = mem[GAIN_VALUE]; 
     const float* a = in[0]; 
     float* y = out[0]; 
-    for(int i = 0; i < n; i++) y[i] = a[i] * g;
+    for(int i = 0; i < n; i++) y[i] = a[i] * gain;
 }
 
 // ===================== Mixer Implementations =====================
 
-void mix2_process(float* const* in, float* const* out, int n, void* st) {
-    (void)st; 
+void mix2_process(float* const* in, float* const* out, int n, void* memory) {
+    (void)memory; // Mixers have no state
     const float* a = in[0]; 
     const float* b = in[1]; 
     float* y = out[0]; 
     for(int i = 0; i < n; i++) y[i] = a[i] + b[i];
 }
 
-void mix3_process(float* const* in, float* const* out, int n, void* st) {
-    (void)st; 
+void mix3_process(float* const* in, float* const* out, int n, void* memory) {
+    (void)memory; // Mixers have no state
     const float* a = in[0]; 
     const float* b = in[1]; 
     const float* c = in[2]; 
@@ -76,3 +80,4 @@ const NodeVTable MIX2_VTABLE = {
     .reset = NULL,
     .migrate = NULL
 };
+

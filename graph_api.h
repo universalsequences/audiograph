@@ -43,6 +43,15 @@ AudioNode* create_gain(GraphBuilder* gb, float gain_value, const char* name);
 AudioNode* create_mixer2(GraphBuilder* gb, const char* name);
 AudioNode* create_mixer3(GraphBuilder* gb, const char* name);
 
+// ===================== Generic Node Creation Helper =====================
+
+AudioNode* create_generic_node(GraphBuilder* gb, 
+                               KernelFn process_fn,
+                               int memory_size,
+                               int num_inputs,
+                               int num_outputs,
+                               const char* name);
+
 // ===================== Connection API =====================
 
 void connect(AudioNode* source, AudioNode* dest);

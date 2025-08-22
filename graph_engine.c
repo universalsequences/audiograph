@@ -95,9 +95,9 @@ void apply_params(GraphState *g) {
   while (params_pop(g->params, &m)) {
     for (int i = 0; i < g->nodeCount; i++) {
       if (g->nodes[i].logical_id == m.logical_id) {
-        if (m.idx == 1) {
-          GainState *st = (GainState *)g->nodes[i].state;
-          st->g = m.fvalue;
+        if (g->nodes[i].state) {  // Only apply if node has memory
+          float* memory = (float*)g->nodes[i].state;
+          memory[m.idx] = m.fvalue;  // Direct indexed access
         }
       }
     }
@@ -371,16 +371,16 @@ int live_add_node(LiveGraph *lg, NodeVTable vtable, void *state,
 }
 
 int live_add_oscillator(LiveGraph *lg, float freq_hz, const char *name) {
-  OscState *state = calloc(1, sizeof(OscState));
-  state->inc = freq_hz / 48000.0f;
-  state->phase = 0.0f;
-  return live_add_node(lg, OSC_VTABLE, state, ++g_next_node_id, name);
+  float* memory = calloc(OSC_MEMORY_SIZE, sizeof(float));
+  memory[OSC_PHASE] = 0.0f;
+  memory[OSC_INC] = freq_hz / 48000.0f;
+  return live_add_node(lg, OSC_VTABLE, memory, ++g_next_node_id, name);
 }
 
 int live_add_gain(LiveGraph *lg, float gain_value, const char *name) {
-  GainState *state = calloc(1, sizeof(GainState));
-  state->g = gain_value;
-  return live_add_node(lg, GAIN_VTABLE, state, ++g_next_node_id, name);
+  float* memory = calloc(GAIN_MEMORY_SIZE, sizeof(float));
+  memory[GAIN_VALUE] = gain_value;
+  return live_add_node(lg, GAIN_VTABLE, memory, ++g_next_node_id, name);
 }
 
 int live_add_mixer2(LiveGraph *lg, const char *name) {

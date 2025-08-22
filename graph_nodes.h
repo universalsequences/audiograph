@@ -3,35 +3,39 @@
 
 #include "graph_types.h"
 
-// ===================== Node State Structures =====================
+// ===================== Node Memory Layout =====================
 
-typedef struct {
-    float phase;
-    float inc;
-} OscState;
+// Oscillator memory layout
+#define OSC_MEMORY_SIZE 2
+#define OSC_PHASE 0
+#define OSC_INC   1
 
-typedef struct {
-    float g;
-} GainState;
+// Gain memory layout  
+#define GAIN_MEMORY_SIZE 1
+#define GAIN_VALUE 0
+
+// Mixer has no state
+#define MIX_MEMORY_SIZE 0
 
 // ===================== Node Processing Functions =====================
 
 // Oscillator functions
-void osc_init(void* st, int sr, int maxBlock);
-void osc_process(float* const* in, float* const* out, int n, void* st);
-void osc_migrate(void* newState, const void* oldState);
+void osc_init(void* memory, int sr, int maxBlock);
+void osc_process(float* const* in, float* const* out, int n, void* memory);
+void osc_migrate(void* newMemory, const void* oldMemory);
 
 // Gain function
-void gain_process(float* const* in, float* const* out, int n, void* st);
+void gain_process(float* const* in, float* const* out, int n, void* memory);
 
 // Mixer functions
-void mix2_process(float* const* in, float* const* out, int n, void* st);
-void mix3_process(float* const* in, float* const* out, int n, void* st);
+void mix2_process(float* const* in, float* const* out, int n, void* memory);
+void mix3_process(float* const* in, float* const* out, int n, void* memory);
 
 // ===================== Node VTables =====================
 
 extern const NodeVTable OSC_VTABLE;
 extern const NodeVTable GAIN_VTABLE;
 extern const NodeVTable MIX2_VTABLE;
+
 
 #endif // GRAPH_NODES_H

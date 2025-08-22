@@ -49,11 +49,11 @@ AudioNode* create_oscillator(GraphBuilder* gb, float freq_hz, const char* name) 
     node->vtable = OSC_VTABLE;
     node->name = name;
     
-    // Allocate and initialize state
-    OscState* state = calloc(1, sizeof(OscState));
-    state->inc = freq_hz / 48000.0f; // assume 48kHz for now
-    state->phase = 0.0f;
-    node->state = state;
+    // Allocate and initialize memory
+    float* memory = calloc(OSC_MEMORY_SIZE, sizeof(float));
+    memory[OSC_PHASE] = 0.0f;
+    memory[OSC_INC] = freq_hz / 48000.0f; // assume 48kHz for now
+    node->state = memory;
     
     add_node_to_builder(gb, node);
     return node;
@@ -65,10 +65,10 @@ AudioNode* create_gain(GraphBuilder* gb, float gain_value, const char* name) {
     node->vtable = GAIN_VTABLE;
     node->name = name;
     
-    // Allocate and initialize state
-    GainState* state = calloc(1, sizeof(GainState));
-    state->g = gain_value;
-    node->state = state;
+    // Allocate and initialize memory
+    float* memory = calloc(GAIN_MEMORY_SIZE, sizeof(float));
+    memory[GAIN_VALUE] = gain_value;
+    node->state = memory;
     
     add_node_to_builder(gb, node);
     return node;
@@ -79,7 +79,7 @@ AudioNode* create_mixer2(GraphBuilder* gb, const char* name) {
     node->logical_id = ++g_next_node_id;
     node->vtable = MIX2_VTABLE;
     node->name = name;
-    node->state = NULL; // mixer doesn't need state
+    node->state = NULL; // mixer has no memory
     
     add_node_to_builder(gb, node);
     return node;
@@ -95,7 +95,45 @@ AudioNode* create_mixer3(GraphBuilder* gb, const char* name) {
         .migrate = NULL 
     };
     node->name = name;
-    node->state = NULL; // mixer doesn't need state
+    node->state = NULL; // mixer has no memory
+    
+    add_node_to_builder(gb, node);
+    return node;
+}
+
+// ===================== Generic Node Creation Helper =====================
+
+AudioNode* create_generic_node(GraphBuilder* gb, 
+                               KernelFn process_fn,
+                               int memory_size,
+                               int num_inputs,
+                               int num_outputs,
+                               const char* name) {
+    AudioNode* node = calloc(1, sizeof(AudioNode));
+    if (!node) return NULL;
+    
+    node->logical_id = ++g_next_node_id;
+    node->vtable.process = process_fn;
+    node->vtable.init = NULL;      // Generic nodes don't have init by default
+    node->vtable.reset = NULL;
+    node->vtable.migrate = NULL;   // Generic nodes don't migrate by default
+    node->name = name;
+    
+    // Allocate memory if needed
+    if (memory_size > 0) {
+        node->state = calloc(memory_size, sizeof(float));
+        if (!node->state) {
+            free(node);
+            return NULL;
+        }
+    } else {
+        node->state = NULL;
+    }
+    
+    // Store I/O counts for potential future use
+    // (Currently AudioNode doesn't store these, but RTNode will get them during compilation)
+    (void)num_inputs;
+    (void)num_outputs;
     
     add_node_to_builder(gb, node);
     return node;

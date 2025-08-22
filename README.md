@@ -101,21 +101,24 @@ void process(float* const* inputs,   // Array of input buffers
 - Safe for parallel execution across worker threads
 - Deterministic behavior for testing
 
-### Example: Oscillator Kernel
+### Node Memory Model
+
+State is represented as a simple **float array** with indexed parameters:
 
 ```c
-typedef struct {
-    float phase, inc;  // Private state
-} OscState;
+// Oscillator memory layout
+#define OSC_MEMORY_SIZE 2
+#define OSC_PHASE 0
+#define OSC_INC   1
 
-void osc_process(float* const* in, float* const* out, int n, void* st) {
-    OscState* s = (OscState*)st;
+void osc_process(float* const* in, float* const* out, int n, void* memory) {
+    float* mem = (float*)memory;
     float* y = out[0];
     
     for(int i = 0; i < n; i++) {
-        y[i] = 2.0f * s->phase - 1.0f;  // Generate sawtooth
-        s->phase += s->inc;
-        if(s->phase >= 1.f) s->phase -= 1.f;
+        y[i] = 2.0f * mem[OSC_PHASE] - 1.0f;  // Generate sawtooth
+        mem[OSC_PHASE] += mem[OSC_INC];
+        if(mem[OSC_PHASE] >= 1.f) mem[OSC_PHASE] -= 1.f;
     }
 }
 
@@ -126,6 +129,25 @@ const NodeVTable OSC_VTABLE = {
 };
 ```
 
+### Generic Node Creation
+
+```c
+// Create any node type with a simple helper
+AudioNode* my_filter = create_generic_node(
+    gb,                    // GraphBuilder
+    my_filter_process,     // Process function
+    FILTER_MEMORY_SIZE,    // Memory slots needed
+    1,                     // Number of inputs  
+    1,                     // Number of outputs
+    "lowpass"              // Name
+);
+
+// Initialize parameters directly
+float* memory = (float*)my_filter->state;
+memory[CUTOFF_FREQ] = 1000.0f;
+memory[RESONANCE] = 0.7f;
+```
+
 ### AudioNode: High-Level Wrapper
 
 The `AudioNode` provides a user-friendly interface over the kernel system:
@@ -134,7 +156,7 @@ The `AudioNode` provides a user-friendly interface over the kernel system:
 typedef struct AudioNode {
     uint64_t logical_id;     // Unique identifier for parameter targeting
     NodeVTable vtable;       // Contains the actual processing kernel
-    void* state;             // Kernel's private state (OscState, GainState, etc.)
+    void* state;             // Kernel's memory array (float*)
     
     // Connection tracking (build-time only) 
     struct AudioNode** inputs;
@@ -148,7 +170,7 @@ typedef struct AudioNode {
 ```c
 // 1. Create AudioNode with kernel
 AudioNode* osc = create_oscillator(gb, 440.0f, "A4");
-// Internally sets: osc->vtable = OSC_VTABLE, osc->state = OscState{...}
+// Internally: osc->vtable = OSC_VTABLE, osc->state = float[OSC_MEMORY_SIZE]
 
 // 2. Graph compilation converts AudioNode → RTNode
 GraphState* graph = compile_graph(gb, 48000, 128, "my_graph");
@@ -157,6 +179,7 @@ GraphState* graph = compile_graph(gb, 48000, 128, "my_graph");
 // 3. Engine calls kernel directly
 RTNode* node = &graph->nodes[i];
 node->vtable.process(inputs, outputs, nframes, node->state);
+// node->state points to the float array with indexed parameters
 ```
 
 **The Two-Phase Design:**
@@ -214,7 +237,7 @@ params_push() ──────────────→ apply_params()
 ```c
 // From UI/control thread (never blocks)
 ParamMsg msg = {
-    .idx = PARAM_SET_GAIN,
+    .idx = GAIN_VALUE,       // Direct memory index
     .logical_id = 0x3333,    // Target gain node
     .fvalue = 0.8f           // New gain value
 };
@@ -234,9 +257,9 @@ void apply_params(GraphState* g) {
     while(params_pop(g->params, &m)) {           // Drain all pending
         for(int i = 0; i < g->nodeCount; i++) {
             if(g->nodes[i].logical_id == m.logical_id) {
-                if(m.idx == PARAM_SET_GAIN) {
-                    GainState* st = (GainState*)g->nodes[i].state;
-                    st->g = m.fvalue;            // Update parameter
+                if(g->nodes[i].state) {          // Only if node has memory
+                    float* memory = (float*)g->nodes[i].state;
+                    memory[m.idx] = m.fvalue;    // Direct indexed update
                 }
             }
         }
@@ -268,9 +291,18 @@ void apply_params(GraphState* g) {
 extension AudioGraphEngine {
     func setGain(nodeId: UInt64, value: Float) {
         let msg = ParamMsg(
-            idx: PARAM_SET_GAIN,
+            idx: GAIN_VALUE,         // Direct memory index
             logical_id: nodeId,
             fvalue: value
+        )
+        params_push(liveGraph.pointee.params, msg)
+    }
+    
+    func setOscillatorFreq(nodeId: UInt64, freq: Float) {
+        let msg = ParamMsg(
+            idx: OSC_INC,           // Frequency increment parameter
+            logical_id: nodeId,
+            fvalue: freq / 48000.0  // Convert to phase increment
         )
         params_push(liveGraph.pointee.params, msg)
     }
