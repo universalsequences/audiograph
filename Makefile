@@ -1,17 +1,27 @@
 # Makefile for multi-threaded audio graph system
-# Builds the graph.c demo with proper C11 threading support
+# Builds the modular audio graph demo with proper C11 threading support
 
 CC = gcc
 CFLAGS = -std=c11 -O2 -Wall -Wextra -pthread
 TARGET = audiograph
-SOURCE = graph.c
+
+# Source files for the modular build
+SOURCES = main.c graph_nodes.c graph_engine.c graph_api.c
+OBJECTS = $(SOURCES:.c=.o)
+
+# Header dependencies
+HEADERS = graph_types.h graph_nodes.h graph_engine.h graph_api.h
 
 # Default target
 all: $(TARGET)
 
 # Build the main executable
-$(TARGET): $(SOURCE)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCE)
+$(TARGET): $(OBJECTS)
+	$(CC) $(CFLAGS) -o $(TARGET) $(OBJECTS)
+
+# Build object files
+%.o: %.c $(HEADERS)
+	$(CC) $(CFLAGS) -c $< -o $@
 
 # Debug build with more verbose output and debug symbols
 debug: CFLAGS += -g -DDEBUG -O0
@@ -27,7 +37,7 @@ run: $(TARGET)
 
 # Clean up build artifacts
 clean:
-	rm -f $(TARGET) $(TARGET).dSYM a.out
+	rm -f $(TARGET) $(OBJECTS) $(TARGET).dSYM a.out
 
 # Check for memory leaks (macOS)
 valgrind: $(TARGET)
