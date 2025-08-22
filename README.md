@@ -471,66 +471,6 @@ module AudioGraphC {
 }
 ```
 
-### Alternative: Pre-compiled Library Approach
-
-If you prefer using the pre-compiled library:
-
-#### 1. Package.swift with System Library
-
-```swift
-let package = Package(
-    name: "MyAudioApp",
-    platforms: [.macOS(.v10_15)],
-    products: [
-        .executable(name: "MyAudioApp", targets: ["MyAudioApp"])
-    ],
-    targets: [
-        .systemLibrary(
-            name: "AudioGraphC",
-            path: "Sources/AudioGraphC",
-            pkgConfig: "audiograph",
-            providers: [.brew(["audiograph"])]  // If you publish to homebrew
-        ),
-        .executableTarget(
-            name: "MyAudioApp", 
-            dependencies: ["AudioGraphC"]
-        )
-    ]
-)
-```
-
-#### 2. Create pkg-config File
-
-Create `/usr/local/lib/pkgconfig/audiograph.pc`:
-
-```
-prefix=/usr/local
-exec_prefix=${prefix}
-libdir=${exec_prefix}/lib
-includedir=${prefix}/include
-
-Name: AudioGraph
-Description: Real-time audio graph processing engine
-Version: 1.0.0
-Libs: -L${libdir} -laudiograph -lpthread
-Cflags: -I${includedir}
-```
-
-#### 3. Install Library and Headers
-
-```bash
-# Copy library
-sudo cp libaudiograph.a /usr/local/lib/
-
-# Copy headers  
-sudo mkdir -p /usr/local/include/audiograph
-sudo cp *.h /usr/local/include/audiograph/
-
-# Update library cache
-sudo ldconfig  # Linux
-# or
-sudo update_dyld_shared_cache  # macOS
-```
 
 ### Building and Running
 
