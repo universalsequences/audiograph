@@ -48,9 +48,12 @@ profile: $(TARGET)
 	instruments -t "Time Profiler" ./$(TARGET)
 
 # Test targets
-test: test_mpmc_queue test_engine_workers
+test: test_mpmc_queue test_engine_workers test_live_graph_multithreaded test_live_graph_workers test_live_graph_partial_connections
 	./test_mpmc_queue
 	./test_engine_workers
+	./test_live_graph_multithreaded
+	./test_live_graph_workers
+	./test_live_graph_partial_connections
 
 # Build MPMC queue unit tests
 test_mpmc_queue: test_mpmc_queue.c $(HEADERS) graph_engine.o graph_nodes.o
@@ -60,10 +63,22 @@ test_mpmc_queue: test_mpmc_queue.c $(HEADERS) graph_engine.o graph_nodes.o
 test_engine_workers: test_engine_workers.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o
 	$(CC) $(CFLAGS) -o test_engine_workers test_engine_workers.c graph_engine.o graph_nodes.o graph_api.o
 
+# Build live graph multi-threading test
+test_live_graph_multithreaded: test_live_graph_multithreaded.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o
+	$(CC) $(CFLAGS) -o test_live_graph_multithreaded test_live_graph_multithreaded.c graph_engine.o graph_nodes.o graph_api.o
+
+# Build live graph worker race condition tests (equivalent to engine workers test)
+test_live_graph_workers: test_live_graph_workers.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o
+	$(CC) $(CFLAGS) -o test_live_graph_workers test_live_graph_workers.c graph_engine.o graph_nodes.o graph_api.o
+
+# Build live graph partial connections test (orphaned nodes test)
+test_live_graph_partial_connections: test_live_graph_partial_connections.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o
+	$(CC) $(CFLAGS) -o test_live_graph_partial_connections test_live_graph_partial_connections.c graph_engine.o graph_nodes.o graph_api.o
+
 # Clean up test artifacts
 clean: clean_tests
 
 clean_tests:
-	rm -f test_mpmc_queue test_livegraph_workers test_engine_workers
+	rm -f test_mpmc_queue test_livegraph_workers test_engine_workers test_live_graph_multithreaded test_live_graph_workers test_live_graph_partial_connections
 
 .PHONY: all debug release run clean valgrind profile test clean_tests

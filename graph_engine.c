@@ -1,6 +1,10 @@
 #include "graph_engine.h"
 #include "graph_nodes.h"
 
+// ===================== Forward Declarations =====================
+
+void bind_and_run_live(LiveGraph *lg, int nid, int nframes);
+
 // ===================== Global Engine Instance =====================
 
 Engine g_engine; // single global for demo
@@ -88,9 +92,9 @@ void apply_params(GraphState *g) {
   while (params_pop(g->params, &m)) {
     for (int i = 0; i < g->nodeCount; i++) {
       if (g->nodes[i].logical_id == m.logical_id) {
-        if (g->nodes[i].state) {  // Only apply if node has memory
-          float* memory = (float*)g->nodes[i].state;
-          memory[m.idx] = m.fvalue;  // Direct indexed access
+        if (g->nodes[i].state) { // Only apply if node has memory
+          float *memory = (float *)g->nodes[i].state;
+          memory[m.idx] = m.fvalue; // Direct indexed access
         }
       }
     }
@@ -101,42 +105,48 @@ void apply_params(GraphState *g) {
 
 void bind_and_run(GraphState *g, int nid, int nframes) {
   RTNode *node = &g->nodes[nid];
-  
+
   // Debug output: Show which thread is processing which node
   pthread_t thread_id = pthread_self();
-  printf("    [WORKER %lu] Processing node_id=%d (logical_id=%llu) for %d samples\n", 
+  printf("    [WORKER %lu] Processing node_id=%d (logical_id=%llu) for %d "
+         "samples\n",
          (unsigned long)thread_id, nid, node->logical_id, nframes);
-  
+
   // RACE DETECTION: Check if this node is already being processed
   static _Atomic int processing_nodes[64] = {0}; // Assumes max 64 nodes
   int expected = 0;
   if (!atomic_compare_exchange_strong(&processing_nodes[nid], &expected, 1)) {
-    printf("    [RACE DETECTED] Node %d already being processed by another worker!\n", nid);
+    printf("    [RACE DETECTED] Node %d already being processed by another "
+           "worker!\n",
+           nid);
   }
-  
-  printf("    [DEBUG] node_id=%d has %d inputs, %d outputs\n", nid, node->nInputs, node->nOutputs);
-  
+
+  printf("    [DEBUG] node_id=%d has %d inputs, %d outputs\n", nid,
+         node->nInputs, node->nOutputs);
+
   // Skip processing nodes with no outputs - they're just master edge markers
   if (node->nOutputs == 0) {
-    printf("    [WORKER %lu] Skipping node_id=%d (no outputs - master edge marker)\n", 
+    printf("    [WORKER %lu] Skipping node_id=%d (no outputs - master edge "
+           "marker)\n",
            (unsigned long)thread_id, nid);
     // RACE DETECTION: Reset processing flag
     atomic_store(&processing_nodes[nid], 0);
     return;
   }
-  
+
   float *inPtrsStatic[MAX_IO];
   float *outPtrsStatic[MAX_IO];
   if (g->edgeBufs == NULL) {
     printf("    [ERROR] g->edgeBufs is NULL!\n");
     return;
   }
-  
+
   for (int i = 0; i < node->nInputs; i++) {
     int edge_idx = node->inEdges[i];
     printf("    [DEBUG] Input %d: edge_idx=%d\n", i, edge_idx);
     if (edge_idx < 0 || edge_idx >= g->edgeCount) {
-      printf("    [ERROR] Invalid input edge index %d (edgeCount=%d)\n", edge_idx, g->edgeCount);
+      printf("    [ERROR] Invalid input edge index %d (edgeCount=%d)\n",
+             edge_idx, g->edgeCount);
       return;
     }
     if (g->edgeBufs[edge_idx] == NULL) {
@@ -145,12 +155,13 @@ void bind_and_run(GraphState *g, int nid, int nframes) {
     }
     inPtrsStatic[i] = g->edgeBufs[edge_idx];
   }
-  
+
   for (int i = 0; i < node->nOutputs; i++) {
     int edge_idx = node->outEdges[i];
     printf("    [DEBUG] Output %d: edge_idx=%d\n", i, edge_idx);
     if (edge_idx < 0 || edge_idx >= g->edgeCount) {
-      printf("    [ERROR] Invalid output edge index %d (edgeCount=%d)\n", edge_idx, g->edgeCount);
+      printf("    [ERROR] Invalid output edge index %d (edgeCount=%d)\n",
+             edge_idx, g->edgeCount);
       return;
     }
     if (g->edgeBufs[edge_idx] == NULL) {
@@ -160,31 +171,35 @@ void bind_and_run(GraphState *g, int nid, int nframes) {
     outPtrsStatic[i] = g->edgeBufs[edge_idx];
   }
   // DEBUG: Verify state pointer integrity
-  printf("    [STATE_DEBUG] node_id=%d state_ptr=%p\n", nid, (void*)node->state);
+  printf("    [STATE_DEBUG] node_id=%d state_ptr=%p\n", nid,
+         (void *)node->state);
   if (node->state != NULL && node->vtable.process == osc_process) {
-    float* mem = (float*)node->state;
-    printf("    [STATE_DEBUG] Before process: phase=%.6f, inc=%.6f\n", mem[0], mem[1]);
+    float *mem = (float *)node->state;
+    printf("    [STATE_DEBUG] Before process: phase=%.6f, inc=%.6f\n", mem[0],
+           mem[1]);
   }
-  
+
   node->vtable.process((float *const *)inPtrsStatic,
                        (float *const *)outPtrsStatic, nframes, node->state);
-                       
+
   // DEBUG: Check state after processing
   if (node->state != NULL && node->vtable.process == osc_process) {
-    float* mem = (float*)node->state;
-    printf("    [STATE_DEBUG] After process: phase=%.6f, inc=%.6f\n", mem[0], mem[1]);
+    float *mem = (float *)node->state;
+    printf("    [STATE_DEBUG] After process: phase=%.6f, inc=%.6f\n", mem[0],
+           mem[1]);
   }
-                       
+
   // RACE DETECTION: Reset processing flag
   atomic_store(&processing_nodes[nid], 0);
-  
+
   // DEBUG: Show first few samples of each output buffer
   for (int i = 0; i < node->nOutputs; i++) {
-    printf("    [OUTPUT] node_id=%d output[%d]: [%.6f, %.6f, %.6f, %.6f]\n", 
-           nid, i, outPtrsStatic[i][0], outPtrsStatic[i][1], outPtrsStatic[i][2], outPtrsStatic[i][3]);
+    printf("    [OUTPUT] node_id=%d output[%d]: [%.6f, %.6f, %.6f, %.6f]\n",
+           nid, i, outPtrsStatic[i][0], outPtrsStatic[i][1],
+           outPtrsStatic[i][2], outPtrsStatic[i][3]);
   }
-                       
-  printf("    [WORKER %lu] Completed node_id=%d (logical_id=%llu)\n", 
+
+  printf("    [WORKER %lu] Completed node_id=%d (logical_id=%llu)\n",
          (unsigned long)thread_id, nid, node->logical_id);
 }
 
@@ -193,15 +208,42 @@ static void *worker_main(void *arg) {
   for (;;) {
     if (!atomic_load_explicit(&g_engine.runFlag, memory_order_acquire))
       break;
-    GraphState *g =
+
+    LiveGraph *lg =
         atomic_load_explicit(&g_engine.workSession, memory_order_acquire);
-    if (!g) {
+    if (!lg) {
       sched_yield();
       continue;
     }
+
     int32_t nid;
-    // Try to get a ready node from the work queue
-    if (!rb_pop_sc(g, &nid)) {
+    // Try to get a ready node from the live graph's MPMC queue
+    if (mpmc_pop(lg->readyQueue, &nid)) {
+      pthread_t thread_id = pthread_self();
+      printf("    [LIVE_WORKER %lu] Processing node_id=%d for %d frames\n",
+             (unsigned long)thread_id, nid, g_engine.blockSize);
+
+      bind_and_run_live(lg, nid, g_engine.blockSize);
+      RTNode *node = &lg->nodes[nid];
+
+      // Notify successors
+      if (node->succ && node->succCount > 0) {
+        for (int i = 0; i < node->succCount; i++) {
+          int succ = node->succ[i];
+          if (succ >= 0 && succ < lg->node_count && !lg->is_orphaned[succ]) {
+            if (atomic_fetch_sub_explicit(&lg->pending[succ], 1,
+                                          memory_order_acq_rel) == 1) {
+              while (!mpmc_push(lg->readyQueue, succ)) {
+                __asm__ __volatile__("" ::: "memory");
+              }
+            }
+          }
+        }
+      }
+      atomic_fetch_sub_explicit(&lg->jobsInFlight, 1, memory_order_acq_rel);
+      printf("    [LIVE_WORKER %lu] Completed node_id=%d\n",
+             (unsigned long)thread_id, nid);
+    } else {
       // Queue is empty - use hybrid spin-yield strategy:
 
       // First, do a brief spin loop (64 iterations) to avoid syscall overhead
@@ -220,30 +262,6 @@ static void *worker_main(void *arg) {
       // Go back to top of worker loop to check for new work
       continue;
     }
-    printf("    [WORKER %lu] About to call bind_and_run(nid=%d, nframes=%d)\n", 
-           (unsigned long)pthread_self(), nid, g_engine.blockSize);
-    bind_and_run(g, nid, g_engine.blockSize);
-    RTNode *node = &g->nodes[nid];
-    // loop through each node that depends on this node's output
-    for (int i = 0; i < node->succCount; i++) {
-      int succ = node->succ[i];
-      // note: pending[succ] = how many dependencies the successor is still
-      // waiting for
-      if (atomic_fetch_sub_explicit(&g->pending[succ], 1,
-                                    memory_order_acq_rel) == 1) {
-        // this was the LAST dependency the successor was waiting for
-        // successor is now ready to run (all its inputs are satisfied)
-
-        // try to add successor to ready queue
-        // note: this loop spins if queue if full (rare, but ensures we don't
-        // lose work)
-        while (!rb_push_mpsc(g, succ)) {
-          __asm__ __volatile__("" ::: "memory");
-        }
-      }
-    }
-    // we've completed a job, so decrement jobsInFlight
-    atomic_fetch_sub_explicit(&g->jobsInFlight, 1, memory_order_acq_rel);
   }
   return NULL;
 }
@@ -272,10 +290,12 @@ void process_block_parallel(GraphState *g, int nframes) {
     int32_t nid;
     // read a new job from the ready queue
     if (rb_pop_sc(g, &nid)) {
-      // TODO(human): This is the core issue - every thread processes the same nframes (128).
-      // In task-parallel design, each node should be processed once with full block size.
-      // But we're seeing 0-sample calls, suggesting job duplication or scheduling errors.
-      printf("    [AUDIO THREAD %lu] About to call bind_and_run(nid=%d, nframes=%d)\n", 
+      // TODO(human): This is the core issue - every thread processes the same
+      // nframes (128). In task-parallel design, each node should be processed
+      // once with full block size. But we're seeing 0-sample calls, suggesting
+      // job duplication or scheduling errors.
+      printf("    [AUDIO THREAD %lu] About to call bind_and_run(nid=%d, "
+             "nframes=%d)\n",
              (unsigned long)pthread_self(), nid, nframes);
       bind_and_run(g, nid, nframes);
       RTNode *node = &g->nodes[nid];
@@ -402,6 +422,9 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   // Parameter mailbox
   lg->params = calloc(1, sizeof(ParamRing));
 
+  // Initialize DAC node (no DAC connected initially)
+  lg->dac_node_id = -1;
+
   lg->label = label;
   return lg;
 }
@@ -449,27 +472,46 @@ int live_add_node(LiveGraph *lg, NodeVTable vtable, void *state,
   node->outEdges = NULL;
   node->succ = NULL;
 
+  // Initialize orphaned state - new nodes with no connections start as orphaned
+  // They will be marked as non-orphaned when they get connected to the signal
+  // path
+  lg->is_orphaned[node_id] = true;
+
   lg->node_count++;
 
   return node_id;
 }
 
 int live_add_oscillator(LiveGraph *lg, float freq_hz, const char *name) {
-  float* memory = calloc(OSC_MEMORY_SIZE, sizeof(float));
+  float *memory = calloc(OSC_MEMORY_SIZE, sizeof(float));
   memory[OSC_PHASE] = 0.0f;
   memory[OSC_INC] = freq_hz / 48000.0f;
   return live_add_node(lg, OSC_VTABLE, memory, ++g_next_node_id, name);
 }
 
 int live_add_gain(LiveGraph *lg, float gain_value, const char *name) {
-  float* memory = calloc(GAIN_MEMORY_SIZE, sizeof(float));
+  float *memory = calloc(GAIN_MEMORY_SIZE, sizeof(float));
   memory[GAIN_VALUE] = gain_value;
+
+  // TODO(human): The mixer dependency race happens here. When we add gains and
+  // connect them to the mixer, we need to ensure proper dependency counting so
+  // the mixer waits for BOTH gains to complete before processing. Currently,
+  // the mixer might process with only one input ready, causing 50% output.
+  // Please fix the dependency tracking logic in the schedule_ready_nodes or
+  // process_live_block functions to ensure proper ordering.
+
   return live_add_node(lg, GAIN_VTABLE, memory, ++g_next_node_id, name);
 }
 
 int live_add_mixer2(LiveGraph *lg, const char *name) {
   return live_add_node(lg, MIX2_VTABLE, NULL, ++g_next_node_id, name);
 }
+
+int live_add_mixer8(LiveGraph *lg, const char *name) {
+  return live_add_node(lg, MIX8_VTABLE, NULL, ++g_next_node_id, name);
+}
+
+// DAC function moved after helper function declarations
 
 // Helper functions for live connections
 static void add_input_edge(RTNode *node, int edge_id) {
@@ -493,6 +535,50 @@ static void add_successor(RTNode *node, int succ_id) {
   node->succ = realloc(node->succ, (node->succCount + 1) * sizeof(int32_t));
   node->succ[node->succCount] = succ_id;
   node->succCount++;
+}
+
+// Recursive function to mark nodes reachable from DAC
+static void mark_reachable_from_dac(LiveGraph *lg, int node_id, bool *visited) {
+  if (node_id < 0 || node_id >= lg->node_count || visited[node_id]) {
+    return;
+  }
+  
+  visited[node_id] = true;
+  lg->is_orphaned[node_id] = false; // Mark as not orphaned
+  
+  RTNode *node = &lg->nodes[node_id];
+  // Traverse backwards through input edges to find all nodes that feed this one
+  for (int i = 0; i < node->nInputs; i++) {
+    int edge_id = node->inEdges[i];
+    // Find the source node that outputs to this edge
+    for (int j = 0; j < lg->node_count; j++) {
+      RTNode *potential_source = &lg->nodes[j];
+      for (int k = 0; k < potential_source->nOutputs; k++) {
+        if (potential_source->outEdges[k] == edge_id) {
+          mark_reachable_from_dac(lg, j, visited);
+          break;
+        }
+      }
+    }
+  }
+}
+
+// Update orphaned status for all nodes based on DAC reachability
+static void update_orphaned_status(LiveGraph *lg) {
+  // First, mark all nodes as orphaned
+  for (int i = 0; i < lg->node_count; i++) {
+    lg->is_orphaned[i] = true;
+  }
+  
+  // If no DAC node exists, all nodes remain orphaned
+  if (lg->dac_node_id < 0) {
+    return;
+  }
+  
+  // Use DFS to mark all nodes reachable from DAC
+  bool *visited = calloc(lg->node_count, sizeof(bool));
+  mark_reachable_from_dac(lg, lg->dac_node_id, visited);
+  free(visited);
 }
 
 bool live_connect(LiveGraph *lg, int source_id, int dest_id) {
@@ -519,10 +605,8 @@ bool live_connect(LiveGraph *lg, int source_id, int dest_id) {
   // Add dest to source's successors
   add_successor(source, dest_id);
 
-  // Check if dest node is no longer orphaned (now has inputs)
-  if (dest->nInputs > 0 && lg->is_orphaned[dest_id]) {
-    lg->is_orphaned[dest_id] = false;
-  }
+  // Update orphaned status based on DAC reachability
+  update_orphaned_status(lg);
 
   // Record the connection
   if (lg->connection_count < lg->connection_capacity) {
@@ -534,6 +618,23 @@ bool live_connect(LiveGraph *lg, int source_id, int dest_id) {
   }
 
   return true;
+}
+
+int live_add_dac(LiveGraph *lg, const char *name) {
+  int dac_id = live_add_node(lg, DAC_VTABLE, NULL, ++g_next_node_id, name);
+  if (dac_id >= 0) {
+    lg->dac_node_id = dac_id; // Remember the DAC node
+
+    // Allocate an output edge for the DAC so we can read the final audio
+    int output_edge = find_free_edge(lg);
+    if (output_edge >= 0) {
+      RTNode *dac = &lg->nodes[dac_id];
+      add_output_edge(dac, output_edge);
+      printf("DEBUG: Created output edge %d for DAC node %d\\n", output_edge,
+             dac_id);
+    }
+  }
+  return dac_id;
 }
 
 bool live_disconnect(LiveGraph *lg, int source_id, int dest_id) {
@@ -614,10 +715,8 @@ bool live_disconnect(LiveGraph *lg, int source_id, int dest_id) {
     printf("  WARNING: Inconsistent connection state during disconnect\n");
   }
 
-  // Check if dest node became orphaned (no inputs but has outputs)
-  if (dest->nInputs == 0 && dest->nOutputs > 0) {
-    lg->is_orphaned[dest_id] = true;
-  }
+  // Update orphaned status based on DAC reachability
+  update_orphaned_status(lg);
 
   // Free the edge buffer
   free_edge(lg, edge_id);
@@ -639,7 +738,7 @@ static inline bool rb_pop_sc_live(LiveGraph *lg, int32_t *out) {
   return mpmc_pop(lg->readyQueue, out);
 }
 
-static void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
+void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
   if (nid < 0 || nid >= lg->node_count) {
     printf("ERROR: Invalid node ID %d\n", nid);
     return;
@@ -744,7 +843,7 @@ void process_live_block(LiveGraph *lg, int nframes) {
     bool should_process = !lg->is_orphaned[i] && !is_isolated;
 
     if (is_true_source) {
-      while (!rb_push_mpsc_live(lg, i)) { /* spin */
+      while (!mpmc_push(lg->readyQueue, i)) { /* spin */
         __asm__ __volatile__("" ::: "memory");
       }
       sources_found++;
@@ -760,39 +859,92 @@ void process_live_block(LiveGraph *lg, int nframes) {
     return;
   }
 
-  // Process nodes (single-threaded for simplicity in demo)
-  int32_t nid;
-  int processed = 0;
-  while (rb_pop_sc_live(lg, &nid)) {
-    bind_and_run_live(lg, nid, nframes);
-    RTNode *node = &lg->nodes[nid];
+  // Process nodes with multi-threaded workers using MPMC queue
+  if (g_engine.workerCount > 0) {
+    // Multi-threaded path: use worker threads with MPMC queue
+    atomic_store_explicit(&g_engine.workSession, lg, memory_order_release);
 
-    // Notify successors
-    if (node->succ && node->succCount > 0) {
-      for (int i = 0; i < node->succCount; i++) {
-        int succ = node->succ[i];
-        if (succ >= 0 && succ < lg->node_count && !lg->is_orphaned[succ]) {
-          if (atomic_fetch_sub_explicit(&lg->pending[succ], 1,
-                                        memory_order_acq_rel) == 1) {
-            while (!rb_push_mpsc_live(lg, succ)) { /* spin */
-              __asm__ __volatile__("" ::: "memory");
+    // Process some jobs on audio thread while workers help
+    int32_t nid;
+    while (mpmc_pop(lg->readyQueue, &nid)) {
+      bind_and_run_live(lg, nid, nframes);
+      RTNode *node = &lg->nodes[nid];
+
+      // Notify successors
+      if (node->succ && node->succCount > 0) {
+        for (int i = 0; i < node->succCount; i++) {
+          int succ = node->succ[i];
+          if (succ >= 0 && succ < lg->node_count && !lg->is_orphaned[succ]) {
+            if (atomic_fetch_sub_explicit(&lg->pending[succ], 1,
+                                          memory_order_acq_rel) == 1) {
+              while (!mpmc_push(lg->readyQueue, succ)) {
+                // Queue full, yield briefly
+                __asm__ __volatile__("" ::: "memory");
+              }
             }
           }
         }
       }
+      atomic_fetch_sub_explicit(&lg->jobsInFlight, 1, memory_order_acq_rel);
     }
-    atomic_fetch_sub_explicit(&lg->jobsInFlight, 1, memory_order_acq_rel);
-    processed++;
+
+    // Wait for all jobs to complete
+    while (atomic_load_explicit(&lg->jobsInFlight, memory_order_acquire) > 0) {
+      // Keep trying to help with remaining work
+      if (mpmc_pop(lg->readyQueue, &nid)) {
+        bind_and_run_live(lg, nid, nframes);
+        RTNode *node = &lg->nodes[nid];
+
+        // Notify successors
+        if (node->succ && node->succCount > 0) {
+          for (int i = 0; i < node->succCount; i++) {
+            int succ = node->succ[i];
+            if (succ >= 0 && succ < lg->node_count && !lg->is_orphaned[succ]) {
+              if (atomic_fetch_sub_explicit(&lg->pending[succ], 1,
+                                            memory_order_acq_rel) == 1) {
+                while (!mpmc_push(lg->readyQueue, succ)) {
+                  __asm__ __volatile__("" ::: "memory");
+                }
+              }
+            }
+          }
+        }
+        atomic_fetch_sub_explicit(&lg->jobsInFlight, 1, memory_order_acq_rel);
+      } else {
+        // No work available, yield CPU briefly
+        __asm__ __volatile__("" ::: "memory");
+      }
+    }
+
+    atomic_store_explicit(&g_engine.workSession, NULL, memory_order_release);
+  } else {
+    // Single-threaded fallback path
+    int32_t nid;
+    while (mpmc_pop(lg->readyQueue, &nid)) {
+      bind_and_run_live(lg, nid, nframes);
+      RTNode *node = &lg->nodes[nid];
+
+      // Notify successors
+      if (node->succ && node->succCount > 0) {
+        for (int i = 0; i < node->succCount; i++) {
+          int succ = node->succ[i];
+          if (succ >= 0 && succ < lg->node_count && !lg->is_orphaned[succ]) {
+            if (atomic_fetch_sub_explicit(&lg->pending[succ], 1,
+                                          memory_order_acq_rel) == 1) {
+              while (!mpmc_push(lg->readyQueue, succ)) { /* spin */
+                __asm__ __volatile__("" ::: "memory");
+              }
+            }
+          }
+        }
+      }
+      atomic_fetch_sub_explicit(&lg->jobsInFlight, 1, memory_order_acq_rel);
+    }
   }
 }
 
 int find_live_output(LiveGraph *lg) {
-  for (int i = 0; i < lg->node_count; i++) {
-    if (lg->nodes[i].nOutputs == 0 && lg->nodes[i].nInputs > 0) {
-      return i; // has inputs but no outputs
-    }
-  }
-  return -1;
+  return lg->dac_node_id; // Simply return the DAC node - no searching needed
 }
 
 // ===================== Live Engine Implementation =====================

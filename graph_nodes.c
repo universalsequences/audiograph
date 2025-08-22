@@ -80,6 +80,17 @@ void mix8_process(float* const* in, float* const* out, int n, void* memory) {
     }
 }
 
+void dac_process(float* const* in, float* const* out, int n, void* memory) {
+    (void)memory; // DAC has no state
+    
+    // DAC is a pass-through - copy input to output so we can read the final audio
+    if (in && out && in[0] && out[0]) {
+        for (int i = 0; i < n; i++) {
+            out[0][i] = in[0][i];  // Pass input directly to output
+        }
+    }
+}
+
 // ===================== Node VTables =====================
 
 const NodeVTable OSC_VTABLE = {
@@ -98,6 +109,20 @@ const NodeVTable GAIN_VTABLE = {
 
 const NodeVTable MIX2_VTABLE = {
     .process = mix2_process,
+    .init = NULL,
+    .reset = NULL,
+    .migrate = NULL
+};
+
+const NodeVTable MIX8_VTABLE = {
+    .process = mix8_process,
+    .init = NULL,
+    .reset = NULL,
+    .migrate = NULL
+};
+
+const NodeVTable DAC_VTABLE = {
+    .process = dac_process,
     .init = NULL,
     .reset = NULL,
     .migrate = NULL

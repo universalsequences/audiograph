@@ -72,6 +72,9 @@ typedef struct LiveGraph {
     // Parameter mailbox
     ParamRing* params;
     
+    // DAC output sink - the final destination for all audio
+    int dac_node_id;  // -1 if no DAC connected
+    
     const char* label;
 } LiveGraph;
 
@@ -88,7 +91,7 @@ typedef struct Engine {
     int        workerCount;
     _Atomic int runFlag;
 
-    _Atomic(GraphState*) workSession; // when non-NULL, workers process that graph
+    _Atomic(LiveGraph*) workSession; // when non-NULL, workers process this live graph
 
     int sampleRate;
     int blockSize;
@@ -125,6 +128,8 @@ int live_add_node(LiveGraph* lg, NodeVTable vtable, void* state, uint64_t logica
 int live_add_oscillator(LiveGraph* lg, float freq_hz, const char* name);
 int live_add_gain(LiveGraph* lg, float gain_value, const char* name);
 int live_add_mixer2(LiveGraph* lg, const char* name);
+int live_add_mixer8(LiveGraph* lg, const char* name);
+int live_add_dac(LiveGraph* lg, const char* name);
 bool live_connect(LiveGraph* lg, int source_id, int dest_id);
 bool live_disconnect(LiveGraph* lg, int source_id, int dest_id);
 void process_live_block(LiveGraph* lg, int nframes);
