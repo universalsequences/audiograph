@@ -83,11 +83,7 @@ typedef struct LiveGraph {
 // ===================== Worker Pool / Engine =====================
 
 typedef struct Engine {
-  _Atomic(GraphState *) current; // current graph
-  _Atomic(GraphState *) prev;    // previous graph (for crossfade), can be NULL
-
-  _Atomic int crossfade_blocks_left; // remaining blocks of crossfade
-  int crossfade_len;                 // total blocks to crossfade when swapping
+  int crossfade_len; // total blocks to crossfade when swapping
 
   pthread_t *threads;
   int workerCount;
@@ -104,15 +100,13 @@ typedef struct Engine {
 
 // ===================== Graph Management =====================
 
-void migrate_state(GraphState *newg, GraphState *oldg);
-
 // ===================== Block Processing =====================
 
 // ===================== Worker Pool Management =====================
 
 void engine_start_workers(int workers);
 void engine_stop_workers(void);
-void apply_params(GraphState *g);
+void apply_params(LiveGraph *g);
 
 // ===================== Live Graph Operations =====================
 

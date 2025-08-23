@@ -261,23 +261,23 @@ bool process_and_validate_partial_block(int block_num) {
     printf("  Deviation: %.8f (threshold: %.8f)\n", deviation,
            max_allowed_deviation);
     printf(
-        "  This suggests the %d orphaned oscillators are affecting output!\\n",
+        "  This suggests the %d orphaned oscillators are affecting output!\n",
         NUM_OSCILLATORS - NUM_CONNECTED);
-    printf("  >>> DEVIATION CORRUPTION DETECTED <<<\\n");
+    printf("  >>> DEVIATION CORRUPTION DETECTED <<<\n");
     corrupted = true;
   } else {
     printf("Partial block %d: Output matches expected from %d connected "
-           "oscillators (deviation: %.8f)\\n",
+           "oscillators (deviation: %.8f)\n",
            block_num, NUM_CONNECTED, deviation);
-    printf("  Orphaned oscillators correctly excluded from output\\n");
+    printf("  Orphaned oscillators correctly excluded from output\n");
   }
 
   // Check for NaN/infinity (definite signs of corruption)
   for (int i = 0; i < BLOCK_SIZE; i++) {
     if (!isfinite(output[i])) {
-      printf("ERROR: Partial block %d sample %d is not finite: %f\\n",
-             block_num, i, output[i]);
-      printf("  >>> NAN/INFINITY CORRUPTION DETECTED <<<\\n");
+      printf("ERROR: Partial block %d sample %d is not finite: %f\n", block_num,
+             i, output[i]);
+      printf("  >>> NAN/INFINITY CORRUPTION DETECTED <<<\n");
       atomic_fetch_add_explicit(&g_partial_test.corruption_count, 1,
                                 memory_order_relaxed);
       corrupted = true;
@@ -295,13 +295,13 @@ bool process_and_validate_partial_block(int block_num) {
 
 // Main test function
 bool test_partial_connections() {
-  printf("\\n=== AudioGraph Live Graph Partial Connections Test ===\\n");
-  printf("Testing scenario with orphaned nodes:\\n");
-  printf("- %d oscillators created, but only %d connected to output\\n",
+  printf("\\n=== AudioGraph Live Graph Partial Connections Test ===\n");
+  printf("Testing scenario with orphaned nodes:\n");
+  printf("- %d oscillators created, but only %d connected to output\n",
          NUM_OSCILLATORS, NUM_CONNECTED);
-  printf("- %d oscillators will be orphaned (run but don't contribute)\\n",
+  printf("- %d oscillators will be orphaned (run but don't contribute)\n",
          NUM_OSCILLATORS - NUM_CONNECTED);
-  printf("- Output validation expects only %d oscillator contributions\\n\\n",
+  printf("- Output validation expects only %d oscillator contributions\n\n",
          NUM_CONNECTED);
 
   // Initialize test state

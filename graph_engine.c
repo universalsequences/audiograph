@@ -9,88 +9,21 @@ void bind_and_run_live(LiveGraph *lg, int nid, int nframes);
 
 Engine g_engine; // single global for demo
 
-// ===================== Ready Queue Operations =====================
-
-// Legacy ring buffer functions (now use MPMC queue underneath)
-bool rb_push_mpsc(GraphState *g, int32_t v) {
-  return mpmc_push(g->readyQueue, v);
-}
-
-bool rb_pop_sc(GraphState *g, int32_t *out) {
-  return mpmc_pop(g->readyQueue, out);
+void initialize_engine(int block_Size, int sample_rate) {
+  g_engine.blockSize = block_Size;
+  g_engine.sampleRate = sample_rate;
 }
 
 // ===================== Graph Management =====================
 
-GraphState *alloc_graph(int nodeCount, int edgeCount, int maxBlock,
-                        const char *label) {
-  GraphState *g = (GraphState *)calloc(1, sizeof(GraphState));
-  g->nodeCount = nodeCount;
-  g->edgeCount = edgeCount;
-  g->maxBlock = maxBlock;
-  g->label = label;
-  g->nodes = (RTNode *)calloc(nodeCount, sizeof(RTNode));
-  g->pending = (atomic_int *)calloc(nodeCount, sizeof(atomic_int));
-  g->edgeBufs = (float **)calloc(edgeCount, sizeof(float *));
-  for (int e = 0; e < edgeCount; e++) {
-    g->edgeBufs[e] = (float *)alloc_aligned(64, maxBlock * sizeof(float));
-  }
-  // Create MPMC queue for work distribution (power of 2 capacity)
-  g->readyQueue = mpmc_create(1024);
-  if (!g->readyQueue) {
-    free_graph(g);
-    return NULL;
-  }
-  g->params = (ParamRing *)calloc(1, sizeof(ParamRing));
-  return g;
-}
-
-void free_graph(GraphState *g) {
-  if (!g)
-    return;
-  for (int i = 0; i < g->edgeCount; i++)
-    free(g->edgeBufs[i]);
-  free(g->edgeBufs);
-  for (int i = 0; i < g->nodeCount; i++) {
-    free(g->nodes[i].inEdges);
-    free(g->nodes[i].outEdges);
-    free(g->nodes[i].succ);
-    free(g->nodes[i].state);
-  }
-  free(g->nodes);
-  free(g->pending);
-  mpmc_destroy(g->readyQueue);
-  free(g->params);
-  free(g);
-}
-
-// ===================== State Migration =====================
-
-void migrate_state(GraphState *newg, GraphState *oldg) {
-  if (!newg || !oldg)
-    return;
-  for (int i = 0; i < newg->nodeCount; i++) {
-    uint64_t id = newg->nodes[i].logical_id;
-    if (!newg->nodes[i].vtable.migrate)
-      continue;
-    for (int j = 0; j < oldg->nodeCount; j++) {
-      if (oldg->nodes[j].logical_id == id) {
-        newg->nodes[i].vtable.migrate(newg->nodes[i].state,
-                                      oldg->nodes[j].state);
-        break;
-      }
-    }
-  }
-}
-
 // ===================== Parameter Application =====================
 
-void apply_params(GraphState *g) {
+void apply_params(LiveGraph *g) {
   if (!g || !g->params)
     return;
   ParamMsg m;
   while (params_pop(g->params, &m)) {
-    for (int i = 0; i < g->nodeCount; i++) {
+    for (int i = 0; i < g->node_count; i++) {
       if (g->nodes[i].logical_id == m.logical_id) {
         if (g->nodes[i].state) { // Only apply if node has memory
           float *memory = (float *)g->nodes[i].state;
@@ -266,58 +199,6 @@ static void *worker_main(void *arg) {
   return NULL;
 }
 
-void process_block_parallel(GraphState *g, int nframes) {
-  // reset pending counts (MPMC queue doesn't need manual reset)
-  for (int i = 0; i < g->nodeCount; i++) {
-    atomic_store_explicit(&g->pending[i], g->nodes[i].faninBase,
-                          memory_order_relaxed);
-  }
-
-  // seed sources
-  int totalJobs = 0;
-  for (int i = 0; i < g->nodeCount; i++) {
-    if (g->nodes[i].faninBase == 0)
-      rb_push_mpsc(g, i);
-    totalJobs++;
-  }
-  atomic_store_explicit(&g->jobsInFlight, totalJobs, memory_order_release);
-
-  // publish work session
-  atomic_store_explicit(&g_engine.workSession, g, memory_order_release);
-
-  // audio thread helps too
-  while (atomic_load_explicit(&g->jobsInFlight, memory_order_acquire) > 0) {
-    int32_t nid;
-    // read a new job from the ready queue
-    if (rb_pop_sc(g, &nid)) {
-      // TODO(human): This is the core issue - every thread processes the same
-      // nframes (128). In task-parallel design, each node should be processed
-      // once with full block size. But we're seeing 0-sample calls, suggesting
-      // job duplication or scheduling errors.
-      printf("    [AUDIO THREAD %lu] About to call bind_and_run(nid=%d, "
-             "nframes=%d)\n",
-             (unsigned long)pthread_self(), nid, nframes);
-      bind_and_run(g, nid, nframes);
-      RTNode *node = &g->nodes[nid];
-      for (int i = 0; i < node->succCount; i++) {
-        int succ = node->succ[i];
-        if (atomic_fetch_sub_explicit(&g->pending[succ], 1,
-                                      memory_order_acq_rel) == 1) {
-          while (!rb_push_mpsc(g, succ)) {
-            __asm__ __volatile__("" ::: "memory");
-          }
-        }
-      }
-      atomic_fetch_sub_explicit(&g->jobsInFlight, 1, memory_order_acq_rel);
-    } else {
-      __asm__ __volatile__("" ::: "memory");
-    }
-  }
-  // clear session
-  atomic_store_explicit(&g_engine.workSession, NULL, memory_order_release);
-}
-
-
 // ===================== Worker Pool Management =====================
 
 void engine_start_workers(int workers) {
@@ -462,14 +343,6 @@ int live_add_oscillator(LiveGraph *lg, float freq_hz, const char *name) {
 int live_add_gain(LiveGraph *lg, float gain_value, const char *name) {
   float *memory = calloc(GAIN_MEMORY_SIZE, sizeof(float));
   memory[GAIN_VALUE] = gain_value;
-
-  // TODO(human): The mixer dependency race happens here. When we add gains and
-  // connect them to the mixer, we need to ensure proper dependency counting so
-  // the mixer waits for BOTH gains to complete before processing. Currently,
-  // the mixer might process with only one input ready, causing 50% output.
-  // Please fix the dependency tracking logic in the schedule_ready_nodes or
-  // process_live_block functions to ensure proper ordering.
-
   return live_add_node(lg, GAIN_VTABLE, memory, ++g_next_node_id, name);
 }
 
@@ -512,10 +385,10 @@ static void mark_reachable_from_dac(LiveGraph *lg, int node_id, bool *visited) {
   if (node_id < 0 || node_id >= lg->node_count || visited[node_id]) {
     return;
   }
-  
+
   visited[node_id] = true;
   lg->is_orphaned[node_id] = false; // Mark as not orphaned
-  
+
   RTNode *node = &lg->nodes[node_id];
   // Traverse backwards through input edges to find all nodes that feed this one
   for (int i = 0; i < node->nInputs; i++) {
@@ -539,12 +412,12 @@ static void update_orphaned_status(LiveGraph *lg) {
   for (int i = 0; i < lg->node_count; i++) {
     lg->is_orphaned[i] = true;
   }
-  
+
   // If no DAC node exists, all nodes remain orphaned
   if (lg->dac_node_id < 0) {
     return;
   }
-  
+
   // Use DFS to mark all nodes reachable from DAC
   bool *visited = calloc(lg->node_count, sizeof(bool));
   mark_reachable_from_dac(lg, lg->dac_node_id, visited);
@@ -600,8 +473,6 @@ int live_add_dac(LiveGraph *lg, const char *name) {
     if (output_edge >= 0) {
       RTNode *dac = &lg->nodes[dac_id];
       add_output_edge(dac, output_edge);
-      printf("DEBUG: Created output edge %d for DAC node %d\\n", output_edge,
-             dac_id);
     }
   }
   return dac_id;
@@ -697,15 +568,6 @@ bool live_disconnect(LiveGraph *lg, int source_id, int dest_id) {
   printf("Disconnected node %d -> node %d (freed edge %d)\n", source_id,
          dest_id, edge_id);
   return true;
-}
-
-// Helper functions for live graph processing
-static inline bool rb_push_mpsc_live(LiveGraph *lg, int32_t v) {
-  return mpmc_push(lg->readyQueue, v);
-}
-
-static inline bool rb_pop_sc_live(LiveGraph *lg, int32_t *out) {
-  return mpmc_pop(lg->readyQueue, out);
 }
 
 void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
