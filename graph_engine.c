@@ -317,36 +317,6 @@ void process_block_parallel(GraphState *g, int nframes) {
   atomic_store_explicit(&g_engine.workSession, NULL, memory_order_release);
 }
 
-void process_block_single(GraphState *g, int nframes) {
-  // Reset pending counts (MPMC queue doesn't need manual reset)
-  for (int i = 0; i < g->nodeCount; i++) {
-    atomic_store_explicit(&g->pending[i], g->nodes[i].faninBase,
-                          memory_order_relaxed);
-  }
-  for (int i = 0; i < g->nodeCount; i++) {
-    if (g->nodes[i].faninBase == 0)
-      rb_push_mpsc(g, i);
-  }
-
-  int jobs = 0;
-  for (int i = 0; i < g->nodeCount; i++)
-    jobs++;
-  atomic_store(&g->jobsInFlight, jobs);
-  int32_t nid;
-  while (rb_pop_sc(g, &nid)) {
-    bind_and_run(g, nid, nframes);
-    RTNode *node = &g->nodes[nid];
-    for (int i = 0; i < node->succCount; i++) {
-      int succ = node->succ[i];
-      if (atomic_fetch_sub_explicit(&g->pending[succ], 1,
-                                    memory_order_acq_rel) == 1) {
-        while (!rb_push_mpsc(g, succ)) {
-          __asm__ __volatile__("" ::: "memory");
-        }
-      }
-    }
-  }
-}
 
 // ===================== Worker Pool Management =====================
 
