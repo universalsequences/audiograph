@@ -2,6 +2,203 @@
 
 This guide shows how to integrate the audiograph dylib into your Swift project for real-time audio processing.
 
+## Quick Start: Running the Example
+
+To quickly test the integration and hear the audiograph in action:
+
+### 1. Build the Dynamic Library
+```bash
+# From the audiograph directory
+make lib-release
+```
+
+### 2. Create Example Project Directory
+```bash
+mkdir MyAudioProject
+cd MyAudioProject
+mkdir -p Sources/MyAudioProject
+mkdir audiograph
+```
+
+### 3. Copy Required Files
+Copy these files from the audiograph directory to your project:
+```bash
+# Copy the dynamic library
+cp /path/to/audiograph/libaudiograph.dylib ./audiograph/
+
+# Copy all header files
+cp /path/to/audiograph/audiograph_swift.h ./audiograph/
+cp /path/to/audiograph/graph_types.h ./audiograph/
+cp /path/to/audiograph/graph_engine.h ./audiograph/
+cp /path/to/audiograph/graph_api.h ./audiograph/
+cp /path/to/audiograph/graph_edit.h ./audiograph/
+cp /path/to/audiograph/graph_nodes.h ./audiograph/
+```
+
+### 4. Create Package.swift
+```swift
+// swift-tools-version: 5.9
+import PackageDescription
+
+let package = Package(
+    name: "MyAudioProject",
+    platforms: [
+        .macOS(.v10_15)
+    ],
+    targets: [
+        .executableTarget(
+            name: "MyAudioProject",
+            dependencies: ["AudioGraph"],
+            linkerSettings: [
+                .linkedLibrary("audiograph"),
+                .unsafeFlags(["-L", "./audiograph"])
+            ]
+        ),
+        .systemLibrary(
+            name: "AudioGraph",
+            path: "audiograph"
+        )
+    ]
+)
+```
+
+### 5. Create module.modulemap
+Create `audiograph/module.modulemap`:
+```
+module AudioGraph {
+    header "audiograph_swift.h"
+    link "audiograph"
+    export *
+}
+```
+
+### 6. Create main.swift
+Create `Sources/MyAudioProject/main.swift` with the complete working example (see Section 5 below for the full stereo audio code).
+
+### 7. Build and Run
+```bash
+# Build the project
+DYLD_LIBRARY_PATH="$PWD/audiograph" swift build
+
+# Run and hear the C major chord
+DYLD_LIBRARY_PATH="$PWD/audiograph" swift run
+```
+
+**Expected Output**: You should hear a pleasant C major chord (4 oscillators) playing for 5 seconds in stereo.
+
+### Alternative: Copy Working Example
+If you want to use the pre-built example from this repository:
+```bash
+# Copy the entire working example
+cp -r /path/to/audiograph/swift_example ./MyAudioProject
+
+# Update the dylib and build
+cd MyAudioProject
+cp ../libaudiograph.dylib ./audiograph/
+DYLD_LIBRARY_PATH="$PWD/audiograph" swift run
+```
+
+### File Checklist
+Before building, ensure your project directory contains:
+```
+MyAudioProject/
+├── Package.swift                    ✓ Created in step 4
+├── Sources/
+│   └── MyAudioProject/
+│       └── main.swift              ✓ Created in step 6 (full example below)
+├── audiograph/
+│   ├── libaudiograph.dylib         ✓ Copied from audiograph directory
+│   ├── module.modulemap            ✓ Created in step 5
+│   ├── audiograph_swift.h          ✓ Copied from audiograph directory
+│   ├── graph_types.h               ✓ Copied from audiograph directory
+│   ├── graph_engine.h              ✓ Copied from audiograph directory
+│   ├── graph_api.h                 ✓ Copied from audiograph directory
+│   ├── graph_edit.h                ✓ Copied from audiograph directory
+│   └── graph_nodes.h               ✓ Copied from audiograph directory
+```
+
+### Complete Copy-Paste Script
+Here's a complete script you can run from the audiograph directory to set up and test the example:
+
+```bash
+#!/bin/bash
+# Complete setup script for audiograph Swift integration
+
+# 1. Build the library
+echo "Building audiograph library..."
+make lib-release
+
+# 2. Create project structure
+echo "Creating project structure..."
+mkdir -p TestAudioProject/Sources/TestAudioProject
+mkdir -p TestAudioProject/audiograph
+cd TestAudioProject
+
+# 3. Copy library and headers
+echo "Copying library files..."
+cp ../libaudiograph.dylib ./audiograph/
+cp ../audiograph_swift.h ./audiograph/
+cp ../graph_types.h ./audiograph/
+cp ../graph_engine.h ./audiograph/
+cp ../graph_api.h ./audiograph/
+cp ../graph_edit.h ./audiograph/
+cp ../graph_nodes.h ./audiograph/
+
+# 4. Create Package.swift
+cat > Package.swift << 'EOF'
+// swift-tools-version: 5.9
+import PackageDescription
+
+let package = Package(
+    name: "TestAudioProject",
+    platforms: [
+        .macOS(.v10_15)
+    ],
+    targets: [
+        .executableTarget(
+            name: "TestAudioProject",
+            dependencies: ["AudioGraph"],
+            linkerSettings: [
+                .linkedLibrary("audiograph"),
+                .unsafeFlags(["-L", "./audiograph"])
+            ]
+        ),
+        .systemLibrary(
+            name: "AudioGraph",
+            path: "audiograph"
+        )
+    ]
+)
+EOF
+
+# 5. Create module map
+cat > audiograph/module.modulemap << 'EOF'
+module AudioGraph {
+    header "audiograph_swift.h"
+    link "audiograph"
+    export *
+}
+EOF
+
+# 6. Copy working main.swift from our example
+cp ../swift_example/Sources/AudioGraphExample/main.swift ./Sources/TestAudioProject/main.swift
+
+# 7. Build and run
+echo "Building and running test..."
+DYLD_LIBRARY_PATH="$PWD/audiograph" swift build
+echo "Starting audio test - you should hear a C major chord!"
+DYLD_LIBRARY_PATH="$PWD/audiograph" swift run
+
+echo "Complete! Your audiograph Swift integration is working."
+```
+
+Save this as `setup_swift_example.sh`, make it executable with `chmod +x setup_swift_example.sh`, and run it.
+
+**OR** simply use the provided `setup_swift_example.sh` script in the audiograph directory:
+```bash
+./setup_swift_example.sh
+```
+
 ## Building the Dynamic Library
 
 ### 1. Compile the Library
@@ -19,6 +216,306 @@ Copy these files to your Swift project:
 - All `.h` files (`graph_types.h`, `graph_engine.h`, etc.) - Required for compilation
 
 ## Swift Project Setup
+
+There are two main ways to integrate audiograph into your Swift project: via Xcode directly or using Swift command-line tools (`swift build`, `swift run`).
+
+## Option A: Swift Command-Line Tools (Package.swift)
+
+This approach is perfect for command-line Swift projects, server-side Swift, or when you prefer working outside of Xcode.
+
+### 1. Project Structure
+Set up your Swift project directory like this:
+```
+MyAudioProject/
+├── Package.swift
+├── Sources/
+│   └── MyAudioProject/
+│       └── main.swift
+├── audiograph/
+│   ├── libaudiograph.dylib
+│   ├── audiograph_swift.h
+│   ├── graph_types.h
+│   ├── graph_engine.h
+│   ├── graph_api.h
+│   ├── graph_edit.h
+│   └── graph_nodes.h
+└── module.modulemap
+```
+
+### 2. Create Package.swift
+```swift
+// swift-tools-version: 5.9
+import PackageDescription
+
+let package = Package(
+    name: "MyAudioProject",
+    platforms: [
+        .macOS(.v10_15)
+    ],
+    targets: [
+        .executableTarget(
+            name: "MyAudioProject",
+            dependencies: ["AudioGraph"]
+        ),
+        .systemLibrary(
+            name: "AudioGraph",
+            path: "audiograph",
+            pkgConfig: "audiograph",
+            providers: [
+                .brew(["audiograph"])  // Optional: if you plan to distribute via brew
+            ]
+        )
+    ]
+)
+```
+
+### 3. Create module.modulemap
+Create `audiograph/module.modulemap`:
+```
+module AudioGraph {
+    header "audiograph_swift.h"
+    link "audiograph"
+    export *
+}
+```
+
+### 4. Configure Library Search Path
+You have several options for linking:
+
+#### Option 4a: Copy dylib to system location
+```bash
+# Copy to system library directory (requires sudo)
+sudo cp libaudiograph.dylib /usr/local/lib/
+
+# Or copy to user library directory
+mkdir -p ~/lib
+cp libaudiograph.dylib ~/lib/
+```
+
+#### Option 4b: Use environment variables
+```bash
+# Set library path for current session
+export DYLD_LIBRARY_PATH="$PWD/audiograph:$DYLD_LIBRARY_PATH"
+
+# Then build/run normally
+swift build
+swift run
+```
+
+#### Option 4c: Use linker flags in Package.swift
+```swift
+.executableTarget(
+    name: "MyAudioProject",
+    dependencies: ["AudioGraph"],
+    linkerSettings: [
+        .linkedLibrary("audiograph"),
+        .unsafeFlags(["-L", "./audiograph"])
+    ]
+)
+```
+
+### 5. Example main.swift with Real Audio Output
+
+This example creates a real-time audio application using AVAudioSourceNode to integrate audiograph with macOS audio output:
+
+```swift
+import AudioGraph
+import AVFoundation
+import Foundation
+
+// Global audio graph manager for use in render callback
+class AudioGraphManager {
+    private var liveGraph: UnsafeMutablePointer<LiveGraph>?
+    private let blockSize: Int32 = 512
+    private var audioBuffer = [Float]()
+    
+    init() {
+        setupAudioGraph()
+    }
+    
+    private func setupAudioGraph() {
+        // Initialize engine with matching sample rate
+        initialize_engine(blockSize, 44100)
+        
+        guard let lg = create_live_graph(32, blockSize, "swift_av_graph") else {
+            print("✗ Failed to create live graph")
+            return
+        }
+        
+        liveGraph = lg
+        audioBuffer = [Float](repeating: 0.0, count: Int(blockSize))
+        
+        // Start worker threads
+        engine_start_workers(2)
+        
+        // Create multiple oscillators for a chord
+        let frequencies: [Float] = [261.63, 329.63, 392.00, 523.25] // C major chord
+        let gainPerOsc: Float = 0.15  // Adjusted for 4 oscillators
+        
+        var oscNodes: [Int32] = []
+        var gainNodes: [Int32] = []
+        
+        // Create oscillators and individual gain controls
+        for (i, freq) in frequencies.enumerated() {
+            let osc = live_add_oscillator(lg, freq, "osc_\(i)")
+            let gain = live_add_gain(lg, gainPerOsc, "gain_\(i)")
+            oscNodes.append(osc)
+            gainNodes.append(gain)
+            
+            // Connect osc -> gain
+            _ = connect(lg, osc, 0, gain, 0)
+        }
+        
+        // Create master mixer and master gain
+        let mixer = live_add_mixer8(lg, "master_mix")
+        let masterGain = live_add_gain(lg, 0.5, "master_vol")
+        
+        // Connect all gains to mixer inputs
+        for (i, gainNode) in gainNodes.enumerated() {
+            _ = connect(lg, gainNode, 0, mixer, Int32(i))
+        }
+        
+        // Connect mixer -> master gain -> DAC
+        _ = connect(lg, mixer, 0, masterGain, 0)
+        _ = connect(lg, masterGain, 0, lg.pointee.dac_node_id, 0)
+        
+        print("✓ Created audio graph: 4 oscillators -> individual gains -> mixer -> master gain -> output")
+        print("✓ Frequencies: \(frequencies.map { "\($0)Hz" }.joined(separator: ", "))")
+    }
+    
+    func renderAudio(frameCount: UInt32, audioBufferList: UnsafeMutablePointer<AudioBufferList>) -> OSStatus {
+        guard let lg = liveGraph else { return kAudioUnitErr_Uninitialized }
+        
+        let ablPointer = UnsafeMutableAudioBufferListPointer(audioBufferList)
+        guard let leftBuffer = ablPointer[0].mData?.assumingMemoryBound(to: Float.self),
+              let rightBuffer = ablPointer[1].mData?.assumingMemoryBound(to: Float.self) else {
+            return kAudioUnitErr_InvalidParameter
+        }
+        
+        var framesProcessed: UInt32 = 0
+        
+        // Process in chunks of our block size
+        while framesProcessed < frameCount {
+            let framesToProcess = min(UInt32(blockSize), frameCount - framesProcessed)
+            
+            // Get audio from audiograph (mono output)
+            audioBuffer.withUnsafeMutableBufferPointer { bufferPtr in
+                process_next_block(lg, bufferPtr.baseAddress!, Int32(framesToProcess))
+            }
+            
+            // Copy mono signal to both stereo channels
+            for i in 0..<Int(framesToProcess) {
+                let sample = audioBuffer[i]
+                leftBuffer[Int(framesProcessed) + i] = sample
+                rightBuffer[Int(framesProcessed) + i] = sample
+            }
+            
+            framesProcessed += framesToProcess
+        }
+        
+        return noErr
+    }
+    
+    deinit {
+        engine_stop_workers()
+        if let lg = liveGraph {
+            destroy_live_graph(lg)
+        }
+    }
+}
+
+class AudioGraphSourceNode: AVAudioSourceNode {
+    private let audioGraphManager = AudioGraphManager()
+    
+    init() {
+        // Initialize with stereo format at 44.1kHz (standard audio)  
+        let format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 2)!
+        
+        super.init(format: format) { [weak audioGraphManager] _, _, frameCount, audioBufferList -> OSStatus in
+            return audioGraphManager?.renderAudio(frameCount: frameCount, audioBufferList: audioBufferList) ?? kAudioUnitErr_Uninitialized
+        }
+    }
+}
+
+func main() {
+    print("AudioGraph + AVAudioEngine Real-time Example")
+    print("===========================================")
+    
+    let audioEngine = AVAudioEngine()
+    let sourceNode = AudioGraphSourceNode()
+    let mainMixer = audioEngine.mainMixerNode
+    
+    // Attach our custom source node
+    audioEngine.attach(sourceNode)
+    
+    // Connect source -> mixer -> output
+    audioEngine.connect(sourceNode, to: mainMixer, format: sourceNode.outputFormat(forBus: 0))
+    audioEngine.connect(mainMixer, to: audioEngine.outputNode, format: nil)
+    
+    do {
+        try audioEngine.start()
+        print("✓ Audio engine started - you should hear a C major chord!")
+        print("✓ Playing for 5 seconds...")
+        
+        // Play for 5 seconds
+        Thread.sleep(forTimeInterval: 5.0)
+        
+        audioEngine.stop()
+        print("✓ Audio stopped")
+        
+    } catch {
+        print("✗ Audio engine error: \(error)")
+    }
+    
+    print("\n✓ Real-time audio integration successful!")
+}
+
+main()
+```
+
+### 6. Build and Run
+```bash
+# Build the project (with library path)
+DYLD_LIBRARY_PATH="$PWD/audiograph" swift build
+
+# Run the executable (you should hear audio!)
+DYLD_LIBRARY_PATH="$PWD/audiograph" swift run
+
+# Build for release
+DYLD_LIBRARY_PATH="$PWD/audiograph" swift build -c release
+
+# Run release version
+DYLD_LIBRARY_PATH="$PWD/audiograph" ./.build/release/MyAudioProject
+```
+
+**Important**: Always set `DYLD_LIBRARY_PATH` to include your audiograph directory so the dylib can be found at runtime.
+
+### 7. Alternative: Direct Compilation
+For simple projects, you can compile directly without Package.swift:
+```bash
+# Direct compilation with swift
+swift -I ./audiograph -L ./audiograph -laudiograph main.swift -o myaudio
+
+# Run with library path
+DYLD_LIBRARY_PATH=./audiograph ./myaudio
+```
+
+### 8. Distribution Considerations
+For distributing command-line tools:
+
+```bash
+# Bundle dylib with executable
+mkdir -p MyAudioTool.app/Contents/{MacOS,Libraries}
+cp .build/release/MyAudioProject MyAudioTool.app/Contents/MacOS/
+cp audiograph/libaudiograph.dylib MyAudioTool.app/Contents/Libraries/
+
+# Update install name to look in bundled location
+install_name_tool -change @rpath/libaudiograph.dylib \
+    @executable_path/../Libraries/libaudiograph.dylib \
+    MyAudioTool.app/Contents/MacOS/MyAudioProject
+```
+
+## Option B: Xcode Project Integration
 
 ### 1. Add Library to Xcode Project
 1. Drag `libaudiograph.dylib` into your Xcode project
@@ -230,14 +727,54 @@ ar rcs libaudiograph.a graph_nodes.o graph_engine.o graph_api.o graph_edit.o
 
 ## Troubleshooting
 
-### Common Issues:
+### Common Issues (All Methods):
 1. **Symbol not found**: Ensure bridging header includes `audiograph_swift.h`
 2. **Runtime crashes**: Check that `initialize_engine()` is called before creating graphs
 3. **Audio glitches**: Ensure audio processing happens only in `process_next_block()`
 4. **Memory leaks**: Always pair `create_live_graph()` with `destroy_live_graph()`
 
+### Command-Line Swift Specific Issues:
+1. **"dylib not found" error**:
+   ```bash
+   # Check if dylib is in the right location
+   ls -la audiograph/libaudiograph.dylib
+   
+   # Set library path explicitly
+   export DYLD_LIBRARY_PATH="$PWD/audiograph:$DYLD_LIBRARY_PATH"
+   swift run
+   ```
+
+2. **"module not found" error**:
+   ```bash
+   # Verify module.modulemap exists and is correct
+   cat audiograph/module.modulemap
+   
+   # Check Package.swift systemLibrary path
+   ```
+
+3. **Linker errors during swift build**:
+   ```bash
+   # Try adding explicit linker flags
+   swift build -Xlinker -L -Xlinker ./audiograph -Xlinker -laudiograph
+   ```
+
+4. **Runtime crashes with "image not found"**:
+   ```bash
+   # Check dylib architecture matches your system
+   file audiograph/libaudiograph.dylib
+   
+   # Verify install name
+   otool -D audiograph/libaudiograph.dylib
+   ```
+
 ### Debug Build:
 For debugging, use the debug version:
 ```bash
 make clean && make lib debug
+```
+
+### Verbose Swift Build:
+For troubleshooting build issues:
+```bash
+swift build --verbose
 ```
