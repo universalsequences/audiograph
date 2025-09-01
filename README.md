@@ -172,6 +172,257 @@ void osc_process(float* const* in, float* const* out, int n, void* memory) {
 }
 ```
 
+## Custom Node Implementation
+
+AudioGraph supports creating **custom audio processing nodes** with user-defined behavior. This is ideal for building extensible systems like visual patch editors (Max MSP-style) or gen-expr environments where users can define custom DSP algorithms.
+
+### Creating a Custom Node
+
+Custom nodes require three components:
+1. **Process Function**: Core DSP algorithm
+2. **State Memory**: Float array for parameters and internal state
+3. **NodeVTable**: Function pointer table with optional lifecycle methods
+
+### Complete Custom Node Example
+
+Here's a **delay line node** with adjustable delay time and feedback:
+
+```c
+// === Delay Node State Layout ===
+#define DELAY_MEMORY_SIZE 4098  // 4096 samples + 2 params
+#define DELAY_TIME_SAMPLES 0    // Parameter: delay time in samples
+#define DELAY_FEEDBACK 1        // Parameter: feedback amount (0.0-0.99)
+#define DELAY_WRITE_POS 2       // Internal: write position in buffer
+#define DELAY_BUFFER_START 3    // Start of delay buffer (4096 samples)
+#define DELAY_BUFFER_SIZE 4096
+
+// === Custom Process Function ===
+void delay_process(float* const* in, float* const* out, int n, void* memory) {
+    float* mem = (float*)memory;
+    float* input = in[0];
+    float* output = out[0];
+    
+    float delay_time = mem[DELAY_TIME_SAMPLES];
+    float feedback = mem[DELAY_FEEDBACK];
+    int write_pos = (int)mem[DELAY_WRITE_POS];
+    float* buffer = &mem[DELAY_BUFFER_START];
+    
+    for(int i = 0; i < n; i++) {
+        // Calculate read position
+        int read_pos = write_pos - (int)delay_time;
+        if(read_pos < 0) read_pos += DELAY_BUFFER_SIZE;
+        
+        // Read delayed sample
+        float delayed = buffer[read_pos];
+        
+        // Write input + feedback to buffer
+        buffer[write_pos] = input[i] + (delayed * feedback);
+        
+        // Output = input + delayed signal
+        output[i] = input[i] + delayed * 0.5f;
+        
+        // Advance write position
+        write_pos = (write_pos + 1) % DELAY_BUFFER_SIZE;
+    }
+    
+    // Update write position
+    mem[DELAY_WRITE_POS] = (float)write_pos;
+}
+
+// === Optional: Initialize State ===
+void delay_init(void* memory, int sample_rate, int max_block) {
+    float* mem = (float*)memory;
+    
+    // Set default parameters
+    mem[DELAY_TIME_SAMPLES] = sample_rate * 0.25f;  // 250ms delay
+    mem[DELAY_FEEDBACK] = 0.3f;                     // 30% feedback
+    mem[DELAY_WRITE_POS] = 0.0f;                    // Start at buffer beginning
+    
+    // Clear delay buffer
+    memset(&mem[DELAY_BUFFER_START], 0, DELAY_BUFFER_SIZE * sizeof(float));
+}
+
+// === Optional: Reset to Initial State ===
+void delay_reset(void* memory) {
+    delay_init(memory, 48000, 512);  // Reset with default values
+}
+
+// === Create VTable ===
+const NodeVTable DELAY_VTABLE = {
+    .process = delay_process,
+    .init = delay_init,      // Optional: called once after node creation
+    .reset = delay_reset,    // Optional: called when graph is reset
+    .migrate = NULL          // Optional: copy state during hot-swap
+};
+
+// === Integration with AudioGraph ===
+int create_custom_delay_node(LiveGraph* lg, float delay_seconds, float feedback_amount, const char* name) {
+    // Allocate and initialize state memory
+    float* state = (float*)calloc(DELAY_MEMORY_SIZE, sizeof(float));
+    if (!state) return -1;
+    
+    // Set initial parameters
+    state[DELAY_TIME_SAMPLES] = delay_seconds * 48000.0f;  // Convert to samples
+    state[DELAY_FEEDBACK] = feedback_amount;
+    state[DELAY_WRITE_POS] = 0.0f;
+    
+    // Add node to live graph
+    int node_id = add_node(lg, DELAY_VTABLE, state, name, 1, 1);  // 1 input, 1 output
+    
+    return node_id;
+}
+```
+
+### Using Custom Nodes in Your Graph
+
+```c
+// Create live graph
+LiveGraph* lg = create_live_graph(16, 128, "custom_graph");
+
+// Add built-in nodes
+int osc = live_add_oscillator(lg, 440.0f, "source");
+int gain = live_add_gain(lg, 0.8f, "volume");
+
+// Add your custom delay node
+int delay = create_custom_delay_node(lg, 0.25f, 0.4f, "echo");
+
+// Connect: oscillator -> delay -> gain -> output
+connect(lg, osc, 0, delay, 0);     // osc -> delay input
+connect(lg, delay, 0, gain, 0);    // delay -> gain
+connect(lg, gain, 0, lg->dac_node_id, 0);  // gain -> DAC
+
+// Process audio with your custom effect
+float output[128];
+process_next_block(lg, output, 128);
+```
+
+### Real-time Parameter Updates
+
+Update custom node parameters safely during audio processing:
+
+```c
+// Update delay time parameter
+ParamMsg delay_time_msg = {
+    .idx = DELAY_TIME_SAMPLES,           // Parameter index in state array
+    .logical_id = delay,                 // Target node ID
+    .fvalue = 0.5f * 48000.0f           // New delay time (500ms in samples)
+};
+params_push(lg->params, delay_time_msg);
+
+// Update feedback amount
+ParamMsg feedback_msg = {
+    .idx = DELAY_FEEDBACK,
+    .logical_id = delay,
+    .fvalue = 0.7f                      // 70% feedback
+};
+params_push(lg->params, feedback_msg);
+```
+
+### Advanced Custom Node Patterns
+
+#### 1. Multi-Output Node (Stereo Processor)
+```c
+#define STEREO_MEMORY_SIZE 2
+#define STEREO_WIDTH 0
+#define STEREO_PHASE 1
+
+void stereo_width_process(float* const* in, float* const* out, int n, void* memory) {
+    float* mem = (float*)memory;
+    float* mono_in = in[0];
+    float* left_out = out[0];
+    float* right_out = out[1];
+    
+    float width = mem[STEREO_WIDTH];
+    float phase = mem[STEREO_PHASE];
+    
+    for(int i = 0; i < n; i++) {
+        float mono = mono_in[i];
+        left_out[i] = mono + (mono * width * sinf(phase));
+        right_out[i] = mono - (mono * width * sinf(phase));
+        phase += 0.001f;  // Slow LFO
+    }
+    
+    mem[STEREO_PHASE] = phase;
+}
+
+// Usage: 1 input, 2 outputs
+int stereo_node = add_node(lg, STEREO_WIDTH_VTABLE, state, "stereo", 1, 2);
+```
+
+#### 2. Multi-Input Node (Custom Mixer with Effects)
+```c
+void custom_mixer_process(float* const* in, float* const* out, int n, void* memory) {
+    float* mem = (float*)memory;
+    float* output = out[0];
+    
+    float gain1 = mem[0];
+    float gain2 = mem[1];
+    float reverb_send = mem[2];
+    
+    for(int i = 0; i < n; i++) {
+        float mix = (in[0][i] * gain1) + (in[1][i] * gain2);
+        
+        // Simple reverb simulation
+        float reverb = mix * reverb_send * 0.3f;
+        output[i] = mix + reverb;
+    }
+}
+
+// Usage: 2 inputs, 1 output
+int mixer_node = add_node(lg, CUSTOM_MIXER_VTABLE, state, "fx_mixer", 2, 1);
+```
+
+### Integration with Visual Patch Editors
+
+This custom node system is perfect for **Max MSP-style patch editors** where users:
+
+1. **Define Custom Expressions**: Users write DSP code that gets compiled into process functions
+2. **Dynamic Node Creation**: Each patch element becomes a custom node with its own vtable
+3. **Live Parameter Binding**: Patch UI controls map directly to state memory indices
+4. **Hot-Swapping**: Use `migrate` function to preserve state when recompiling expressions
+
+```c
+// Example: User-defined expression becomes a custom node
+// Expression: "out = in * sin(phase) * gain; phase += freq"
+
+void user_expr_process(float* const* in, float* const* out, int n, void* memory) {
+    float* mem = (float*)memory;
+    float* input = in[0];
+    float* output = out[0];
+    
+    float gain = mem[0];    // Mapped to UI slider
+    float freq = mem[1];    // Mapped to UI knob
+    float phase = mem[2];   // Internal state
+    
+    for(int i = 0; i < n; i++) {
+        output[i] = input[i] * sinf(phase) * gain;
+        phase += freq;
+    }
+    
+    mem[2] = phase;  // Save updated state
+}
+
+// This node can be created dynamically from user expressions
+int expr_node = add_node(lg, USER_EXPR_VTABLE, expr_state, "user_expr", 1, 1);
+```
+
+### Best Practices for Custom Nodes
+
+**State Memory Layout**:
+- **Parameters first**: User-controllable values at known indices
+- **Internal state last**: Algorithm-specific working variables
+- **Alignment**: Use float arrays for SIMD-friendly memory access
+
+**Thread Safety**:
+- **Process function**: Must be real-time safe (no allocations, no locks)
+- **Parameter updates**: Use `params_push()` for thread-safe parameter changes
+- **State migration**: Copy persistent state when hot-swapping nodes
+
+**Memory Management**:
+- **Caller owns state**: Your code allocates and manages state memory
+- **Cleanup**: Free state memory when done (graph doesn't auto-free custom state)
+- **Initialization**: Always zero-initialize state or use `init` function
+
 ## Queue Architecture
 
 ### MPMC Work Queue

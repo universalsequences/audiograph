@@ -67,3 +67,7 @@ echo "Starting audio test - you should hear a C major chord!"
 DYLD_LIBRARY_PATH="$PWD/audiograph" swift run
 
 echo "Complete! Your audiograph Swift integration is working."
+echo ""
+echo "To run tests on the library itself:"
+echo "  make test                     # Run all tests"
+echo "  ./tests/test_sum_behavior     # Test specific functionality"
