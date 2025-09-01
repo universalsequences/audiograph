@@ -91,6 +91,38 @@ bool disconnect(LiveGraph *lg, int src_node, int src_port,
                 int dst_node, int dst_port);
 ```
 
+### Auto-Summing (Multi-input Mixing)
+
+**Transparent Signal Combining**: When multiple sources connect to the same input port, AudioGraph automatically creates hidden SUM nodes to combine the signals:
+
+```c
+// Example: Three oscillators feeding one gain node
+int osc1 = live_add_oscillator(lg, 440.0f, "A4");
+int osc2 = live_add_oscillator(lg, 554.0f, "C#5"); 
+int osc3 = live_add_oscillator(lg, 659.0f, "E5");
+int gain = live_add_gain(lg, 0.5f, "chord_vol");
+
+// These connections automatically create a hidden SUM node
+connect(lg, osc1, 0, gain, 0);  // Direct connection: osc1 -> gain
+connect(lg, osc2, 0, gain, 0);  // Auto-SUM: creates SUM(osc1, osc2) -> gain  
+connect(lg, osc3, 0, gain, 0);  // Auto-SUM: grows to SUM(osc1, osc2, osc3) -> gain
+```
+
+**Key Features**:
+- **Transparent**: Users see logical connections, hidden SUM nodes are managed automatically
+- **Dynamic Growth**: SUM nodes expand/shrink as connections are added/removed
+- **Auto-Collapse**: When reduced to 1 input, SUM collapses back to direct connection
+- **Proper Scheduling**: SUM nodes process before their destination in topological order
+- **Memory Efficient**: SUM nodes are stateless and reuse existing edge buffers
+
+**Implementation Note**: Auto-summing is implemented via the `fanin_sum_node_id` tracking array in `RTNode`. When `apply_connect()` detects multiple sources to the same destination port, it:
+1. Creates a SUM node with appropriate input count
+2. Redirects existing and new sources to the SUM inputs  
+3. Connects SUM output to the original destination
+4. Updates successor lists and indegree tracking for correct scheduling
+
+This ensures that audio mixing happens automatically without requiring users to manually create and manage mixer nodes for common use cases.
+
 ### Key Design Features
 
 **Port-based Connections**: Each node has numbered input/output ports
