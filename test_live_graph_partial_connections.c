@@ -97,9 +97,9 @@ bool create_partial_connections_graph() {
     }
 
     // Connect osc -> gain for all oscillators
-    if (!live_connect(g_partial_test.live_graph,
-                      g_partial_test.oscillator_nodes[i],
-                      g_partial_test.gain_nodes[i])) {
+    if (!apply_connect(g_partial_test.live_graph,
+                       g_partial_test.oscillator_nodes[i], 0,
+                       g_partial_test.gain_nodes[i], 0)) {
       printf("ERROR: Failed to connect oscillator %d to gain %d\\n", i, i);
       return false;
     }
@@ -116,23 +116,19 @@ bool create_partial_connections_graph() {
   // Connect ONLY the first 2 gains to mixer (gains 2-7 will be orphaned)
   printf("Connecting gains 0 and 1 to mixer (gains 2-7 will be orphaned)...\n");
   for (int i = 0; i < NUM_CONNECTED; i++) {
-    if (!live_connect(g_partial_test.live_graph, g_partial_test.gain_nodes[i],
-                      g_partial_test.mixer_node)) {
+    if (!apply_connect(g_partial_test.live_graph, g_partial_test.gain_nodes[i],
+                       0, g_partial_test.mixer_node, i)) {
       printf("ERROR: Failed to connect gain %d to mixer\n", i);
       return false;
     }
     printf("  Connected gain_%d -> mixer\n", i);
   }
 
-  // Create DAC node - the explicit final sink for all audio
-  g_partial_test.output_node = live_add_dac(g_partial_test.live_graph, "DAC");
-  if (g_partial_test.output_node < 0) {
-    printf("ERROR: Failed to create DAC node\\n");
-    return false;
-  }
+  // Use the auto-created DAC node as the final sink for all audio
+  g_partial_test.output_node = g_partial_test.live_graph->dac_node_id;
 
-  if (!live_connect(g_partial_test.live_graph, g_partial_test.mixer_node,
-                    g_partial_test.output_node)) {
+  if (!apply_connect(g_partial_test.live_graph, g_partial_test.mixer_node, 0,
+                     g_partial_test.output_node, 0)) {
     printf("ERROR: Failed to connect mixer to DAC\\n");
     return false;
   }
@@ -211,15 +207,19 @@ bool process_and_validate_partial_block(int block_num) {
              &g_partial_test.live_graph->pending[g_partial_test.mixer_node],
              memory_order_acquire));
 
-  if (g_partial_test.live_graph->nodes[output_node].nOutputs == 0) {
-    printf("ERROR: DAC node has no outputs - can't read signal!\n");
+  if (g_partial_test.live_graph->nodes[output_node].nInputs == 0) {
+    printf("ERROR: DAC node has no inputs - can't read signal!\n");
     return false;
   }
 
-  int output_edge = g_partial_test.live_graph->nodes[output_node].outEdges[0];
-  printf("  Using DAC output edge %d as final audio output\n", output_edge);
+  int input_edge_id = g_partial_test.live_graph->nodes[output_node].inEdgeId[0];
+  if (input_edge_id < 0) {
+    printf("ERROR: DAC node input is not connected!\n");
+    return false;
+  }
+  printf("  Using DAC input edge %d as final audio output\n", input_edge_id);
 
-  float *output = g_partial_test.live_graph->edge_buffers[output_edge];
+  float *output = g_partial_test.live_graph->edges[input_edge_id].buf;
 
   // For the first block, save as reference
   if (block_num == 0) {

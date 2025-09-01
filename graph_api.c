@@ -138,25 +138,6 @@ AudioNode *create_generic_node(GraphBuilder *gb, KernelFn process_fn,
 
 // ===================== Connection API =====================
 
-void connect(AudioNode *source, AudioNode *dest) {
-  // Add dest to source's outputs
-  if (source->output_count >= source->output_capacity) {
-    source->output_capacity =
-        source->output_capacity ? source->output_capacity * 2 : 4;
-    source->outputs =
-        realloc(source->outputs, source->output_capacity * sizeof(AudioNode *));
-  }
-  source->outputs[source->output_count++] = dest;
-
-  // Add source to dest's inputs
-  if (dest->input_count >= dest->input_capacity) {
-    dest->input_capacity = dest->input_capacity ? dest->input_capacity * 2 : 4;
-    dest->inputs =
-        realloc(dest->inputs, dest->input_capacity * sizeof(AudioNode *));
-  }
-  dest->inputs[dest->input_count++] = source;
-}
-
 // ===================== Graph Compilation Helpers =====================
 
 int count_total_edges(GraphBuilder *gb) {

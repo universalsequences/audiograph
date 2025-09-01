@@ -5,13 +5,33 @@
 
 // ===================== Runtime Graph Types =====================
 
+// Per edge (really: "signal" on an output port)
+typedef struct {
+  float *buf;   // size = block_size
+  int refcount; // number of input ports consuming this signal
+  bool in_use;
+} EdgeBuf;
+
+// Live graph edge buffer (compatible with EdgeBuf but for LiveGraph)
+typedef struct {
+  float *buf;   // size = block_size
+  int refcount; // number of input ports consuming this signal
+  bool in_use;
+} LiveEdge;
+
 typedef struct RTNode {
   uint64_t logical_id; // stable ID for migration/params
   NodeVTable vtable;
   void *state; // aligned, preallocated
   int nInputs, nOutputs;
-  int32_t *inEdges; // indices into GraphState.edgeBufs
-  int32_t *outEdges;
+
+  // Port-based edge management
+  int32_t
+      *inEdgeId; // array[nInputs]: edge ID per input port (-1 if unconnected)
+  int32_t *
+      outEdgeId; // array[nOutputs]: edge ID per output port (-1 if unconnected)
+
+  // scheduling
   int32_t *succ; // successor node indices
   int succCount; // number of nodes that depend on this node's output
   int faninBase; // initial number of preds
@@ -53,11 +73,14 @@ typedef struct LiveGraph {
   RTNode *nodes;
   int node_count, node_capacity;
 
-  // Dynamic edge pool
-  float **edge_buffers;
-  bool *edge_free; // which edges are available
+  // Dynamic edge pool (new port-based system)
+  LiveEdge *edges; // edge pool with refcounting
   int edge_capacity;
   int block_size;
+
+  // Support buffers for port system
+  float *silence_buf;  // zero buffer for unconnected inputs
+  float *scratch_null; // throwaway buffer for unconnected outputs
 
   // Live connections
   LiveConnection *connections;
@@ -68,6 +91,7 @@ typedef struct LiveGraph {
 
   // Scheduling state (same as GraphState)
   atomic_int *pending;
+  int *indegree; // maintained incrementally at edits for port-based system
   MPMCQueue *readyQueue; // MPMC work queue for thread-safe job distribution
   _Atomic int jobsInFlight;
 
@@ -78,6 +102,9 @@ typedef struct LiveGraph {
   int dac_node_id; // -1 if no DAC connected
 
   const char *label;
+
+  // Graph Edit Queue
+  GraphEditQueue *graphEditQueue;
 } LiveGraph;
 
 // ===================== Worker Pool / Engine =====================
@@ -112,15 +139,17 @@ void apply_params(LiveGraph *g);
 
 LiveGraph *create_live_graph(int initial_capacity, int block_size,
                              const char *label);
-int live_add_node(LiveGraph *lg, NodeVTable vtable, void *state,
-                  uint64_t logical_id, const char *name);
+int apply_add_node(LiveGraph *lg, NodeVTable vtable, void *state,
+                   uint64_t logical_id, const char *name);
 int live_add_oscillator(LiveGraph *lg, float freq_hz, const char *name);
 int live_add_gain(LiveGraph *lg, float gain_value, const char *name);
 int live_add_mixer2(LiveGraph *lg, const char *name);
 int live_add_mixer8(LiveGraph *lg, const char *name);
-int live_add_dac(LiveGraph *lg, const char *name);
-bool live_connect(LiveGraph *lg, int source_id, int dest_id);
-bool live_disconnect(LiveGraph *lg, int source_id, int dest_id);
+bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
+                   int dst_port);
+bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
+                      int dst_port);
+bool apply_delete_node(LiveGraph *lg, int node_id);
 void process_live_block(LiveGraph *lg, int nframes);
 int find_live_output(LiveGraph *lg);
 

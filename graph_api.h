@@ -49,10 +49,6 @@ AudioNode *create_generic_node(GraphBuilder *gb, KernelFn process_fn,
                                int memory_size, int num_inputs, int num_outputs,
                                const char *name);
 
-// ===================== Connection API =====================
-
-void connect(AudioNode *source, AudioNode *dest);
-
 // ===================== Graph Compilation =====================
 
 GraphState *compile_graph(GraphBuilder *gb, int sample_rate, int block_size,

@@ -6,11 +6,11 @@ CFLAGS = -std=c11 -O2 -Wall -Wextra -pthread
 TARGET = audiograph
 
 # Source files for the modular build
-SOURCES = main.c graph_nodes.c graph_engine.c graph_api.c
+SOURCES = main.c graph_nodes.c graph_engine.c graph_api.c graph_edit.c
 OBJECTS = $(SOURCES:.c=.o)
 
 # Header dependencies
-HEADERS = graph_types.h graph_nodes.h graph_engine.h graph_api.h
+HEADERS = graph_types.h graph_nodes.h graph_engine.h graph_api.h graph_edit.h
 
 # Default target
 all: $(TARGET)
@@ -48,37 +48,32 @@ profile: $(TARGET)
 	instruments -t "Time Profiler" ./$(TARGET)
 
 # Test targets
-test: test_mpmc_queue test_engine_workers test_live_graph_multithreaded test_live_graph_workers test_live_graph_partial_connections
+test: test_mpmc_queue test_live_graph_partial_connections test_disconnect test_graph_edit_queue
 	./test_mpmc_queue
-	./test_engine_workers
-	./test_live_graph_multithreaded
-	./test_live_graph_workers
 	./test_live_graph_partial_connections
+	./test_disconnect
+	./test_graph_edit_queue
 
 # Build MPMC queue unit tests
-test_mpmc_queue: test_mpmc_queue.c $(HEADERS) graph_engine.o graph_nodes.o
-	$(CC) $(CFLAGS) -o test_mpmc_queue test_mpmc_queue.c graph_engine.o graph_nodes.o
-
-# Build engine worker race condition tests (the real test!)
-test_engine_workers: test_engine_workers.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o
-	$(CC) $(CFLAGS) -o test_engine_workers test_engine_workers.c graph_engine.o graph_nodes.o graph_api.o
-
-# Build live graph multi-threading test
-test_live_graph_multithreaded: test_live_graph_multithreaded.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o
-	$(CC) $(CFLAGS) -o test_live_graph_multithreaded test_live_graph_multithreaded.c graph_engine.o graph_nodes.o graph_api.o
-
-# Build live graph worker race condition tests (equivalent to engine workers test)
-test_live_graph_workers: test_live_graph_workers.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o
-	$(CC) $(CFLAGS) -o test_live_graph_workers test_live_graph_workers.c graph_engine.o graph_nodes.o graph_api.o
+test_mpmc_queue: test_mpmc_queue.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o
+	$(CC) $(CFLAGS) -o test_mpmc_queue test_mpmc_queue.c graph_engine.o graph_nodes.o graph_edit.o
 
 # Build live graph partial connections test (orphaned nodes test)
-test_live_graph_partial_connections: test_live_graph_partial_connections.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o
-	$(CC) $(CFLAGS) -o test_live_graph_partial_connections test_live_graph_partial_connections.c graph_engine.o graph_nodes.o graph_api.o
+test_live_graph_partial_connections: test_live_graph_partial_connections.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o graph_edit.o
+	$(CC) $(CFLAGS) -o test_live_graph_partial_connections test_live_graph_partial_connections.c graph_engine.o graph_nodes.o graph_api.o graph_edit.o
+
+# Build disconnect test (port-based disconnect functionality)
+test_disconnect: test_disconnect.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o graph_edit.o
+	$(CC) $(CFLAGS) -o test_disconnect test_disconnect.c graph_engine.o graph_nodes.o graph_api.o graph_edit.o
+
+# Build graph edit queue test (dynamic editing via queue)
+test_graph_edit_queue: test_graph_edit_queue.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o graph_edit.o
+	$(CC) $(CFLAGS) -o test_graph_edit_queue test_graph_edit_queue.c graph_engine.o graph_nodes.o graph_api.o graph_edit.o
 
 # Clean up test artifacts
 clean: clean_tests
 
 clean_tests:
-	rm -f test_mpmc_queue test_livegraph_workers test_engine_workers test_live_graph_multithreaded test_live_graph_workers test_live_graph_partial_connections
+	rm -f test_mpmc_queue test_engine_workers test_live_graph_multithreaded test_live_graph_workers test_live_graph_partial_connections test_disconnect test_graph_edit_queue
 
 .PHONY: all debug release run clean valgrind profile test clean_tests
