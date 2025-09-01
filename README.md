@@ -146,30 +146,55 @@ typedef struct {
 
 ## Usage Example
 
-### Basic Live Graph Setup
+### Complete System Example
 
 ```c
 #include "graph_engine.h"
+#include "graph_edit.h"
+#include "graph_nodes.h"
+#include <stdio.h>
 
-// Create live graph with initial capacity
-LiveGraph* lg = create_live_graph(16, 128, "my_graph");
-
-// Start worker threads for parallel processing
-engine_start_workers(3);
-
-// Add nodes (returns immediately usable IDs)
-int osc1 = live_add_oscillator(lg, 440.0f, "A4");
-int osc2 = live_add_oscillator(lg, 660.0f, "E5");
-int gain1 = live_add_gain(lg, 0.5f, "vol1");
-int gain2 = live_add_gain(lg, 0.3f, "vol2");
-int mixer = live_add_mixer2(lg, "output");
-
-// Connect using port-based system
-connect(lg, osc1, 0, gain1, 0);    // osc1:port0 -> gain1:port0
-connect(lg, osc2, 0, gain2, 0);    // osc2:port0 -> gain2:port0
-connect(lg, gain1, 0, mixer, 0);   // gain1:port0 -> mixer:port0
-connect(lg, gain2, 0, mixer, 1);   // gain2:port0 -> mixer:port1
-connect(lg, mixer, 0, lg->dac_node_id, 0);  // mixer:port0 -> DAC:port0
+int main() {
+    // 1. Initialize the engine
+    initialize_engine(128, 48000);  // 128-sample blocks, 48kHz
+    
+    // 2. Create live graph with initial capacity (grows automatically)
+    LiveGraph *lg = create_live_graph(16, 128, "my_audio_graph");
+    
+    // 3. Start worker threads for parallel processing
+    engine_start_workers(4);  // Use 4 worker threads
+    
+    // 4. Build the audio graph (all operations are queued)
+    int osc1 = live_add_oscillator(lg, 440.0f, "A4");       // 440Hz sine
+    int osc2 = live_add_oscillator(lg, 660.0f, "E5");       // 660Hz sine  
+    int gain1 = live_add_gain(lg, 0.3f, "vol1");            // 30% volume
+    int gain2 = live_add_gain(lg, 0.2f, "vol2");            // 20% volume
+    int mixer = live_add_mixer2(lg, "main_mix");             // 2-input mixer
+    
+    // 5. Connect the signal path (queued operations)
+    connect(lg, osc1, 0, gain1, 0);           // osc1 -> gain1
+    connect(lg, osc2, 0, gain2, 0);           // osc2 -> gain2  
+    connect(lg, gain1, 0, mixer, 0);          // gain1 -> mixer input 0
+    connect(lg, gain2, 0, mixer, 1);          // gain2 -> mixer input 1
+    connect(lg, mixer, 0, lg->dac_node_id, 0); // mixer -> DAC output
+    
+    // 6. Process audio blocks and read output
+    float output_buffer[128];
+    for (int block = 0; block < 10; block++) {
+        // Process one audio block (applies queued edits + runs DSP)
+        process_next_block(lg, output_buffer, 128);
+        
+        // Print some output samples
+        printf("Block %d: [%.6f, %.6f, %.6f, ...]\n", 
+               block, output_buffer[0], output_buffer[1], output_buffer[2]);
+    }
+    
+    // 7. Clean shutdown
+    engine_stop_workers();        // Stop all worker threads
+    destroy_live_graph(lg);       // Free all graph memory
+    
+    return 0;
+}
 ```
 
 ### Live Editing While Audio Runs

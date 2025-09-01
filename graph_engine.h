@@ -63,13 +63,6 @@ void free_graph(GraphState *g);
 
 // ===================== Live Editing System =====================
 
-typedef struct LiveConnection {
-  int source_node_id;
-  int dest_node_id;
-  int edge_buffer_id;
-  bool active;
-} LiveConnection;
-
 typedef struct LiveGraph {
   RTNode *nodes;
   int node_count, node_capacity;
@@ -83,9 +76,6 @@ typedef struct LiveGraph {
   float *silence_buf;  // zero buffer for unconnected inputs
   float *scratch_null; // throwaway buffer for unconnected outputs
 
-  // Live connections
-  LiveConnection *connections;
-  int connection_count, connection_capacity;
 
   // Orphaned nodes (have no inputs but aren't true sources)
   bool *is_orphaned;
@@ -148,6 +138,7 @@ void apply_params(LiveGraph *g);
 
 LiveGraph *create_live_graph(int initial_capacity, int block_size,
                              const char *label);
+void destroy_live_graph(LiveGraph *lg);
 int apply_add_node(LiveGraph *lg, NodeVTable vtable, void *state,
                    uint64_t logical_id, const char *name, int nInputs, int nOutputs);
 int live_add_oscillator(LiveGraph *lg, float freq_hz, const char *name);

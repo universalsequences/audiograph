@@ -135,6 +135,49 @@ void engine_stop_workers(void) {
 
 
 // Ensure node's port arrays exist/are sized (call at node creation in practice)
+// Grow node arrays when capacity is exceeded
+static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
+  if (required_capacity <= lg->node_capacity) {
+    return true; // Already sufficient
+  }
+  
+  int new_capacity = lg->node_capacity;
+  while (new_capacity <= required_capacity) {
+    new_capacity *= 2; // Double until sufficient
+  }
+  
+  // Grow all node-indexed arrays
+  RTNode *new_nodes = realloc(lg->nodes, new_capacity * sizeof(RTNode));
+  atomic_int *new_pending = realloc(lg->pending, new_capacity * sizeof(atomic_int));
+  int *new_indegree = realloc(lg->indegree, new_capacity * sizeof(int));
+  bool *new_orphaned = realloc(lg->is_orphaned, new_capacity * sizeof(bool));
+  
+  if (!new_nodes || !new_pending || !new_indegree || !new_orphaned) {
+    // Allocation failed - don't change anything
+    return false;
+  }
+  
+  // Zero new slots
+  int old_capacity = lg->node_capacity;
+  memset(&new_nodes[old_capacity], 0, (new_capacity - old_capacity) * sizeof(RTNode));
+  memset(&new_indegree[old_capacity], 0, (new_capacity - old_capacity) * sizeof(int));
+  memset(&new_orphaned[old_capacity], 0, (new_capacity - old_capacity) * sizeof(bool));
+  
+  // Initialize new pending slots to -1 (orphaned)
+  for (int i = old_capacity; i < new_capacity; i++) {
+    atomic_init(&new_pending[i], -1);
+  }
+  
+  // Update pointers and capacity
+  lg->nodes = new_nodes;
+  lg->pending = new_pending;
+  lg->indegree = new_indegree;
+  lg->is_orphaned = new_orphaned;
+  lg->node_capacity = new_capacity;
+  
+  return true;
+}
+
 static void ensure_port_arrays(RTNode *n) {
   if (!n->inEdgeId && n->nInputs > 0) {
     n->inEdgeId = (int32_t *)malloc(sizeof(int32_t) * n->nInputs);
@@ -179,9 +222,6 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   memset(lg->silence_buf, 0,
          block_size * sizeof(float)); // keep silence buffer zeroed
 
-  // Connection tracking
-  lg->connection_capacity = initial_capacity * 8;
-  lg->connections = calloc(lg->connection_capacity, sizeof(LiveConnection));
 
   // Ready queue (MPMC for thread safety)
   lg->readyQueue = mpmc_create(1024);
@@ -193,7 +233,6 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
     free(lg->edges);
     free(lg->silence_buf);
     free(lg->scratch_null);
-    free(lg->connections);
     free(lg->nodes);
     free(lg->pending);
     free(lg->indegree);
@@ -237,6 +276,63 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   return lg;
 }
 
+void destroy_live_graph(LiveGraph *lg) {
+  if (!lg) return;
+  
+  // Free all edge buffers
+  if (lg->edges) {
+    for (int i = 0; i < lg->edge_capacity; i++) {
+      if (lg->edges[i].buf) {
+        free(lg->edges[i].buf);
+      }
+    }
+    free(lg->edges);
+  }
+  
+  // Free all node state and port arrays
+  if (lg->nodes) {
+    for (int i = 0; i < lg->node_count; i++) {
+      RTNode *node = &lg->nodes[i];
+      if (node->state) {
+        free(node->state);
+      }
+      if (node->inEdgeId) {
+        free(node->inEdgeId);
+      }
+      if (node->outEdgeId) {
+        free(node->outEdgeId);
+      }
+      if (node->succ) {
+        free(node->succ);
+      }
+    }
+    free(lg->nodes);
+  }
+  
+  // Free scheduling arrays
+  if (lg->pending) free(lg->pending);
+  if (lg->indegree) free(lg->indegree);
+  if (lg->is_orphaned) free(lg->is_orphaned);
+  
+  // Free support buffers
+  if (lg->silence_buf) free(lg->silence_buf);
+  if (lg->scratch_null) free(lg->scratch_null);
+  
+  // Free queues
+  if (lg->readyQueue) mpmc_destroy(lg->readyQueue);
+  if (lg->params) free(lg->params);
+  if (lg->graphEditQueue) {
+    if (lg->graphEditQueue->buf) free(lg->graphEditQueue->buf);
+    free(lg->graphEditQueue);
+  }
+  
+  // Free failed IDs tracking
+  if (lg->failed_ids) free(lg->failed_ids);
+  
+  // Free the graph itself
+  free(lg);
+}
+
 // Legacy edge functions removed - using port-based alloc_edge instead
 
 int apply_add_node(LiveGraph *lg, NodeVTable vtable, void *state,
@@ -244,8 +340,10 @@ int apply_add_node(LiveGraph *lg, NodeVTable vtable, void *state,
   // Use logical_id directly as the array index
   int node_id = (int)logical_id;
   if (node_id >= lg->node_capacity) {
-    // Need to expand - for demo just fail
-    return -1;
+    // Need to expand capacity
+    if (!grow_node_capacity(lg, node_id)) {
+      return -1; // Growth failed
+    }
   }
 
   RTNode *node = &lg->nodes[node_id];
