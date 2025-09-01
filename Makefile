@@ -48,11 +48,12 @@ profile: $(TARGET)
 	instruments -t "Time Profiler" ./$(TARGET)
 
 # Test targets
-test: test_mpmc_queue test_live_graph_partial_connections test_disconnect test_graph_edit_queue
+test: test_mpmc_queue test_live_graph_partial_connections test_disconnect test_graph_edit_queue test_queue_api
 	./test_mpmc_queue
 	./test_live_graph_partial_connections
 	./test_disconnect
 	./test_graph_edit_queue
+	./test_queue_api
 
 # Build MPMC queue unit tests
 test_mpmc_queue: test_mpmc_queue.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o
@@ -70,10 +71,14 @@ test_disconnect: test_disconnect.c $(HEADERS) graph_engine.o graph_nodes.o graph
 test_graph_edit_queue: test_graph_edit_queue.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o graph_edit.o
 	$(CC) $(CFLAGS) -o test_graph_edit_queue test_graph_edit_queue.c graph_engine.o graph_nodes.o graph_api.o graph_edit.o
 
+# Build queue API test (pre-allocated IDs API)
+test_queue_api: test_queue_api.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o graph_edit.o
+	$(CC) $(CFLAGS) -o test_queue_api test_queue_api.c graph_engine.o graph_nodes.o graph_api.o graph_edit.o
+
 # Clean up test artifacts
 clean: clean_tests
 
 clean_tests:
-	rm -f test_mpmc_queue test_engine_workers test_live_graph_multithreaded test_live_graph_workers test_live_graph_partial_connections test_disconnect test_graph_edit_queue
+	rm -f test_mpmc_queue test_engine_workers test_live_graph_multithreaded test_live_graph_workers test_live_graph_partial_connections test_disconnect test_graph_edit_queue test_queue_api
 
 .PHONY: all debug release run clean valgrind profile test clean_tests

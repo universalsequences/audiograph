@@ -105,6 +105,14 @@ typedef struct LiveGraph {
 
   // Graph Edit Queue
   GraphEditQueue *graphEditQueue;
+  
+  // Failed operation tracking
+  uint64_t *failed_ids;      // Array of node IDs that failed to create
+  int failed_ids_count;      // Number of failed IDs
+  int failed_ids_capacity;   // Capacity of failed_ids array
+  
+  // Atomic node ID allocation
+  _Atomic int next_node_id;  // Next node ID to allocate (thread-safe)
 } LiveGraph;
 
 // ===================== Worker Pool / Engine =====================
@@ -140,7 +148,7 @@ void apply_params(LiveGraph *g);
 LiveGraph *create_live_graph(int initial_capacity, int block_size,
                              const char *label);
 int apply_add_node(LiveGraph *lg, NodeVTable vtable, void *state,
-                   uint64_t logical_id, const char *name);
+                   uint64_t logical_id, const char *name, int nInputs, int nOutputs);
 int live_add_oscillator(LiveGraph *lg, float freq_hz, const char *name);
 int live_add_gain(LiveGraph *lg, float gain_value, const char *name);
 int live_add_mixer2(LiveGraph *lg, const char *name);
@@ -151,6 +159,14 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
                       int dst_port);
 bool apply_delete_node(LiveGraph *lg, int node_id);
 void process_live_block(LiveGraph *lg, int nframes);
+
+// ===================== Queue-based API (Pre-allocated IDs) =====================
+int add_node(LiveGraph *lg, NodeVTable vtable, void *state, const char *name, int nInputs, int nOutputs);
+bool delete_node(LiveGraph *lg, int node_id);
+bool connect(LiveGraph *lg, int src_node, int src_port, int dst_node, int dst_port);
+bool disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node, int dst_port);
+bool is_failed_node(LiveGraph *lg, int node_id);
+void add_failed_id(LiveGraph *lg, uint64_t logical_id);
 int find_live_output(LiveGraph *lg);
 
 // ===================== Live Engine Operations =====================

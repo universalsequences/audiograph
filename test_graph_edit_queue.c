@@ -214,7 +214,7 @@ int main() {
   printf("✓ Successfully queued delete command\n");
 
   // Verify node still exists (edit not applied yet)
-  assert(temp_node->logical_id != 0); // Should still be valid
+  assert(temp_node->state != NULL); // Should still be valid
   printf("✓ Node still exists before applying delete\n");
 
   // Apply the delete edit
@@ -223,9 +223,9 @@ int main() {
   printf("✓ Successfully applied delete edit\n");
 
   // Verify node is deleted and connections are cleaned up
-  assert(temp_node->logical_id == 0);  // Should be marked as deleted
-  assert(temp_node->state == NULL);    // State should be freed
-  assert(temp_node->inEdgeId == NULL); // Port arrays freed
+  assert(temp_node->state == NULL);        // Should be marked as deleted
+  assert(temp_node->vtable.process == NULL); // Vtable should be cleared
+  assert(temp_node->inEdgeId == NULL);     // Port arrays freed
   assert(temp_node->outEdgeId == NULL);
   printf("✓ Node deleted and all connections cleaned up\n");
 

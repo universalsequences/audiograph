@@ -213,6 +213,8 @@ typedef struct {
       void *state;
       uint64_t logical_id;
       char *name;
+      int nInputs;
+      int nOutputs;
     } add_node;
     struct {
       int node_id;
