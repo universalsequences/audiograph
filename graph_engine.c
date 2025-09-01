@@ -736,9 +736,13 @@ bool apply_delete_node(LiveGraph *lg, int node_id) {
 
 void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
   RTNode *node = &lg->nodes[nid];
-  if (lg->is_orphaned[nid])
-    return; // safety
-  if (node->nInputs < 0 || node->nOutputs < 0)
+  
+  // Safety checks for deleted/invalid nodes
+  if (node->state == NULL)    // Node was deleted
+    return;
+  if (lg->is_orphaned[nid])   // Node is orphaned
+    return;
+  if (node->nInputs < 0 || node->nOutputs < 0)  // Invalid port counts
     return;
 
   float *inPtrs[MAX_IO];
@@ -765,8 +769,13 @@ void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
 static void init_pending_and_seed(LiveGraph *lg) {
   int totalJobs = 0;
 
-  // pending = indegree for reachable nodes, -1 for orphaned
+  // pending = indegree for reachable nodes, -1 for orphaned/deleted
   for (int i = 0; i < lg->node_count; i++) {
+    // Skip deleted nodes (state == NULL)
+    if (lg->nodes[i].state == NULL) {
+      atomic_store_explicit(&lg->pending[i], -1, memory_order_relaxed);
+      continue;
+    }
     if (lg->is_orphaned[i]) {
       atomic_store_explicit(&lg->pending[i], -1, memory_order_relaxed);
       continue;

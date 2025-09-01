@@ -75,10 +75,14 @@ test_graph_edit_queue: test_graph_edit_queue.c $(HEADERS) graph_engine.o graph_n
 test_queue_api: test_queue_api.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o graph_edit.o
 	$(CC) $(CFLAGS) -o test_queue_api test_queue_api.c graph_engine.o graph_nodes.o graph_api.o graph_edit.o
 
+# Build deletion safety test (worker thread safety with node deletion)
+test_deletion_safety: test_deletion_safety.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o graph_edit.o
+	$(CC) $(CFLAGS) -o test_deletion_safety test_deletion_safety.c graph_engine.o graph_nodes.o graph_api.o graph_edit.o
+
 # Clean up test artifacts
 clean: clean_tests
 
 clean_tests:
-	rm -f test_mpmc_queue test_engine_workers test_live_graph_multithreaded test_live_graph_workers test_live_graph_partial_connections test_disconnect test_graph_edit_queue test_queue_api
+	rm -f test_mpmc_queue test_engine_workers test_live_graph_multithreaded test_live_graph_workers test_live_graph_partial_connections test_disconnect test_graph_edit_queue test_queue_api test_deletion_safety
 
 .PHONY: all debug release run clean valgrind profile test clean_tests
