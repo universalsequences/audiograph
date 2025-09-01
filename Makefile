@@ -48,7 +48,7 @@ profile: $(TARGET)
 	instruments -t "Time Profiler" ./$(TARGET)
 
 # Test targets
-test: test_mpmc_queue test_live_graph_partial_connections test_disconnect test_graph_edit_queue test_queue_api test_capacity_growth test_simple_teardown
+test: test_mpmc_queue test_live_graph_partial_connections test_disconnect test_graph_edit_queue test_queue_api test_capacity_growth test_simple_teardown test_orphan_comprehensive
 	./test_mpmc_queue
 	./test_live_graph_partial_connections
 	./test_disconnect
@@ -56,6 +56,7 @@ test: test_mpmc_queue test_live_graph_partial_connections test_disconnect test_g
 	./test_queue_api
 	./test_capacity_growth
 	./test_simple_teardown
+	./test_orphan_comprehensive
 
 # Build MPMC queue unit tests
 test_mpmc_queue: test_mpmc_queue.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o
@@ -89,10 +90,14 @@ test_capacity_growth: test_capacity_growth.c $(HEADERS) graph_engine.o graph_nod
 test_simple_teardown: test_simple_teardown.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o
 	$(CC) $(CFLAGS) -o test_simple_teardown test_simple_teardown.c graph_engine.o graph_nodes.o graph_edit.o
 
+# Build comprehensive orphan test (focused orphan status validation)
+test_orphan_comprehensive: test_orphan_comprehensive.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o graph_edit.o
+	$(CC) $(CFLAGS) -o test_orphan_comprehensive test_orphan_comprehensive.c graph_engine.o graph_nodes.o graph_api.o graph_edit.o
+
 # Clean up test artifacts
 clean: clean_tests
 
 clean_tests:
-	rm -f test_mpmc_queue test_engine_workers test_live_graph_multithreaded test_live_graph_workers test_live_graph_partial_connections test_disconnect test_graph_edit_queue test_queue_api test_deletion_safety test_capacity_growth test_simple_teardown
+	rm -f test_mpmc_queue test_engine_workers test_live_graph_multithreaded test_live_graph_workers test_live_graph_partial_connections test_disconnect test_graph_edit_queue test_queue_api test_deletion_safety test_capacity_growth test_simple_teardown test_orphan_comprehensive
 
 .PHONY: all debug release run clean valgrind profile test clean_tests
