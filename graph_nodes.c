@@ -47,6 +47,17 @@ void gain_process(float *const *in, float *const *out, int n, void *memory) {
     y[i] = a[i] * gain;
 }
 
+// ===================== Number Implementation =====================
+
+void number_process(float *const *in, float *const *out, int n, void *memory) {
+  (void)in; // Number generator has no inputs
+  float *mem = (float *)memory;
+  float value = mem[NUMBER_VALUE];
+  float *y = out[0];
+  for (int i = 0; i < n; i++)
+    y[i] = value;
+}
+
 // ===================== Mixer Implementations =====================
 
 void mix2_process(float *const *in, float *const *out, int n, void *memory) {
@@ -90,6 +101,33 @@ void dac_process(float *const *in, float *const *out, int n, void *memory) {
   }
 }
 
+// ===================== SUM Implementation =====================
+
+// Global accessor for current node's input count (to be implemented)
+extern int ap_current_node_ninputs(void);
+
+void sum_process(float *const *in, float *const *out, int n, void *memory) {
+  (void)memory; // SUM is stateless
+  float *y = out[0];
+  
+  // Zero output buffer
+  for (int i = 0; i < n; i++) 
+    y[i] = 0.0f;
+
+  // Get number of inputs from the current processing context
+  int nIn = ap_current_node_ninputs();
+  // Accumulate all inputs
+  for (int k = 0; k < nIn; k++) {
+    const float *x = in[k];
+    for (int i = 0; i < n; i++) 
+      y[i] += x[i];
+  }
+
+  // Optional normalization to avoid gain jump with fan-in:
+  // float g = 1.0f / (float)(nIn > 0 ? nIn : 1);
+  // for (int i = 0; i < n; i++) y[i] *= g;
+}
+
 // ===================== Node VTables =====================
 
 const NodeVTable OSC_VTABLE = {.process = osc_process,
@@ -100,6 +138,9 @@ const NodeVTable OSC_VTABLE = {.process = osc_process,
 const NodeVTable GAIN_VTABLE = {
     .process = gain_process, .init = NULL, .reset = NULL, .migrate = NULL};
 
+const NodeVTable NUMBER_VTABLE = {
+    .process = number_process, .init = NULL, .reset = NULL, .migrate = NULL};
+
 const NodeVTable MIX2_VTABLE = {
     .process = mix2_process, .init = NULL, .reset = NULL, .migrate = NULL};
 
@@ -108,3 +149,6 @@ const NodeVTable MIX8_VTABLE = {
 
 const NodeVTable DAC_VTABLE = {
     .process = dac_process, .init = NULL, .reset = NULL, .migrate = NULL};
+
+const NodeVTable SUM_VTABLE = {
+    .process = sum_process, .init = NULL, .reset = NULL, .migrate = NULL};

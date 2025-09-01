@@ -33,6 +33,9 @@ typedef struct RTNode {
   int32_t *
       outEdgeId; // array[nOutputs]: edge ID per output port (-1 if unconnected)
 
+  // For auto-sum: for each input port on this node, store an optional SUM node id
+  int32_t *fanin_sum_node_id;  // array[nInputs]: SUM node ID per input port (-1 if none)
+
   // scheduling
   int32_t *succ; // successor node indices
   int succCount; // number of nodes that depend on this node's output
@@ -143,8 +146,10 @@ int apply_add_node(LiveGraph *lg, NodeVTable vtable, void *state,
                    uint64_t logical_id, const char *name, int nInputs, int nOutputs);
 int live_add_oscillator(LiveGraph *lg, float freq_hz, const char *name);
 int live_add_gain(LiveGraph *lg, float gain_value, const char *name);
+int live_add_number(LiveGraph *lg, float value, const char *name);
 int live_add_mixer2(LiveGraph *lg, const char *name);
 int live_add_mixer8(LiveGraph *lg, const char *name);
+int live_add_sum(LiveGraph *lg, const char *name, int nInputs);
 bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
                    int dst_port);
 bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
@@ -168,5 +173,6 @@ void process_next_block(LiveGraph *lg, float *output_buffer, int nframes);
 // ===================== Global Engine Instance =====================
 
 extern Engine g_engine;
+void initialize_engine(int block_size, int sample_rate);
 
 #endif // GRAPH_ENGINE_H
