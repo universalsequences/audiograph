@@ -66,66 +66,67 @@ profile: $(TARGET)
 	instruments -t "Time Profiler" ./$(TARGET)
 
 # Test targets
-test: test_mpmc_queue test_live_graph_partial_connections test_disconnect test_graph_edit_queue test_queue_api test_capacity_growth test_simple_teardown test_orphan_comprehensive test_auto_sum test_sum_behavior
-	./test_mpmc_queue
-	./test_live_graph_partial_connections
-	./test_disconnect
-	./test_graph_edit_queue
-	./test_queue_api
-	./test_capacity_growth
-	./test_simple_teardown
-	./test_orphan_comprehensive
-	./test_auto_sum
-	./test_sum_behavior
+test: tests/test_mpmc_queue tests/test_live_graph_partial_connections tests/test_disconnect tests/test_graph_edit_queue tests/test_queue_api tests/test_capacity_growth tests/test_simple_teardown tests/test_orphan_comprehensive tests/test_auto_sum tests/test_sum_behavior
+	./tests/test_mpmc_queue
+	./tests/test_live_graph_partial_connections
+	./tests/test_disconnect
+	./tests/test_graph_edit_queue
+	./tests/test_queue_api
+	./tests/test_capacity_growth
+	./tests/test_simple_teardown
+	./tests/test_orphan_comprehensive
+	./tests/test_auto_sum
+	./tests/test_sum_behavior
 
 # Build MPMC queue unit tests
-test_mpmc_queue: test_mpmc_queue.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o
-	$(CC) $(CFLAGS) -o test_mpmc_queue test_mpmc_queue.c graph_engine.o graph_nodes.o graph_edit.o
+tests/test_mpmc_queue: tests/test_mpmc_queue.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o
+	$(CC) $(CFLAGS) -I. -o tests/test_mpmc_queue tests/test_mpmc_queue.c graph_engine.o graph_nodes.o graph_edit.o
 
 # Build live graph partial connections test (orphaned nodes test)
-test_live_graph_partial_connections: test_live_graph_partial_connections.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o graph_edit.o
-	$(CC) $(CFLAGS) -o test_live_graph_partial_connections test_live_graph_partial_connections.c graph_engine.o graph_nodes.o graph_api.o graph_edit.o
+tests/test_live_graph_partial_connections: tests/test_live_graph_partial_connections.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o graph_edit.o
+	$(CC) $(CFLAGS) -I. -o tests/test_live_graph_partial_connections tests/test_live_graph_partial_connections.c graph_engine.o graph_nodes.o graph_api.o graph_edit.o
 
 # Build disconnect test (port-based disconnect functionality)
-test_disconnect: test_disconnect.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o graph_edit.o
-	$(CC) $(CFLAGS) -o test_disconnect test_disconnect.c graph_engine.o graph_nodes.o graph_api.o graph_edit.o
+tests/test_disconnect: tests/test_disconnect.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o graph_edit.o
+	$(CC) $(CFLAGS) -I. -o tests/test_disconnect tests/test_disconnect.c graph_engine.o graph_nodes.o graph_api.o graph_edit.o
 
 # Build graph edit queue test (dynamic editing via queue)
-test_graph_edit_queue: test_graph_edit_queue.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o graph_edit.o
-	$(CC) $(CFLAGS) -o test_graph_edit_queue test_graph_edit_queue.c graph_engine.o graph_nodes.o graph_api.o graph_edit.o
+tests/test_graph_edit_queue: tests/test_graph_edit_queue.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o graph_edit.o
+	$(CC) $(CFLAGS) -I. -o tests/test_graph_edit_queue tests/test_graph_edit_queue.c graph_engine.o graph_nodes.o graph_api.o graph_edit.o
 
 # Build queue API test (pre-allocated IDs API)
-test_queue_api: test_queue_api.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o graph_edit.o
-	$(CC) $(CFLAGS) -o test_queue_api test_queue_api.c graph_engine.o graph_nodes.o graph_api.o graph_edit.o
+tests/test_queue_api: tests/test_queue_api.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o graph_edit.o
+	$(CC) $(CFLAGS) -I. -o tests/test_queue_api tests/test_queue_api.c graph_engine.o graph_nodes.o graph_api.o graph_edit.o
 
 # Build deletion safety test (worker thread safety with node deletion)
-test_deletion_safety: test_deletion_safety.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o graph_edit.o
-	$(CC) $(CFLAGS) -o test_deletion_safety test_deletion_safety.c graph_engine.o graph_nodes.o graph_api.o graph_edit.o
+tests/test_deletion_safety: tests/test_deletion_safety.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o graph_edit.o
+	$(CC) $(CFLAGS) -I. -o tests/test_deletion_safety tests/test_deletion_safety.c graph_engine.o graph_nodes.o graph_api.o graph_edit.o
 
 # Build capacity growth test (dynamic node array expansion)
-test_capacity_growth: test_capacity_growth.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o
-	$(CC) $(CFLAGS) -o test_capacity_growth test_capacity_growth.c graph_engine.o graph_nodes.o graph_edit.o
+tests/test_capacity_growth: tests/test_capacity_growth.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o
+	$(CC) $(CFLAGS) -I. -o tests/test_capacity_growth tests/test_capacity_growth.c graph_engine.o graph_nodes.o graph_edit.o
 
 # Build simple teardown test (basic graph destruction)
-test_simple_teardown: test_simple_teardown.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o
-	$(CC) $(CFLAGS) -o test_simple_teardown test_simple_teardown.c graph_engine.o graph_nodes.o graph_edit.o
+tests/test_simple_teardown: tests/test_simple_teardown.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o
+	$(CC) $(CFLAGS) -I. -o tests/test_simple_teardown tests/test_simple_teardown.c graph_engine.o graph_nodes.o graph_edit.o
 
 # Build comprehensive orphan test (focused orphan status validation)
-test_orphan_comprehensive: test_orphan_comprehensive.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o graph_edit.o
-	$(CC) $(CFLAGS) -o test_orphan_comprehensive test_orphan_comprehensive.c graph_engine.o graph_nodes.o graph_api.o graph_edit.o
+tests/test_orphan_comprehensive: tests/test_orphan_comprehensive.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o graph_edit.o
+	$(CC) $(CFLAGS) -I. -o tests/test_orphan_comprehensive tests/test_orphan_comprehensive.c graph_engine.o graph_nodes.o graph_api.o graph_edit.o
 
 # Build auto-sum test (automatic summing of multiple edges)
-test_auto_sum: test_auto_sum.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o
-	$(CC) $(CFLAGS) -o test_auto_sum test_auto_sum.c graph_engine.o graph_nodes.o graph_edit.o
+tests/test_auto_sum: tests/test_auto_sum.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o
+	$(CC) $(CFLAGS) -I. -o tests/test_auto_sum tests/test_auto_sum.c graph_engine.o graph_nodes.o graph_edit.o
 
 # Build sum behavior test (verify actual audio summing)
-test_sum_behavior: test_sum_behavior.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o
-	$(CC) $(CFLAGS) -o test_sum_behavior test_sum_behavior.c graph_engine.o graph_nodes.o graph_edit.o
+tests/test_sum_behavior: tests/test_sum_behavior.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o
+	$(CC) $(CFLAGS) -I. -o tests/test_sum_behavior tests/test_sum_behavior.c graph_engine.o graph_nodes.o graph_edit.o
 
 # Clean up test artifacts
 clean: clean_tests
 
 clean_tests:
-	rm -f test_mpmc_queue test_engine_workers test_live_graph_multithreaded test_live_graph_workers test_live_graph_partial_connections test_disconnect test_graph_edit_queue test_queue_api test_deletion_safety test_capacity_growth test_simple_teardown test_orphan_comprehensive test_auto_sum test_sum_behavior
+	rm -f tests/test_mpmc_queue tests/test_engine_workers tests/test_live_graph_multithreaded tests/test_live_graph_workers tests/test_live_graph_partial_connections tests/test_disconnect tests/test_graph_edit_queue tests/test_queue_api tests/test_deletion_safety tests/test_capacity_growth tests/test_simple_teardown tests/test_orphan_comprehensive tests/test_auto_sum tests/test_sum_behavior tests/test_engine_workers_debug tests/test_number_node tests/test_orphan_edge_cases
+	rm -rf tests/*.dSYM
 
 .PHONY: all debug release lib lib-release run clean valgrind profile test clean_tests

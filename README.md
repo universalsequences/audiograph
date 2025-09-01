@@ -332,11 +332,11 @@ make clean             # Clean build artifacts
 ### Test Programs
 
 ```bash
-./test_queue_api                    # Test port-based API
-./test_graph_edit_queue            # Test queued graph modifications
-./test_disconnect                  # Test port-based disconnections
-./test_deletion_safety             # Test node deletion with workers
-./test_live_graph_partial_connections  # Test live editing under load
+./tests/test_queue_api                    # Test port-based API
+./tests/test_graph_edit_queue            # Test queued graph modifications
+./tests/test_disconnect                  # Test port-based disconnections
+./tests/test_deletion_safety             # Test node deletion with workers
+./tests/test_live_graph_partial_connections  # Test live editing under load
 ```
 
 ## Performance Characteristics
