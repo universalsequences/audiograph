@@ -8,6 +8,29 @@ AudioGraph is built around a **port-based connection model** with **multi-thread
 
 **Important**: AudioGraph enforces a **Directed Acyclic Graph (DAG)** topology - feedback loops and cycles are not supported. Nodes that form cycles or are not reachable from the output (DAC) are automatically marked as orphaned and excluded from processing.
 
+**Dynamic Capacity**: The graph automatically grows its internal node arrays when needed. During capacity growth, all node port arrays (`inEdgeId`, `outEdgeId`, `succ`) are individually reallocated to prevent memory corruption - this ensures proper cleanup during teardown since each node owns its port arrays independently.
+
+### Memory Layout & Regrowth Strategy
+
+**Node Storage**: The `LiveGraph` uses parallel arrays for node data:
+```c
+RTNode    *nodes;        // Node structures with port pointers
+atomic_int *pending;     // Scheduling counters  
+int       *indegree;     // Connection counts
+bool      *is_orphaned;  // Reachability flags
+```
+
+**Critical Boundary Check**: Growth triggers when `node_id >= node_capacity` (not `node_id > node_capacity`) because array indexes are 0-based. With capacity N, valid indexes are 0 to N-1, so index N requires immediate growth.
+
+**Regrowth Process**:
+1. **Allocate new arrays** at 2× capacity using `malloc` (not `realloc` to avoid partial corruption)
+2. **Deep copy nodes**: Each node's port arrays (`inEdgeId`, `outEdgeId`, `succ`) are individually `malloc`'d and `memcpy`'d to prevent shared pointer corruption
+3. **Preserve edge pool**: The shared edge buffer pool (`lg->edges`) remains unchanged - only node capacity grows
+4. **Atomic pointer swap**: Update all array pointers and capacity in one operation
+5. **Clean old memory**: Free old port arrays first, then old node arrays
+
+This strategy prevents double-free errors during teardown since each node owns independent copies of its port arrays after growth.
+
 ### Core Components
 
 ```

@@ -60,9 +60,6 @@ static void *worker_main(void *arg) {
     int32_t nid;
     // Try to get a ready node from the live graph's MPMC queue
     if (mpmc_pop(lg->readyQueue, &nid)) {
-      pthread_t thread_id = pthread_self();
-      printf("    [LIVE_WORKER %lu] Processing node_id=%d for %d frames\n",
-             (unsigned long)thread_id, nid, g_engine.blockSize);
 
       bind_and_run_live(lg, nid, g_engine.blockSize);
       RTNode *node = &lg->nodes[nid];
@@ -82,8 +79,6 @@ static void *worker_main(void *arg) {
         }
       }
       atomic_fetch_sub_explicit(&lg->jobsInFlight, 1, memory_order_acq_rel);
-      printf("    [LIVE_WORKER %lu] Completed node_id=%d\n",
-             (unsigned long)thread_id, nid);
     } else {
       // Queue is empty - use hybrid spin-yield strategy:
 
@@ -133,48 +128,122 @@ void engine_stop_workers(void) {
 
 // ===================== Live Graph Operations =====================
 
-
 // Ensure node's port arrays exist/are sized (call at node creation in practice)
 // Grow node arrays when capacity is exceeded
 static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
-  if (required_capacity <= lg->node_capacity) {
+
+  if (required_capacity < lg->node_capacity) {
     return true; // Already sufficient
   }
-  
-  int new_capacity = lg->node_capacity;
+
+  int new_capacity = lg->node_capacity * 2;
   while (new_capacity <= required_capacity) {
     new_capacity *= 2; // Double until sufficient
   }
-  
-  // Grow all node-indexed arrays
-  RTNode *new_nodes = realloc(lg->nodes, new_capacity * sizeof(RTNode));
-  atomic_int *new_pending = realloc(lg->pending, new_capacity * sizeof(atomic_int));
-  int *new_indegree = realloc(lg->indegree, new_capacity * sizeof(int));
-  bool *new_orphaned = realloc(lg->is_orphaned, new_capacity * sizeof(bool));
-  
+
+  int old_capacity = lg->node_capacity;
+
+
+  // Allocate new arrays (don't use realloc to avoid partial corruption)
+  RTNode *new_nodes = malloc(new_capacity * sizeof(RTNode));
+
+  int *new_indegree = malloc(new_capacity * sizeof(int));
+
+  bool *new_orphaned = malloc(new_capacity * sizeof(bool));
+
+  atomic_int *new_pending = calloc(new_capacity, sizeof(atomic_int));
+
   if (!new_nodes || !new_pending || !new_indegree || !new_orphaned) {
-    // Allocation failed - don't change anything
+    // Clean up any successful allocations
+    if (new_nodes)
+      free(new_nodes);
+    if (new_indegree)
+      free(new_indegree);
+    if (new_orphaned)
+      free(new_orphaned);
+    if (new_pending)
+      free(new_pending);
     return false;
   }
-  
+
+  // Copy existing data EXCEPT for dynamically allocated port arrays
+  for (int i = 0; i < old_capacity; i++) {
+
+    // Copy the basic node structure
+    new_nodes[i] = lg->nodes[i];
+
+    // But clear the port array pointers - we'll reallocate them
+    new_nodes[i].inEdgeId = NULL;
+    new_nodes[i].outEdgeId = NULL;
+    new_nodes[i].succ = NULL;
+
+    // Re-allocate port arrays if the old node had them
+    RTNode *old_node = &lg->nodes[i];
+    RTNode *new_node = &new_nodes[i];
+
+    if (old_node->nInputs > 0 && old_node->inEdgeId) {
+      new_node->inEdgeId = malloc(old_node->nInputs * sizeof(int));
+      memcpy(new_node->inEdgeId, old_node->inEdgeId,
+             old_node->nInputs * sizeof(int));
+    }
+
+    if (old_node->nOutputs > 0 && old_node->outEdgeId) {
+      new_node->outEdgeId = malloc(old_node->nOutputs * sizeof(int));
+      memcpy(new_node->outEdgeId, old_node->outEdgeId,
+             old_node->nOutputs * sizeof(int));
+    }
+
+    if (old_node->succCount > 0 && old_node->succ) {
+      new_node->succ = malloc(old_node->succCount * sizeof(int));
+      memcpy(new_node->succ, old_node->succ, old_node->succCount * sizeof(int));
+    }
+  }
+
+  memcpy(new_indegree, lg->indegree, old_capacity * sizeof(int));
+  memcpy(new_orphaned, lg->is_orphaned, old_capacity * sizeof(bool));
+
+  // Copy existing atomic values
+  for (int i = 0; i < old_capacity; i++) {
+    int old_val = atomic_load_explicit(&lg->pending[i], memory_order_relaxed);
+    atomic_init(&new_pending[i], old_val);
+  }
+
   // Zero new slots
-  int old_capacity = lg->node_capacity;
-  memset(&new_nodes[old_capacity], 0, (new_capacity - old_capacity) * sizeof(RTNode));
-  memset(&new_indegree[old_capacity], 0, (new_capacity - old_capacity) * sizeof(int));
-  memset(&new_orphaned[old_capacity], 0, (new_capacity - old_capacity) * sizeof(bool));
-  
+  memset(&new_nodes[old_capacity], 0,
+         (new_capacity - old_capacity) * sizeof(RTNode));
+  memset(&new_indegree[old_capacity], 0,
+         (new_capacity - old_capacity) * sizeof(int));
+  memset(&new_orphaned[old_capacity], 0,
+         (new_capacity - old_capacity) * sizeof(bool));
+
   // Initialize new pending slots to -1 (orphaned)
   for (int i = old_capacity; i < new_capacity; i++) {
     atomic_init(&new_pending[i], -1);
   }
-  
+
+  // Now properly free the old arrays including their port arrays
+  for (int i = 0; i < old_capacity; i++) {
+    RTNode *old_node = &lg->nodes[i];
+    if (old_node->inEdgeId)
+      free(old_node->inEdgeId);
+    if (old_node->outEdgeId)
+      free(old_node->outEdgeId);
+    if (old_node->succ)
+      free(old_node->succ);
+  }
+  free(lg->nodes);
+  free(lg->pending);
+  free(lg->indegree);
+  free(lg->is_orphaned);
+
+
   // Update pointers and capacity
   lg->nodes = new_nodes;
   lg->pending = new_pending;
   lg->indegree = new_indegree;
   lg->is_orphaned = new_orphaned;
   lg->node_capacity = new_capacity;
-  
+
   return true;
 }
 
@@ -210,6 +279,9 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   lg->edges = calloc(lg->edge_capacity, sizeof(LiveEdge));
   for (int i = 0; i < lg->edge_capacity; i++) {
     lg->edges[i].buf = alloc_aligned(64, block_size * sizeof(float));
+    if (!lg->edges[i].buf) {
+      return NULL;
+    }
     lg->edges[i].in_use = false;
     lg->edges[i].refcount = 0;
     lg->edges[i].src_node = -1;
@@ -221,7 +293,6 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   lg->scratch_null = alloc_aligned(64, block_size * sizeof(float));
   memset(lg->silence_buf, 0,
          block_size * sizeof(float)); // keep silence buffer zeroed
-
 
   // Ready queue (MPMC for thread safety)
   lg->readyQueue = mpmc_create(1024);
@@ -246,25 +317,26 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
 
   lg->graphEditQueue = calloc(1, sizeof(GraphEditQueue));
   geq_init(lg->graphEditQueue, 256);
-  
+
   // Initialize failed IDs tracking
   lg->failed_ids_capacity = 64; // Start with reasonable capacity
   lg->failed_ids = calloc(lg->failed_ids_capacity, sizeof(uint64_t));
   lg->failed_ids_count = 0;
-  
-  // Initialize atomic node ID counter (start at 1 to avoid confusion with DAC at 0)
+
+  // Initialize atomic node ID counter (start at 1 to avoid confusion with DAC
+  // at 0)
   atomic_init(&lg->next_node_id, 1);
 
   // Automatically create the DAC node at index 0
   int dac_id = apply_add_node(lg, DAC_VTABLE, NULL, 0, "DAC", 1, 1);
   if (dac_id >= 0) {
     lg->dac_node_id = dac_id; // Remember the DAC node
-    
+
     RTNode *dac = &lg->nodes[dac_id];
     dac->nInputs = 1;  // DAC has 1 input (audio in)
     dac->nOutputs = 1; // DAC has 1 output (for reading final audio)
     ensure_port_arrays(dac);
-    
+
     // Allocate an output edge for the DAC so we can read the final audio
     int output_edge = alloc_edge(lg);
     if (output_edge >= 0) {
@@ -277,8 +349,9 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
 }
 
 void destroy_live_graph(LiveGraph *lg) {
-  if (!lg) return;
-  
+  if (!lg)
+    return;
+
   // Free all edge buffers
   if (lg->edges) {
     for (int i = 0; i < lg->edge_capacity; i++) {
@@ -288,11 +361,12 @@ void destroy_live_graph(LiveGraph *lg) {
     }
     free(lg->edges);
   }
-  
+
   // Free all node state and port arrays
   if (lg->nodes) {
-    for (int i = 0; i < lg->node_count; i++) {
+    for (int i = 0; i < lg->node_count; i++) { // Use count, not capacity
       RTNode *node = &lg->nodes[i];
+
       if (node->state) {
         free(node->state);
       }
@@ -308,27 +382,36 @@ void destroy_live_graph(LiveGraph *lg) {
     }
     free(lg->nodes);
   }
-  
+
   // Free scheduling arrays
-  if (lg->pending) free(lg->pending);
-  if (lg->indegree) free(lg->indegree);
-  if (lg->is_orphaned) free(lg->is_orphaned);
-  
+  if (lg->pending)
+    free(lg->pending);
+  if (lg->indegree)
+    free(lg->indegree);
+  if (lg->is_orphaned)
+    free(lg->is_orphaned);
+
   // Free support buffers
-  if (lg->silence_buf) free(lg->silence_buf);
-  if (lg->scratch_null) free(lg->scratch_null);
-  
+  if (lg->silence_buf)
+    free(lg->silence_buf);
+  if (lg->scratch_null)
+    free(lg->scratch_null);
+
   // Free queues
-  if (lg->readyQueue) mpmc_destroy(lg->readyQueue);
-  if (lg->params) free(lg->params);
+  if (lg->readyQueue)
+    mpmc_destroy(lg->readyQueue);
+  if (lg->params)
+    free(lg->params);
   if (lg->graphEditQueue) {
-    if (lg->graphEditQueue->buf) free(lg->graphEditQueue->buf);
+    if (lg->graphEditQueue->buf)
+      free(lg->graphEditQueue->buf);
     free(lg->graphEditQueue);
   }
-  
+
   // Free failed IDs tracking
-  if (lg->failed_ids) free(lg->failed_ids);
-  
+  if (lg->failed_ids)
+    free(lg->failed_ids);
+
   // Free the graph itself
   free(lg);
 }
@@ -336,9 +419,11 @@ void destroy_live_graph(LiveGraph *lg) {
 // Legacy edge functions removed - using port-based alloc_edge instead
 
 int apply_add_node(LiveGraph *lg, NodeVTable vtable, void *state,
-                   uint64_t logical_id, const char *name, int nInputs, int nOutputs) {
+                   uint64_t logical_id, const char *name, int nInputs,
+                   int nOutputs) {
   // Use logical_id directly as the array index
   int node_id = (int)logical_id;
+
   if (node_id >= lg->node_capacity) {
     // Need to expand capacity
     if (!grow_node_capacity(lg, node_id)) {
@@ -357,12 +442,12 @@ int apply_add_node(LiveGraph *lg, NodeVTable vtable, void *state,
   // Set port counts from command
   node->nInputs = nInputs;
   node->nOutputs = nOutputs;
-  
+
   // Initialize port arrays to NULL first
   node->inEdgeId = NULL;
   node->outEdgeId = NULL;
   node->succ = NULL;
-  
+
   // Set up port arrays if needed
   ensure_port_arrays(node);
 
@@ -407,12 +492,15 @@ int live_add_mixer8(LiveGraph *lg, const char *name) {
 static bool still_connected_S_to_D(LiveGraph *lg, int S_id, int D_id) {
   RTNode *S = &lg->nodes[S_id];
   RTNode *D = &lg->nodes[D_id];
-  if (!S->outEdgeId || !D->inEdgeId) return false;
+  if (!S->outEdgeId || !D->inEdgeId)
+    return false;
   for (int so = 0; so < S->nOutputs; so++) {
     int eid = S->outEdgeId[so];
-    if (eid < 0) continue;
+    if (eid < 0)
+      continue;
     for (int di = 0; di < D->nInputs; di++) {
-      if (D->inEdgeId[di] == eid) return true;
+      if (D->inEdgeId[di] == eid)
+        return true;
     }
   }
   return false;
@@ -511,13 +599,16 @@ static void mark_reachable_from_dac(LiveGraph *lg, int node_id, bool *visited) {
   lg->is_orphaned[node_id] = false;
 
   RTNode *node = &lg->nodes[node_id];
-  if (!node->inEdgeId) return;
+  if (!node->inEdgeId)
+    return;
 
   for (int i = 0; i < node->nInputs; i++) {
     int eid = node->inEdgeId[i];
-    if (eid < 0) continue;
+    if (eid < 0)
+      continue;
     int src = lg->edges[eid].src_node;
-    if (src >= 0) mark_reachable_from_dac(lg, src, visited);
+    if (src >= 0)
+      mark_reachable_from_dac(lg, src, visited);
   }
 }
 
@@ -602,7 +693,6 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
   return true;
 }
 
-
 /**
  * Disconnect exactly one destination input port from a source output port.
  * Idempotent: returns true if the specific mapping existed and was removed;
@@ -668,8 +758,6 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
   // 5) Update orphaned status based on DAC reachability
   update_orphaned_status(lg);
 
-  printf("Disconnected node %d:%d -> node %d:%d (edge %d)\n", src_node,
-         src_port, dst_node, dst_port, eid_in);
   return true;
 }
 
@@ -785,7 +873,7 @@ bool apply_delete_node(LiveGraph *lg, int node_id) {
 
   // 4) Clear node data and mark as deleted
   // Note: Don't clear logical_id since it's now the array index
-  node->state = NULL;      // Mark as deleted (state is freed above)
+  node->state = NULL; // Mark as deleted (state is freed above)
   memset(&node->vtable, 0, sizeof(NodeVTable)); // Clear vtable
   node->nInputs = 0;
   node->nOutputs = 0;
@@ -796,19 +884,18 @@ bool apply_delete_node(LiveGraph *lg, int node_id) {
   // 5) Update orphaned status for the entire graph
   update_orphaned_status(lg);
 
-  printf("Deleted node %d and all its connections\n", node_id);
   return true;
 }
 
 void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
   RTNode *node = &lg->nodes[nid];
-  
+
   // treat deleted nodes as: no process fn AND no ports
   if (node->vtable.process == NULL && node->nInputs == 0 && node->nOutputs == 0)
     return;
-  if (lg->is_orphaned[nid])   // Node is orphaned
+  if (lg->is_orphaned[nid]) // Node is orphaned
     return;
-  if (node->nInputs < 0 || node->nOutputs < 0)  // Invalid port counts
+  if (node->nInputs < 0 || node->nOutputs < 0) // Invalid port counts
     return;
 
   float *inPtrs[MAX_IO];
@@ -838,7 +925,8 @@ static void init_pending_and_seed(LiveGraph *lg) {
   // pending = indegree for reachable nodes, -1 for orphaned/deleted
   for (int i = 0; i < lg->node_count; i++) {
     // Skip deleted nodes (no process fn AND no ports)
-    if (lg->nodes[i].vtable.process == NULL && lg->nodes[i].nInputs == 0 && lg->nodes[i].nOutputs == 0) {
+    if (lg->nodes[i].vtable.process == NULL && lg->nodes[i].nInputs == 0 &&
+        lg->nodes[i].nOutputs == 0) {
       atomic_store_explicit(&lg->pending[i], -1, memory_order_relaxed);
       continue;
     }
@@ -869,9 +957,11 @@ static void init_pending_and_seed(LiveGraph *lg) {
 static bool detect_cycle(LiveGraph *lg) {
   int reachable = 0, zero_in = 0;
   for (int i = 0; i < lg->node_count; i++) {
-    if (atomic_load_explicit(&lg->pending[i], memory_order_relaxed) < 0) continue; // orphan/deleted
+    if (atomic_load_explicit(&lg->pending[i], memory_order_relaxed) < 0)
+      continue; // orphan/deleted
     reachable++;
-    if (lg->indegree[i] == 0 && node_has_any_output_connected(lg, i)) zero_in++;
+    if (lg->indegree[i] == 0 && node_has_any_output_connected(lg, i))
+      zero_in++;
   }
   return (reachable > 0 && zero_in == 0);
 }
@@ -883,7 +973,6 @@ void process_live_block(LiveGraph *lg, int nframes) {
 
   // Check for cycles that would cause silent deadlocks
   if (detect_cycle(lg)) {
-    printf("ERROR: Cycle detected in graph - skipping block to prevent deadlock\n");
     // Clear output buffer to silence
     if (lg->dac_node_id >= 0 && lg->nodes[lg->dac_node_id].inEdgeId) {
       int master_edge_id = lg->nodes[lg->dac_node_id].inEdgeId[0];
@@ -1015,7 +1104,8 @@ void add_failed_id(LiveGraph *lg, uint64_t logical_id) {
   // Expand capacity if needed
   if (lg->failed_ids_count >= lg->failed_ids_capacity) {
     lg->failed_ids_capacity *= 2;
-    lg->failed_ids = realloc(lg->failed_ids, lg->failed_ids_capacity * sizeof(uint64_t));
+    lg->failed_ids =
+        realloc(lg->failed_ids, lg->failed_ids_capacity * sizeof(uint64_t));
   }
   lg->failed_ids[lg->failed_ids_count++] = logical_id;
 }
@@ -1032,74 +1122,64 @@ bool is_failed_node(LiveGraph *lg, int logical_id) {
 
 // ===================== Queue-based API =====================
 
-int add_node(LiveGraph *lg, NodeVTable vtable, void *state, const char *name, int nInputs, int nOutputs) {
+int add_node(LiveGraph *lg, NodeVTable vtable, void *state, const char *name,
+             int nInputs, int nOutputs) {
   // Atomically allocate the next node ID (which is also the array index)
   int node_id = atomic_fetch_add(&lg->next_node_id, 1);
-  
+
   // Create the command
   GraphEditCmd cmd = {
-    .op = GE_ADD_NODE,
-    .u.add_node = {
-      .vt = vtable,
-      .state = state,
-      .logical_id = node_id,  // Use node_id as the logical_id (they're the same)
-      .name = (char *)name,
-      .nInputs = nInputs,
-      .nOutputs = nOutputs
-    }
-  };
-  
+      .op = GE_ADD_NODE,
+      .u.add_node = {
+          .vt = vtable,
+          .state = state,
+          .logical_id =
+              node_id, // Use node_id as the logical_id (they're the same)
+          .name = (char *)name,
+          .nInputs = nInputs,
+          .nOutputs = nOutputs}};
+
   // Queue the command
   if (!geq_push(lg->graphEditQueue, &cmd)) {
     // Queue full - consider this a failure
     add_failed_id(lg, node_id);
     return -1;
   }
-  
+
   // Return the pre-allocated node ID (which is both logical_id and array index)
   return node_id;
 }
 
 bool delete_node(LiveGraph *lg, int node_id) {
-  GraphEditCmd cmd = {
-    .op = GE_REMOVE_NODE,
-    .u.remove_node = {
-      .node_id = node_id
-    }
-  };
-  
+  GraphEditCmd cmd = {.op = GE_REMOVE_NODE,
+                      .u.remove_node = {.node_id = node_id}};
+
   return geq_push(lg->graphEditQueue, &cmd);
 }
 
-bool connect(LiveGraph *lg, int src_node, int src_port, int dst_node, int dst_port) {
+bool connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
+             int dst_port) {
   // Check if either node has failed
   if (is_failed_node(lg, src_node) || is_failed_node(lg, dst_node)) {
     return false;
   }
-  
-  GraphEditCmd cmd = {
-    .op = GE_CONNECT,
-    .u.connect = {
-      .src_id = src_node,
-      .src_port = src_port,
-      .dst_id = dst_node,
-      .dst_port = dst_port
-    }
-  };
-  
+
+  GraphEditCmd cmd = {.op = GE_CONNECT,
+                      .u.connect = {.src_id = src_node,
+                                    .src_port = src_port,
+                                    .dst_id = dst_node,
+                                    .dst_port = dst_port}};
+
   return geq_push(lg->graphEditQueue, &cmd);
 }
 
-bool disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node, int dst_port) {
-  GraphEditCmd cmd = {
-    .op = GE_DISCONNECT,
-    .u.disconnect = {
-      .src_id = src_node,
-      .src_port = src_port,
-      .dst_id = dst_node,
-      .dst_port = dst_port
-    }
-  };
-  
+bool disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
+                int dst_port) {
+  GraphEditCmd cmd = {.op = GE_DISCONNECT,
+                      .u.disconnect = {.src_id = src_node,
+                                       .src_port = src_port,
+                                       .dst_id = dst_node,
+                                       .dst_port = dst_port}};
+
   return geq_push(lg->graphEditQueue, &cmd);
 }

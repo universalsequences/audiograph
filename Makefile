@@ -48,12 +48,14 @@ profile: $(TARGET)
 	instruments -t "Time Profiler" ./$(TARGET)
 
 # Test targets
-test: test_mpmc_queue test_live_graph_partial_connections test_disconnect test_graph_edit_queue test_queue_api
+test: test_mpmc_queue test_live_graph_partial_connections test_disconnect test_graph_edit_queue test_queue_api test_capacity_growth test_simple_teardown
 	./test_mpmc_queue
 	./test_live_graph_partial_connections
 	./test_disconnect
 	./test_graph_edit_queue
 	./test_queue_api
+	./test_capacity_growth
+	./test_simple_teardown
 
 # Build MPMC queue unit tests
 test_mpmc_queue: test_mpmc_queue.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o
@@ -79,10 +81,18 @@ test_queue_api: test_queue_api.c $(HEADERS) graph_engine.o graph_nodes.o graph_a
 test_deletion_safety: test_deletion_safety.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o graph_edit.o
 	$(CC) $(CFLAGS) -o test_deletion_safety test_deletion_safety.c graph_engine.o graph_nodes.o graph_api.o graph_edit.o
 
+# Build capacity growth test (dynamic node array expansion)
+test_capacity_growth: test_capacity_growth.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o
+	$(CC) $(CFLAGS) -o test_capacity_growth test_capacity_growth.c graph_engine.o graph_nodes.o graph_edit.o
+
+# Build simple teardown test (basic graph destruction)
+test_simple_teardown: test_simple_teardown.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o
+	$(CC) $(CFLAGS) -o test_simple_teardown test_simple_teardown.c graph_engine.o graph_nodes.o graph_edit.o
+
 # Clean up test artifacts
 clean: clean_tests
 
 clean_tests:
-	rm -f test_mpmc_queue test_engine_workers test_live_graph_multithreaded test_live_graph_workers test_live_graph_partial_connections test_disconnect test_graph_edit_queue test_queue_api test_deletion_safety
+	rm -f test_mpmc_queue test_engine_workers test_live_graph_multithreaded test_live_graph_workers test_live_graph_partial_connections test_disconnect test_graph_edit_queue test_queue_api test_deletion_safety test_capacity_growth test_simple_teardown
 
 .PHONY: all debug release run clean valgrind profile test clean_tests
