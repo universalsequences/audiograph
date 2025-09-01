@@ -17,6 +17,8 @@ typedef struct {
   float *buf;   // size = block_size
   int refcount; // number of input ports consuming this signal
   bool in_use;
+  int src_node;   // who writes this edge
+  int src_port;   // which output port
 } LiveEdge;
 
 typedef struct RTNode {
@@ -34,7 +36,6 @@ typedef struct RTNode {
   // scheduling
   int32_t *succ; // successor node indices
   int succCount; // number of nodes that depend on this node's output
-  int faninBase; // initial number of preds
 } RTNode;
 
 typedef struct GraphState {

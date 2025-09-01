@@ -1,4 +1,5 @@
 #include "graph_engine.h"
+#include "graph_edit.h"
 #include "graph_nodes.h"
 #include <assert.h>
 #include <stdio.h>
@@ -19,11 +20,14 @@ int main() {
 
   // Connect: osc1->gain1->mixer:0, osc2->gain2->mixer:1, mixer->dac
   printf("Connecting nodes...\n");
-  assert(apply_connect(lg, osc1, 0, gain1, 0));
-  assert(apply_connect(lg, osc2, 0, gain2, 0));
-  assert(apply_connect(lg, gain1, 0, mixer, 0)); // mixer port 0
-  assert(apply_connect(lg, gain2, 0, mixer, 1)); // mixer port 1
-  assert(apply_connect(lg, mixer, 0, dac, 0));
+  assert(connect(lg, osc1, 0, gain1, 0));
+  assert(connect(lg, osc2, 0, gain2, 0));
+  assert(connect(lg, gain1, 0, mixer, 0)); // mixer port 0
+  assert(connect(lg, gain2, 0, mixer, 1)); // mixer port 1
+  assert(connect(lg, mixer, 0, dac, 0));
+  
+  // Process all queued operations
+  apply_graph_edits(lg->graphEditQueue, lg);
   printf("All connections established successfully\n");
 
   // Test 1: Valid disconnect - gain1 from mixer port 0

@@ -6,6 +6,8 @@ A real-time audio graph processing engine written in C11 with lock-free multi-th
 
 AudioGraph is built around a **port-based connection model** with **multi-threaded worker pools** and **lock-free queue systems** for safe real-time audio processing and live graph editing.
 
+**Important**: AudioGraph enforces a **Directed Acyclic Graph (DAG)** topology - feedback loops and cycles are not supported. Nodes that form cycles or are not reachable from the output (DAC) are automatically marked as orphaned and excluded from processing.
+
 ### Core Components
 
 ```

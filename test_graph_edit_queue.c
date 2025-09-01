@@ -27,6 +27,9 @@ int main() {
   printf("  Created nodes: osc1=%d, osc2=%d, mixer=%d, dac=%d\n", osc1, osc2,
          mixer, dac);
 
+  // Process queued node creation before creating connections
+  apply_graph_edits(lg->graphEditQueue, lg);
+
   // Queue connect commands instead of connecting directly
   GraphEditCmd connect_cmd1 = {
       .op = GE_CONNECT,
@@ -102,8 +105,10 @@ int main() {
   GraphEditCmd add_node_cmd = {.op = GE_ADD_NODE,
                                .u.add_node = {.vt = GAIN_VTABLE,
                                               .state = gain_state,
-                                              .logical_id = 0x2000,
-                                              .name = "queued_gain"}};
+                                              .logical_id = lg->node_count,
+                                              .name = "queued_gain",
+                                              .nInputs = 1,
+                                              .nOutputs = 1}};
 
   int initial_node_count = lg->node_count;
   bool push_add = geq_push(lg->graphEditQueue, &add_node_cmd);

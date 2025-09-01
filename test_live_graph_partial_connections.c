@@ -12,6 +12,7 @@
  ******************************************************************************/
 
 #include "graph_api.h"
+#include "graph_edit.h"
 #include "graph_engine.h"
 #include "graph_nodes.h"
 #include <assert.h>
@@ -97,9 +98,8 @@ bool create_partial_connections_graph() {
     }
 
     // Connect osc -> gain for all oscillators
-    if (!apply_connect(g_partial_test.live_graph,
-                       g_partial_test.oscillator_nodes[i], 0,
-                       g_partial_test.gain_nodes[i], 0)) {
+    if (!connect(g_partial_test.live_graph, g_partial_test.oscillator_nodes[i],
+                 0, g_partial_test.gain_nodes[i], 0)) {
       printf("ERROR: Failed to connect oscillator %d to gain %d\\n", i, i);
       return false;
     }
@@ -116,8 +116,8 @@ bool create_partial_connections_graph() {
   // Connect ONLY the first 2 gains to mixer (gains 2-7 will be orphaned)
   printf("Connecting gains 0 and 1 to mixer (gains 2-7 will be orphaned)...\n");
   for (int i = 0; i < NUM_CONNECTED; i++) {
-    if (!apply_connect(g_partial_test.live_graph, g_partial_test.gain_nodes[i],
-                       0, g_partial_test.mixer_node, i)) {
+    if (!connect(g_partial_test.live_graph, g_partial_test.gain_nodes[i], 0,
+                 g_partial_test.mixer_node, i)) {
       printf("ERROR: Failed to connect gain %d to mixer\n", i);
       return false;
     }
@@ -127,11 +127,14 @@ bool create_partial_connections_graph() {
   // Use the auto-created DAC node as the final sink for all audio
   g_partial_test.output_node = g_partial_test.live_graph->dac_node_id;
 
-  if (!apply_connect(g_partial_test.live_graph, g_partial_test.mixer_node, 0,
-                     g_partial_test.output_node, 0)) {
+  if (!connect(g_partial_test.live_graph, g_partial_test.mixer_node, 0,
+               g_partial_test.output_node, 0)) {
     printf("ERROR: Failed to connect mixer to DAC\\n");
     return false;
   }
+
+  apply_graph_edits(g_partial_test.live_graph->graphEditQueue,
+                    g_partial_test.live_graph);
 
   printf("Live graph created successfully:\\n");
   printf("  Total nodes: %d\n", g_partial_test.live_graph->node_count);
