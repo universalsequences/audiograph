@@ -167,6 +167,42 @@ typedef struct {
 - Commands: `GE_ADD_NODE`, `GE_REMOVE_NODE`, `GE_CONNECT`, `GE_DISCONNECT`
 - Atomic application ensures graph consistency
 
+### Block Boundary Edit Processing
+
+**Safe Graph Modification**: All graph edits are applied atomically at block boundaries to ensure real-time safety:
+
+```c
+void process_next_block(LiveGraph *lg, float *output_buffer, int nframes) {
+    // 1. Apply all queued parameter updates first
+    apply_params(lg->params);
+    
+    // 2. Apply all queued graph edits (add/remove/connect/disconnect)
+    apply_graph_edits(lg->graphEditQueue, lg);
+    
+    // 3. Process audio with the updated graph structure
+    process_live_block(lg, nframes);
+    
+    // 4. Copy final audio output to user buffer
+    // ...
+}
+```
+
+**Real-time Safety Guarantees**:
+- **UI/Control Thread**: Pushes edit commands to lock-free queue (`add_node()`, `connect()`, etc.)
+- **Audio Thread**: Drains entire queue between audio blocks via `apply_graph_edits()`
+- **Zero Allocations**: All memory allocation (including capacity growth) happens between blocks, never during audio processing
+- **Zero Locks**: Lock-free queue allows non-blocking command submission from any thread
+- **Deterministic Timing**: Graph structure is frozen during each audio block - no mid-block topology changes
+- **Consistent State**: Each audio block sees a stable, consistent graph configuration
+
+**Edit Command Lifecycle**:
+1. **Queue Phase**: Commands pushed to `GraphEditQueue` (returns immediately)
+2. **Batch Apply**: All pending edits applied atomically at next block boundary  
+3. **Capacity Growth**: Node arrays automatically expand if needed during add operations
+4. **Dependency Update**: Orphan detection and scheduling arrays updated after structural changes
+
+This design ensures that graph modifications never interfere with ongoing audio processing while maintaining deterministic real-time performance.
+
 ## Usage Example
 
 ### Complete System Example
