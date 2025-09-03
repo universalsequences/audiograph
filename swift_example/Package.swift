@@ -10,9 +10,12 @@ let package = Package(
         .executableTarget(
             name: "AudioGraphExample",
             dependencies: ["AudioGraph"],
+            cSettings: [
+                .headerSearchPath("audiograph")
+            ],
             linkerSettings: [
                 .linkedLibrary("audiograph"),
-                .unsafeFlags(["-L", "./audiograph"])
+                .unsafeFlags(["-L", "./audiograph", "-Xlinker", "-rpath", "-Xlinker", "./audiograph"])
             ]
         ),
         .systemLibrary(

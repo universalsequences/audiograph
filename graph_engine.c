@@ -1,6 +1,7 @@
 #include "graph_engine.h"
 #include "graph_edit.h"
 #include "graph_nodes.h"
+#include <unistd.h>
 
 // ===================== Forward Declarations =====================
 
@@ -66,6 +67,7 @@ static void *worker_main(void *arg) {
         atomic_load_explicit(&g_engine.workSession, memory_order_acquire);
     if (!lg) {
       sched_yield();
+      usleep(1000);
       continue;
     }
 
@@ -78,15 +80,12 @@ static void *worker_main(void *arg) {
 
       // Notify successors
       if (node->succ && node->succCount > 0) {
-        printf("DEBUG NOTIFY: Node %d notifying %d successors\n", nid, node->succCount);
         for (int i = 0; i < node->succCount; i++) {
           int succ = node->succ[i];
           if (succ >= 0 && succ < lg->node_count && !lg->is_orphaned[succ]) {
             int old_pending = atomic_fetch_sub_explicit(&lg->pending[succ], 1,
-                                          memory_order_acq_rel);
-            printf("DEBUG NOTIFY: Successor %d pending: %d -> %d\n", succ, old_pending, old_pending-1);
+                                                        memory_order_acq_rel);
             if (old_pending == 1) {
-              printf("DEBUG NOTIFY: Adding successor %d to ready queue\n", succ);
               while (!mpmc_push(lg->readyQueue, succ)) {
                 __asm__ __volatile__("" ::: "memory");
               }
@@ -96,22 +95,17 @@ static void *worker_main(void *arg) {
       }
       atomic_fetch_sub_explicit(&lg->jobsInFlight, 1, memory_order_acq_rel);
     } else {
-      // Queue is empty - use hybrid spin-yield strategy:
+      // Queue is empty - use CPU-friendly backoff strategy:
 
-      // First, do a brief spin loop (64 iterations) to avoid syscall overhead
-      // if work becomes available soon. The memory barrier prevents compiler
-      // optimization from removing the loop.
-      for (int i = 0; i < 64; i++) {
-        __asm__ __volatile__(
-            "" ::
-                : "memory"); // Memory barrier (no-op instruction)
+      // Brief spin loop for low-latency response (reduced from 64 to 8
+      // iterations)
+      for (int i = 0; i < 8; i++) {
+        __asm__ __volatile__("" ::: "memory");
       }
 
-      // Still no work - cooperatively yield CPU time to other threads
-      // (audio thread, other workers, or OS tasks)
-      sched_yield();
+      // Sleep for 1 millisecond to be CPU-friendly when idle
+      usleep(1000);
 
-      // Go back to top of worker loop to check for new work
       continue;
     }
   }
@@ -158,7 +152,6 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
   }
 
   int old_capacity = lg->node_capacity;
-
 
   // Allocate new arrays (don't use realloc to avoid partial corruption)
   RTNode *new_nodes = malloc(new_capacity * sizeof(RTNode));
@@ -260,7 +253,6 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
   free(lg->pending);
   free(lg->indegree);
   free(lg->is_orphaned);
-
 
   // Update pointers and capacity
   lg->nodes = new_nodes;
@@ -676,7 +668,8 @@ static void update_orphaned_status(LiveGraph *lg) {
 /**
  * Port-mapped connect with auto-SUM:
  *   - First producer per dst input port: normal 1:1 connect
- *   - Second producer: create SUM node, rewire existing through SUM, add new input
+ *   - Second producer: create SUM node, rewire existing through SUM, add new
+ * input
  *   - Additional producers: grow SUM inputs
  *
  * Returns false on invalid params or capacity issues.
@@ -725,7 +718,8 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       // Case 2: Create SUM with 2 inputs - find a free node slot
       int free_id = -1;
       for (int i = 0; i < lg->node_capacity; i++) {
-        if (lg->nodes[i].vtable.process == NULL && lg->nodes[i].nInputs == 0 && lg->nodes[i].nOutputs == 0) {
+        if (lg->nodes[i].vtable.process == NULL && lg->nodes[i].nInputs == 0 &&
+            lg->nodes[i].nOutputs == 0) {
           free_id = i;
           break;
         }
@@ -746,8 +740,9 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       // Disconnect old_src → D:dst_port (lightweight local form)
       D->inEdgeId[dst_port] = -1;
       lg->indegree[dst_node]--;
-      
-      // Remove dst_node from old_src's successor list since it's no longer a direct successor
+
+      // Remove dst_node from old_src's successor list since it's no longer a
+      // direct successor
       remove_successor(&lg->nodes[old_src], dst_node);
 
       // Hook old_src → SUM.in0 (reuse existing edge)
@@ -789,7 +784,8 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       lg->edges[sum_out].refcount++;
       if (!has_successor(SUM, dst_node))
         add_successor_port(SUM, dst_node);
-      lg->indegree[dst_node]++; // Restore indegree since destination now depends on SUM
+      lg->indegree[dst_node]++; // Restore indegree since destination now
+                                // depends on SUM
 
       // Remember the SUM
       D->fanin_sum_node_id[dst_port] = sum_id;
@@ -828,9 +824,10 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
 }
 
 /**
- * Disconnect a logical connection between src_node:src_port and dst_node:dst_port.
- * This function is transparent to SUM nodes - it handles the hidden SUM logic automatically.
- * Returns true if the logical connection existed and was removed.
+ * Disconnect a logical connection between src_node:src_port and
+ * dst_node:dst_port. This function is transparent to SUM nodes - it handles the
+ * hidden SUM logic automatically. Returns true if the logical connection
+ * existed and was removed.
  */
 bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
                       int dst_port) {
@@ -852,7 +849,7 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
 
   // Check if dst_port has a SUM node
   int sum_id = D->fanin_sum_node_id ? D->fanin_sum_node_id[dst_port] : -1;
-  
+
   if (sum_id == -1) {
     // No SUM node - handle as direct connection
     int eid_in = D->inEdgeId[dst_port];
@@ -890,7 +887,7 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
     int src_eid = S->outEdgeId[src_port];
     if (src_eid < 0)
       return false; // Source not connected
-    
+
     // Find the SUM input that matches this source
     int sum_input_idx = -1;
     for (int i = 0; i < SUM->nInputs; i++) {
@@ -899,17 +896,17 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
         break;
       }
     }
-    
+
     if (sum_input_idx == -1)
       return false; // Source not connected to this SUM
-    
+
     // Disconnect src_node from SUM
     SUM->inEdgeId[sum_input_idx] = -1;
     lg->indegree[sum_id]--;
     if (!still_connected_S_to_D(lg, src_node, sum_id)) {
       remove_successor(S, sum_id);
     }
-    
+
     // Handle edge refcount
     LiveEdge *e = &lg->edges[src_eid];
     if (e->refcount > 0)
@@ -918,48 +915,48 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       retire_edge(lg, src_eid);
       S->outEdgeId[src_port] = -1;
     }
-    
+
     // Compact SUM inputs (remove the gap)
     for (int i = sum_input_idx; i < SUM->nInputs - 1; i++) {
       SUM->inEdgeId[i] = SUM->inEdgeId[i + 1];
     }
     SUM->nInputs--;
     SUM->inEdgeId = realloc(SUM->inEdgeId, SUM->nInputs * sizeof(int32_t));
-    
+
     // Handle SUM collapse cases
     if (SUM->nInputs == 0) {
       // No inputs left - remove SUM and clear destination
       D->inEdgeId[dst_port] = -1;
       D->fanin_sum_node_id[dst_port] = -1;
       lg->indegree[dst_node]--;
-      
+
       // Retire SUM's output edge
       int sum_out = SUM->outEdgeId[0];
       if (sum_out >= 0) {
         retire_edge(lg, sum_out);
       }
-      
+
       // Delete the SUM node
       apply_delete_node(lg, sum_id);
     } else if (SUM->nInputs == 1) {
       // Only one input left - collapse SUM back to direct connection
       int remaining_eid = SUM->inEdgeId[0];
       int sum_out = SUM->outEdgeId[0];
-      
+
       // Find the source of the remaining edge
       int remaining_src = lg->edges[remaining_eid].src_node;
       int remaining_src_port = lg->edges[remaining_eid].src_port;
-      
+
       // Create a new edge for the direct connection
       int direct_eid = alloc_edge(lg);
       if (direct_eid < 0)
         return false;
-      
+
       // Set up the new direct edge
       lg->edges[direct_eid].src_node = remaining_src;
       lg->edges[direct_eid].src_port = remaining_src_port;
       lg->edges[direct_eid].refcount = 1; // consumed by destination
-      
+
       // Wire source to new edge and destination to new edge
       if (remaining_src >= 0) {
         lg->nodes[remaining_src].outEdgeId[remaining_src_port] = direct_eid;
@@ -969,28 +966,28 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
         // Remove SUM from source's successors
         remove_successor(&lg->nodes[remaining_src], sum_id);
       }
-      
+
       D->inEdgeId[dst_port] = direct_eid;
       D->fanin_sum_node_id[dst_port] = -1;
-      
+
       // Clean up SUM connections before deleting
       // Disconnect SUM from destination
-      lg->edges[sum_out].refcount--; 
-      lg->indegree[dst_node]--; 
+      lg->edges[sum_out].refcount--;
+      lg->indegree[dst_node]--;
       remove_successor(SUM, dst_node);
-      
+
       // Disconnect remaining source from SUM
       lg->edges[remaining_eid].refcount--;
       lg->indegree[sum_id]--;
-      
+
       // Retire SUM's edges and delete SUM
       retire_edge(lg, sum_out);
       if (lg->edges[remaining_eid].refcount == 0) {
         retire_edge(lg, remaining_eid);
       }
-      
+
       apply_delete_node(lg, sum_id);
-      
+
       // Update scheduling for direct connection
       lg->indegree[dst_node]++;
     }
@@ -1146,7 +1143,6 @@ void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
 
   // Set thread-local context for SUM nodes to access input count
   g_current_processing_node = node;
-
 
   float *inPtrs[MAX_IO];
   float *outPtrs[MAX_IO];

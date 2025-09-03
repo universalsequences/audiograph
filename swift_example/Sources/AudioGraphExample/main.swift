@@ -1,100 +1,189 @@
-import AudioGraph
 import AVFoundation
+import AudioGraph
 import Foundation
 
-// Global audio graph manager for use in render callback
+// Simple kernel manager that compiles and loads our custom C code
+class CustomKernelManager {
+    private var dylibHandle: UnsafeMutableRawPointer?
+    private var kernelFn: (@convention(c) (UnsafePointer<UnsafeMutablePointer<Float>?>?, UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32, UnsafeMutableRawPointer?) -> Void)?
+    
+    private let kernelSource = """
+    #include <stdio.h>
+    
+    // Simple kernel that outputs constant 0.5 on all channels
+    void constant_kernel(float *const *in, float *const *out, int nframes, void *state) {
+        printf("=== CUSTOM KERNEL CALLED ===\\n");
+        printf("in=%p, out=%p, nframes=%d, state=%p\\n", (void*)in, (void*)out, nframes, state);
+        
+        // Safety checks
+        if (!out || !out[0]) {
+            printf("ERROR: Invalid output buffer\\n");
+            return;
+        }
+        
+        if (nframes <= 0 || nframes > 8192) {
+            printf("ERROR: Invalid nframes=%d\\n", nframes);
+            return;
+        }
+        
+        printf("SUCCESS: Writing constant 0.5 to %d frames\\n", nframes);
+        
+        // Output constant 0.5 to all frames
+        for (int i = 0; i < nframes; i++) {
+            out[0][i] = 0.5f;
+        }
+        
+        printf("SUCCESS: constant_kernel completed\\n");
+    }
+    """
+    
+    func compileAndLoad() throws {
+        let tmpDir = FileManager.default.temporaryDirectory
+        let timestamp = String(Int(Date().timeIntervalSince1970 * 1000))
+        let cFile = tmpDir.appendingPathComponent("kernel_\(timestamp).c")
+        let dylibFile = tmpDir.appendingPathComponent("libkernel_\(timestamp).dylib")
+        
+        try kernelSource.write(to: cFile, atomically: true, encoding: .utf8)
+        
+        let compile = Process()
+        compile.launchPath = "/usr/bin/clang"
+        let arguments = [
+            "-O3", "-march=armv8-a", "-fPIC", "-shared",
+            "-framework", "Accelerate",
+            "-std=c11",
+            "-x", "c",
+            "-o", dylibFile.path, cFile.path,
+        ]
+        
+        print("🔧 Compiling kernel: clang \(arguments.joined(separator: " "))")
+        
+        let errorPipe = Pipe()
+        compile.standardError = errorPipe
+        compile.arguments = arguments
+        compile.launch()
+        compile.waitUntilExit()
+        
+        let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        let errorOutput = String(data: errorData, encoding: .utf8) ?? ""
+        
+        if !errorOutput.isEmpty {
+            print("⚠️ CLANG STDERR OUTPUT:")
+            print(errorOutput)
+        }
+        
+        guard compile.terminationStatus == 0 else {
+            throw NSError(domain: "CompileError", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed to compile kernel: \(errorOutput)"])
+        }
+        
+        dylibHandle = dlopen(dylibFile.path, RTLD_NOW)
+        guard let handle = dylibHandle else {
+            let error = String(cString: dlerror())
+            throw NSError(domain: "DLError", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to load .dylib: \(error)"])
+        }
+        
+        print("🔍 Looking for constant_kernel symbol...")
+        guard let sym = dlsym(handle, "constant_kernel") else {
+            let error = String(cString: dlerror())
+            throw NSError(domain: "DLError", code: 3, userInfo: [NSLocalizedDescriptionKey: "Symbol constant_kernel not found: \(error)"])
+        }
+        
+        kernelFn = unsafeBitCast(sym, to: (@convention(c) (UnsafePointer<UnsafeMutablePointer<Float>?>?, UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32, UnsafeMutableRawPointer?) -> Void).self)
+        
+        print("✅ Custom kernel compiled and loaded successfully!")
+    }
+    
+    func getKernelFunction() -> (@convention(c) (UnsafePointer<UnsafeMutablePointer<Float>?>?, UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32, UnsafeMutableRawPointer?) -> Void)? {
+        return kernelFn
+    }
+    
+    deinit {
+        if let handle = dylibHandle {
+            dlclose(handle)
+        }
+    }
+}
+
+// Simple audio graph manager for testing custom kernel
 class AudioGraphManager {
     private var liveGraph: UnsafeMutablePointer<LiveGraph>?
     private let blockSize: Int32 = 512
     private var audioBuffer = [Float]()
-    
+    private let kernelManager = CustomKernelManager()
+
     init() {
         setupAudioGraph()
     }
-    
+
     private func setupAudioGraph() {
         // Initialize engine with matching sample rate
         initialize_engine(blockSize, 44100)
-        
-        guard let lg = create_live_graph(32, blockSize, "swift_av_graph") else {
+
+        guard let lg = create_live_graph(32, blockSize, "swift_kernel_test") else {
             print("✗ Failed to create live graph")
             return
         }
-        
+
         liveGraph = lg
         audioBuffer = [Float](repeating: 0.0, count: Int(blockSize))
-        
+
         // Start worker threads
-        engine_start_workers(2)
-        
-        // Create multiple oscillators for a chord
-        let frequencies: [Float] = [261.63, 329.63, 392.00, 523.25] // C major chord
-        let gainPerOsc: Float = 0.15  // Adjusted for 4 oscillators
-        
-        var oscNodes: [Int32] = []
-        var gainNodes: [Int32] = []
-        
-        // Create oscillators and individual gain controls
-        for (i, freq) in frequencies.enumerated() {
-            let osc = live_add_oscillator(lg, freq, "osc_\(i)")
-            let gain = live_add_gain(lg, gainPerOsc, "gain_\(i)")
-            oscNodes.append(osc)
-            gainNodes.append(gain)
-            
-            // Connect osc -> gain
-            _ = connect(lg, osc, 0, gain, 0)
+        engine_start_workers(4)
+
+        // Compile and load our custom kernel
+        do {
+            try kernelManager.compileAndLoad()
+        } catch {
+            print("✗ Failed to compile/load kernel: \(error)")
+            return
         }
         
-        // Create master mixer and master gain
-        let mixer = live_add_mixer8(lg, "master_mix")
-        let masterGain = live_add_gain(lg, 0.5, "master_vol")
-        
-        // Connect all gains to mixer inputs
-        for (i, gainNode) in gainNodes.enumerated() {
-            _ = connect(lg, gainNode, 0, mixer, Int32(i))
+        guard let kernelFn = kernelManager.getKernelFunction() else {
+            print("✗ Failed to get kernel function")
+            return
         }
         
-        // Connect mixer -> master gain -> DAC
-        _ = connect(lg, mixer, 0, masterGain, 0)
-        _ = connect(lg, masterGain, 0, lg.pointee.dac_node_id, 0)
+        // Create a custom node with our kernel
+        // Note: We need to create a NodeVTable and pass it to add_node
+        let vtable = NodeVTable(
+            process: kernelFn,
+            init: nil,
+            reset: nil,
+            migrate: nil
+        )
         
-        print("✓ Created audio graph: 4 oscillators -> individual gains -> mixer -> master gain -> output")
-        print("✓ Frequencies: \(frequencies.map { "\($0)Hz" }.joined(separator: ", "))")
+        let customNode = add_node(lg, vtable, nil, "custom_kernel", 0, 1)
+        
+        // Connect custom node directly to DAC
+        _ = connect(lg, customNode, 0, lg.pointee.dac_node_id, 0)
+        
+        print("✓ Created simple audio graph: custom_kernel -> DAC")
     }
-    
-    func renderAudio(frameCount: UInt32, audioBufferList: UnsafeMutablePointer<AudioBufferList>) -> OSStatus {
-        guard let lg = liveGraph else { return kAudioUnitErr_Uninitialized }
-        
-        let ablPointer = UnsafeMutableAudioBufferListPointer(audioBufferList)
-        guard let leftBuffer = ablPointer[0].mData?.assumingMemoryBound(to: Float.self),
-              let rightBuffer = ablPointer[1].mData?.assumingMemoryBound(to: Float.self) else {
-            return kAudioUnitErr_InvalidParameter
+
+    func testProcessNextBlock() {
+        guard let lg = liveGraph else {
+            print("✗ No live graph available")
+            return
         }
         
-        var framesProcessed: UInt32 = 0
+        print("\n🧪 Testing process_next_block with custom kernel...")
         
-        // Process in chunks of our block size
-        while framesProcessed < frameCount {
-            let framesToProcess = min(UInt32(blockSize), frameCount - framesProcessed)
+        // Process a few blocks and print the results
+        for blockNum in 0..<3 {
+            print("\n--- Block \(blockNum + 1) ---")
             
-            // Get audio from audiograph (mono output)
             audioBuffer.withUnsafeMutableBufferPointer { bufferPtr in
-                process_next_block(lg, bufferPtr.baseAddress!, Int32(framesToProcess))
+                process_next_block(lg, bufferPtr.baseAddress!, blockSize)
             }
             
-            // Copy mono signal to both stereo channels
-            for i in 0..<Int(framesToProcess) {
-                let sample = audioBuffer[i]
-                leftBuffer[Int(framesProcessed) + i] = sample
-                rightBuffer[Int(framesProcessed) + i] = sample
-            }
+            // Print first few samples to verify our kernel is working
+            print("First 8 samples: \(Array(audioBuffer.prefix(8)))")
             
-            framesProcessed += framesToProcess
+            // Check if all samples are 0.5 as expected
+            let allCorrect = audioBuffer.allSatisfy { $0 == 0.5 }
+            print("All samples = 0.5: \(allCorrect ? "✅ YES" : "❌ NO")")
         }
-        
-        return noErr
     }
-    
+
     deinit {
         engine_stop_workers()
         if let lg = liveGraph {
@@ -103,50 +192,16 @@ class AudioGraphManager {
     }
 }
 
-class AudioGraphSourceNode: AVAudioSourceNode {
-    private let audioGraphManager = AudioGraphManager()
-    
-    init() {
-        // Initialize with stereo format at 44.1kHz (standard audio)  
-        let format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 2)!
-        
-        super.init(format: format) { [weak audioGraphManager] _, _, frameCount, audioBufferList -> OSStatus in
-            return audioGraphManager?.renderAudio(frameCount: frameCount, audioBufferList: audioBufferList) ?? kAudioUnitErr_Uninitialized
-        }
-    }
-}
-
 func main() {
-    print("AudioGraph + AVAudioEngine Real-time Example")
-    print("===========================================")
+    print("AudioGraph Custom Kernel Test")
+    print("=============================")
+
+    let manager = AudioGraphManager()
     
-    let audioEngine = AVAudioEngine()
-    let sourceNode = AudioGraphSourceNode()
-    let mainMixer = audioEngine.mainMixerNode
+    // Test the custom kernel without AVAudioEngine
+    manager.testProcessNextBlock()
     
-    // Attach our custom source node
-    audioEngine.attach(sourceNode)
-    
-    // Connect source -> mixer -> output
-    audioEngine.connect(sourceNode, to: mainMixer, format: sourceNode.outputFormat(forBus: 0))
-    audioEngine.connect(mainMixer, to: audioEngine.outputNode, format: nil)
-    
-    do {
-        try audioEngine.start()
-        print("✓ Audio engine started - you should hear a C major chord!")
-        print("✓ Playing for 5 seconds...")
-        
-        // Play for 5 seconds
-        Thread.sleep(forTimeInterval: 5.0)
-        
-        audioEngine.stop()
-        print("✓ Audio stopped")
-        
-    } catch {
-        print("✗ Audio engine error: \(error)")
-    }
-    
-    print("\n✓ Real-time audio integration successful!")
+    print("\n✅ Custom kernel test completed!")
 }
 
 main()

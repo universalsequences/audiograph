@@ -9,6 +9,7 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
   bool all_ok = true;
 
   while (geq_pop(r, &cmd)) {
+    printf("APPLYING GRAPH EDIT!\n");
     if (MAX_CMDS_PER_BLOCK && applied >= MAX_CMDS_PER_BLOCK) {
       break;
     }
