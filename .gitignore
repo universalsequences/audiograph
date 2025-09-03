@@ -1,2 +1,7 @@
 /swift_example/.build
 /TestAudioProject/.build
+/TestAudioProject
+*.o
+libaudiograph.dylib
+notes.org
+graph_test
