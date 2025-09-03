@@ -237,4 +237,41 @@ typedef struct GraphEditQueue {
   _Atomic uint32_t tail; // consumer reads
 } GraphEditQueue;
 
+// ===================== Ready Queue (MPMC + length + semaphore) =====================
+
+#ifdef __APPLE__
+#include <dispatch/dispatch.h>
+// macOS doesn't support POSIX unnamed semaphores, use dispatch_semaphore instead
+typedef struct {
+  MPMCQueue *ring;         // Existing MPMC queue for thread-safe node storage
+  _Atomic int qlen;        // Logical queue length for counting
+  dispatch_semaphore_t items;  // dispatch_semaphore for 0→1 wake optimization
+} ReadyQ;
+#else
+#include <semaphore.h>
+typedef struct {
+  MPMCQueue *ring;  // Existing MPMC queue for thread-safe node storage
+  _Atomic int qlen; // Logical queue length for counting
+  sem_t items;      // Semaphore for 0→1 wake optimization
+} ReadyQ;
+#endif
+
+// CPU relaxation (platform specific)
+#if defined(__x86_64__) || defined(__i386__)
+#define cpu_relax() __builtin_ia32_pause()
+#elif defined(__aarch64__) || defined(__arm__)
+#define cpu_relax() __asm__ __volatile__("yield" ::: "memory")
+#else
+#define cpu_relax() __asm__ __volatile__("" ::: "memory")
+#endif
+
+// ReadyQ operations
+ReadyQ *rq_create(int capacity);
+void rq_destroy(ReadyQ *q);
+bool rq_push(ReadyQ *q, int32_t nid);
+bool rq_try_pop(ReadyQ *q, int32_t *out);
+bool rq_wait_nonempty(ReadyQ *q, int timeout_us);
+void rq_reset(ReadyQ *q);  // Reset/drain queue for clean block start
+void rq_push_or_spin(ReadyQ *q, int32_t nid);  // Retry until enqueue succeeds
+
 #endif // GRAPH_TYPES_H

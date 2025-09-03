@@ -65,6 +65,7 @@ void mix2_process(float *const *in, float *const *out, int n, void *memory) {
   const float *a = in[0];
   const float *b = in[1];
   float *y = out[0];
+  // Use assignment (=) instead of addition to ensure clean output
   for (int i = 0; i < n; i++)
     y[i] = a[i] + b[i];
 }

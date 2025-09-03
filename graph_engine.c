@@ -3,6 +3,15 @@
 #include "graph_nodes.h"
 #include <unistd.h>
 
+// Include ReadyQ implementation
+extern ReadyQ *rq_create(int capacity);
+extern void rq_destroy(ReadyQ *q);
+extern bool rq_push(ReadyQ *q, int32_t nid);
+extern bool rq_try_pop(ReadyQ *q, int32_t *out);
+extern bool rq_wait_nonempty(ReadyQ *q, int timeout_us);
+extern void rq_reset(ReadyQ *q);
+extern void rq_push_or_spin(ReadyQ *q, int32_t nid);
+
 // ===================== Forward Declarations =====================
 
 void bind_and_run_live(LiveGraph *lg, int nid, int nframes);
@@ -10,6 +19,8 @@ static void ensure_port_arrays(RTNode *n);
 static void init_pending_and_seed(LiveGraph *lg);
 static int alloc_edge(LiveGraph *lg);
 void process_live_block(LiveGraph *lg, int nframes);
+static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes);
+static void wait_for_block_start_or_shutdown(void);
 
 // ===================== Global Engine Instance =====================
 
@@ -19,6 +30,27 @@ Engine g_engine; // single global for demo
 
 // Thread-local storage for current node being processed
 static __thread RTNode *g_current_processing_node = NULL;
+
+// Thread-local scratch buffers for disconnected outputs
+// This prevents the write-write race that caused audio artifacts
+static __thread float *tls_out_scratch[MAX_IO] = {0};
+static __thread int tls_scratch_size = 0;
+
+static inline float *get_tls_out_scratch(int port, int nframes) {
+  if (tls_scratch_size < nframes) {
+    // Reallocate all scratch buffers for this thread
+    for (int p = 0; p < MAX_IO; p++) {
+      free(tls_out_scratch[p]);
+      tls_out_scratch[p] = aligned_alloc(64, nframes * sizeof(float));
+      if (!tls_out_scratch[p]) {
+        // Fallback to regular malloc if aligned_alloc fails
+        tls_out_scratch[p] = malloc(nframes * sizeof(float));
+      }
+    }
+    tls_scratch_size = nframes;
+  }
+  return tls_out_scratch[port];
+}
 
 int ap_current_node_ninputs(void) {
   if (g_current_processing_node) {
@@ -57,57 +89,53 @@ void apply_params(LiveGraph *g) {
 // Legacy bind_and_run function removed - using port-based bind_and_run_live
 // only
 
+static void wait_for_block_start_or_shutdown(void) {
+  pthread_mutex_lock(&g_engine.sess_mtx);
+  for (;;) {
+    if (!atomic_load_explicit(&g_engine.runFlag, memory_order_acquire)) break;
+    LiveGraph *lg = atomic_load_explicit(&g_engine.workSession, memory_order_acquire);
+    if (lg && atomic_load_explicit(&lg->jobsInFlight, memory_order_acquire) > 0) break;
+    pthread_cond_wait(&g_engine.sess_cv, &g_engine.sess_mtx);
+  }
+  pthread_mutex_unlock(&g_engine.sess_mtx);
+}
+
 static void *worker_main(void *arg) {
   (void)arg;
   for (;;) {
-    if (!atomic_load_explicit(&g_engine.runFlag, memory_order_acquire))
-      break;
+    if (!atomic_load_explicit(&g_engine.runFlag, memory_order_acquire)) break;
 
-    LiveGraph *lg =
-        atomic_load_explicit(&g_engine.workSession, memory_order_acquire);
-    if (!lg) {
-      sched_yield();
-      usleep(1000);
-      continue;
-    }
+    // Park until a block is published
+    wait_for_block_start_or_shutdown();
+    if (!atomic_load_explicit(&g_engine.runFlag, memory_order_acquire)) break;
 
-    int32_t nid;
-    // Try to get a ready node from the live graph's MPMC queue
-    if (mpmc_pop(lg->readyQueue, &nid)) {
+    LiveGraph *lg = atomic_load_explicit(&g_engine.workSession, memory_order_acquire);
+    if (!lg) continue;  // spurious wake or block already ended
 
-      bind_and_run_live(lg, nid, g_engine.blockSize);
-      RTNode *node = &lg->nodes[nid];
+    // Hot loop: run until this block is complete
+    for (;;) {
+      if (atomic_load_explicit(&lg->jobsInFlight, memory_order_acquire) == 0)
+        break;
 
-      // Notify successors
-      if (node->succ && node->succCount > 0) {
-        for (int i = 0; i < node->succCount; i++) {
-          int succ = node->succ[i];
-          if (succ >= 0 && succ < lg->node_count && !lg->is_orphaned[succ]) {
-            int old_pending = atomic_fetch_sub_explicit(&lg->pending[succ], 1,
-                                                        memory_order_acq_rel);
-            if (old_pending == 1) {
-              while (!mpmc_push(lg->readyQueue, succ)) {
-                __asm__ __volatile__("" ::: "memory");
-              }
-            }
-          }
-        }
+      int32_t nid;
+
+      // Tiny spin to catch bursts without kernel call
+      bool got = false;
+      for (int s = 0; s < 64; s++) {
+        if ((got = rq_try_pop(lg->readyQueue, &nid))) break;
+        cpu_relax(); // _mm_pause / __yield
       }
-      atomic_fetch_sub_explicit(&lg->jobsInFlight, 1, memory_order_acq_rel);
-    } else {
-      // Queue is empty - use CPU-friendly backoff strategy:
-
-      // Brief spin loop for low-latency response (reduced from 64 to 8
-      // iterations)
-      for (int i = 0; i < 8; i++) {
-        __asm__ __volatile__("" ::: "memory");
+      if (!got) {
+        // Queue appears empty; wait a short time for 0→1 signal
+        // LATENCY FIX: Reduced from 100us to 10us to minimize block delays
+        (void)rq_wait_nonempty(lg->readyQueue, /*timeout_us=*/10);
+        continue;
       }
 
-      // Sleep for 1 millisecond to be CPU-friendly when idle
-      usleep(1000);
-
-      continue;
+      execute_and_fanout(lg, nid, g_engine.blockSize);
     }
+
+    // Loop back: will go to sleep on sess_cv until next block
   }
   return NULL;
 }
@@ -117,6 +145,11 @@ static void *worker_main(void *arg) {
 void engine_start_workers(int workers) {
   g_engine.workerCount = workers;
   g_engine.threads = (pthread_t *)calloc(workers, sizeof(pthread_t));
+  
+  // Initialize mutex and condition variable for block-start wake
+  pthread_mutex_init(&g_engine.sess_mtx, NULL);
+  pthread_cond_init(&g_engine.sess_cv, NULL);
+  
   atomic_store(&g_engine.runFlag, 1);
   for (int i = 0; i < workers; i++) {
     pthread_attr_t attr;
@@ -128,9 +161,24 @@ void engine_start_workers(int workers) {
 
 void engine_stop_workers(void) {
   atomic_store(&g_engine.runFlag, 0);
+
+  // Wake sleepers on both wait sites
+  pthread_mutex_lock(&g_engine.sess_mtx);
+  pthread_cond_broadcast(&g_engine.sess_cv);
+  pthread_mutex_unlock(&g_engine.sess_mtx);
+
+  // Also wake any workers blocked in rq_wait_nonempty during a block
+  // We'll iterate through all potential live graphs, but since we're shutting down,
+  // we can just wait for threads to exit naturally
+
   for (int i = 0; i < g_engine.workerCount; i++) {
     pthread_join(g_engine.threads[i], NULL);
   }
+  
+  // Clean up synchronization primitives
+  pthread_mutex_destroy(&g_engine.sess_mtx);
+  pthread_cond_destroy(&g_engine.sess_cv);
+  
   free(g_engine.threads);
   g_engine.threads = NULL;
   g_engine.workerCount = 0;
@@ -316,8 +364,9 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   memset(lg->silence_buf, 0,
          block_size * sizeof(float)); // keep silence buffer zeroed
 
-  // Ready queue (MPMC for thread safety)
-  lg->readyQueue = mpmc_create(1024);
+  // Ready queue (ReadyQ with MPMC + semaphore for thread safety)
+  // BURST FIX: Increased capacity from 1024 to 4096 for wide graphs
+  lg->readyQueue = rq_create(4096);
   if (!lg->readyQueue) {
     // Handle allocation failure - clean up port-based edges
     for (int i = 0; i < lg->edge_capacity; i++) {
@@ -424,7 +473,7 @@ void destroy_live_graph(LiveGraph *lg) {
 
   // Free queues
   if (lg->readyQueue)
-    mpmc_destroy(lg->readyQueue);
+    rq_destroy(lg->readyQueue);
   if (lg->params)
     free(lg->params);
   if (lg->graphEditQueue) {
@@ -1166,9 +1215,11 @@ void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
   }
 
   // Outputs: one buffer per output port (edge id or -1)
+  // CRITICAL FIX: Use thread-local scratch to prevent write-write races
   for (int i = 0; i < node->nOutputs && i < MAX_IO; i++) {
     int eid = node->outEdgeId ? node->outEdgeId[i] : -1;
-    outPtrs[i] = (eid >= 0) ? lg->edges[eid].buf : lg->scratch_null;
+    outPtrs[i] = (eid >= 0) ? lg->edges[eid].buf 
+                            : get_tls_out_scratch(i, nframes);
   }
 
   if (node->vtable.process) {
@@ -1180,34 +1231,49 @@ void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
   g_current_processing_node = NULL;
 }
 
+static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes) {
+  bind_and_run_live(lg, nid, nframes); // uses silence/scratch for missing ports
+
+  RTNode *node = &lg->nodes[nid];
+  // Notify successors (node-level)
+  for (int i = 0; i < node->succCount; i++) {
+    int succ = node->succ[i];
+    if (succ < 0 || succ >= lg->node_count) continue;
+    if (lg->is_orphaned[succ]) continue;
+    if (atomic_fetch_sub_explicit(&lg->pending[succ], 1, memory_order_acq_rel) == 1) {
+      rq_push_or_spin(lg->readyQueue, succ);  // CRITICAL FIX: Never drop work
+    }
+  }
+
+  atomic_fetch_sub_explicit(&lg->jobsInFlight, 1, memory_order_acq_rel);
+}
+
 static void init_pending_and_seed(LiveGraph *lg) {
   int totalJobs = 0;
+
+  // CRITICAL FIX: Properly reset/drain the ready queue to prevent stale node IDs
+  rq_reset(lg->readyQueue);
 
   // pending = indegree for reachable nodes, -1 for orphaned/deleted
   for (int i = 0; i < lg->node_count; i++) {
     // Skip deleted nodes (no process fn AND no ports)
-    if (lg->nodes[i].vtable.process == NULL && lg->nodes[i].nInputs == 0 &&
-        lg->nodes[i].nOutputs == 0) {
+    bool deleted = (lg->nodes[i].vtable.process == NULL &&
+                    lg->nodes[i].nInputs == 0 && lg->nodes[i].nOutputs == 0);
+    if (deleted || lg->is_orphaned[i]) {
       atomic_store_explicit(&lg->pending[i], -1, memory_order_relaxed);
       continue;
     }
-    if (lg->is_orphaned[i]) {
-      atomic_store_explicit(&lg->pending[i], -1, memory_order_relaxed);
-      continue;
-    }
-    int indeg = lg->indegree[i]; // maintained incrementally at edits
+
+    int indeg = lg->indegree[i];        // maintained incrementally at edits
     atomic_store_explicit(&lg->pending[i], indeg, memory_order_relaxed);
 
-    // Count schedulable jobs (exclude isolated reachable nodes that neither
-    // produce nor consume anything; practically rare).
-    bool isolated = (indeg == 0) && !node_has_any_output_connected(lg, i);
-    if (!isolated)
-      totalJobs++;
+    bool hasOut = node_has_any_output_connected(lg, i);
+    bool isSink = !hasOut && indeg > 0; // if you have true sinks that must run
 
-    // Seed true sources (reachable, indegree==0, and at least one output conn)
-    if (indeg == 0 && node_has_any_output_connected(lg, i)) {
-      while (!mpmc_push(lg->readyQueue, i)) {
-        __asm__ __volatile__("" ::: "memory");
+    if (hasOut || isSink) {
+      totalJobs++;
+      if (indeg == 0 && hasOut) {
+        rq_push_or_spin(lg->readyQueue, i);     // CRITICAL FIX: Never drop work
       }
     }
   }
@@ -1228,8 +1294,7 @@ static bool detect_cycle(LiveGraph *lg) {
 }
 
 void process_live_block(LiveGraph *lg, int nframes) {
-  // (Queue state already empty from previous block by construction.)
-
+  // Initialize pending counts and seed ready queue
   init_pending_and_seed(lg);
 
   // Check for cycles that would cause silent deadlocks
@@ -1249,82 +1314,51 @@ void process_live_block(LiveGraph *lg, int nframes) {
     return;
 
   if (g_engine.workerCount > 0) {
-    // Publish session for workers
+    // Publish session & wake workers
     atomic_store_explicit(&g_engine.workSession, lg, memory_order_release);
+    
+    pthread_mutex_lock(&g_engine.sess_mtx);
+    pthread_cond_broadcast(&g_engine.sess_cv);
+    pthread_mutex_unlock(&g_engine.sess_mtx);
 
-    // Audio thread also helps process
+    // CRITICAL FIX: Audio thread helps to prevent deadline misses
+    // This prevents timeouts from causing audio dropouts
     int32_t nid;
-    while (mpmc_pop(lg->readyQueue, &nid)) {
-      bind_and_run_live(lg, nid, nframes);
-
-      RTNode *node = &lg->nodes[nid];
-      for (int i = 0; i < node->succCount; i++) {
-        int succ = node->succ[i];
-        if (succ < 0 || succ >= lg->node_count)
-          continue;
-        if (lg->is_orphaned[succ])
-          continue;
-        if (atomic_fetch_sub_explicit(&lg->pending[succ], 1,
-                                      memory_order_acq_rel) == 1) {
-          while (!mpmc_push(lg->readyQueue, succ)) {
-            __asm__ __volatile__("" ::: "memory");
-          }
-        }
-      }
-      atomic_fetch_sub_explicit(&lg->jobsInFlight, 1, memory_order_acq_rel);
-    }
-
-    // Wait/help until all jobs done
-    for (;;) {
-      if (atomic_load_explicit(&lg->jobsInFlight, memory_order_acquire) == 0)
-        break;
-
-      int32_t more;
-      if (mpmc_pop(lg->readyQueue, &more)) {
-        bind_and_run_live(lg, more, nframes);
-        RTNode *node = &lg->nodes[more];
-        for (int i = 0; i < node->succCount; i++) {
-          int succ = node->succ[i];
-          if (succ < 0 || succ >= lg->node_count)
-            continue;
-          if (lg->is_orphaned[succ])
-            continue;
-          if (atomic_fetch_sub_explicit(&lg->pending[succ], 1,
-                                        memory_order_acq_rel) == 1) {
-            while (!mpmc_push(lg->readyQueue, succ)) {
-              __asm__ __volatile__("" ::: "memory");
-            }
-          }
-        }
-        atomic_fetch_sub_explicit(&lg->jobsInFlight, 1, memory_order_acq_rel);
+    while (atomic_load_explicit(&lg->jobsInFlight, memory_order_acquire) > 0) {
+      if (rq_try_pop(lg->readyQueue, &nid)) {
+        execute_and_fanout(lg, nid, nframes);
       } else {
-        __asm__ __volatile__("" ::: "memory");
+        cpu_relax(); // Brief pause when no work available
       }
     }
+
+#ifdef DEBUG
+    // Debug assertions to verify block completion
+    int32_t dummy_node;
+    int remaining_queue_items = 0;
+    // Count any remaining items in the ready queue (should be 0)
+    while (rq_try_pop(lg->readyQueue, &dummy_node)) {
+      remaining_queue_items++;
+    }
+    if (remaining_queue_items > 0) {
+      fprintf(stderr, "ERROR: Block completed but %d items remain in ready queue!\n", 
+              remaining_queue_items);
+    }
+    
+    // Verify ready queue length is consistent
+    int qlen = atomic_load_explicit(&lg->readyQueue->qlen, memory_order_acquire);
+    if (qlen != 0) {
+      fprintf(stderr, "ERROR: Block completed but readyQueue qlen = %d (expected 0)\n", qlen);
+    }
+#endif
 
     // Clear session
     atomic_store_explicit(&g_engine.workSession, NULL, memory_order_release);
   } else {
     // Single-thread fallback
     int32_t nid;
-    while (mpmc_pop(lg->readyQueue, &nid)) {
-      bind_and_run_live(lg, nid, nframes);
-
-      RTNode *node = &lg->nodes[nid];
-      for (int i = 0; i < node->succCount; i++) {
-        int succ = node->succ[i];
-        if (succ < 0 || succ >= lg->node_count)
-          continue;
-        if (lg->is_orphaned[succ])
-          continue;
-        if (atomic_fetch_sub_explicit(&lg->pending[succ], 1,
-                                      memory_order_acq_rel) == 1) {
-          while (!mpmc_push(lg->readyQueue, succ)) {
-            __asm__ __volatile__("" ::: "memory");
-          }
-        }
-      }
-      atomic_fetch_sub_explicit(&lg->jobsInFlight, 1, memory_order_acq_rel);
+    while (rq_try_pop(lg->readyQueue, &nid)) {
+      execute_and_fanout(lg, nid, nframes);
     }
   }
 }
@@ -1348,7 +1382,7 @@ void process_next_block(LiveGraph *lg, float *output_buffer, int nframes) {
   process_live_block(lg, nframes);
 
   int output_node = find_live_output(lg);
-  float *src;
+  float *src = NULL;
   if (output_node >= 0 && lg->nodes[output_node].nInputs > 0) {
     int master_edge_id = lg->nodes[output_node].inEdgeId[0];
     if (master_edge_id >= 0 && master_edge_id < lg->edge_capacity) {

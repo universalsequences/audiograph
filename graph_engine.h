@@ -87,7 +87,7 @@ typedef struct LiveGraph {
   // Scheduling state (same as GraphState)
   atomic_int *pending;
   int *indegree; // maintained incrementally at edits for port-based system
-  MPMCQueue *readyQueue; // MPMC work queue for thread-safe job distribution
+  ReadyQ *readyQueue;    // Ready queue with counting length and semaphore
   _Atomic int jobsInFlight;
 
   // Parameter mailbox
@@ -115,10 +115,14 @@ typedef struct LiveGraph {
 typedef struct Engine {
   pthread_t *threads;
   int workerCount;
-  _Atomic int runFlag;
+  _Atomic int runFlag;                    // 1 = running, 0 = shutdown
 
   _Atomic(LiveGraph *)
-      workSession; // when non-NULL, workers process this live graph
+      workSession; // published at block start, NULL after
+
+  // Block-start wake mechanism
+  pthread_mutex_t sess_mtx;               // protects sess_cv wait/signal
+  pthread_cond_t  sess_cv;                // workers sleep here between blocks
 
   int sampleRate;
   int blockSize;

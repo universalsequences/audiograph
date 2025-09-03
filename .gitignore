@@ -5,3 +5,10 @@
 libaudiograph.dylib
 notes.org
 graph_test
+audiograph
+tests/test_sum_behavior
+tests/test_new_worker_system
+test_simplified_worker_system
+test_audio_fix_debug
+test_audio_fix
+test_simplified_worker_system_debug
