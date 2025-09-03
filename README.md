@@ -1,6 +1,12 @@
 # AudioGraph
 
-A real-time audio graph processing engine written in C11 with lock-free multi-threaded architecture for live editing and parallel processing.
+A small real-time audio graph engine written in C11 with lock-free multi-threaded architecture for live editing and parallel processing. 
+- simple web-audio inspired API
+- multi-threaded scheduling lets you take advantage of _all_ your computers cores
+- add/delete nodes and edit connections safely while the engine is running
+- auto summing inputs to nodes (inspired by web-audio and Max/MSP)
+- simple API for adding "custom" nodes (using function pointers) to the graph
+- easily embeddedable in swift projects (see swift integration guide)
 
 ## Architecture Overview
 
