@@ -17,8 +17,8 @@ typedef struct {
   float *buf;   // size = block_size
   int refcount; // number of input ports consuming this signal
   bool in_use;
-  int src_node;   // who writes this edge
-  int src_port;   // which output port
+  int src_node; // who writes this edge
+  int src_port; // which output port
 } LiveEdge;
 
 typedef struct RTNode {
@@ -33,8 +33,10 @@ typedef struct RTNode {
   int32_t *
       outEdgeId; // array[nOutputs]: edge ID per output port (-1 if unconnected)
 
-  // For auto-sum: for each input port on this node, store an optional SUM node id
-  int32_t *fanin_sum_node_id;  // array[nInputs]: SUM node ID per input port (-1 if none)
+  // For auto-sum: for each input port on this node, store an optional SUM node
+  // id
+  int32_t *fanin_sum_node_id; // array[nInputs]: SUM node ID per input port (-1
+                              // if none)
 
   // scheduling
   int32_t *succ; // successor node indices
@@ -79,7 +81,6 @@ typedef struct LiveGraph {
   float *silence_buf;  // zero buffer for unconnected inputs
   float *scratch_null; // throwaway buffer for unconnected outputs
 
-
   // Orphaned nodes (have no inputs but aren't true sources)
   bool *is_orphaned;
 
@@ -99,21 +100,19 @@ typedef struct LiveGraph {
 
   // Graph Edit Queue
   GraphEditQueue *graphEditQueue;
-  
+
   // Failed operation tracking
-  uint64_t *failed_ids;      // Array of node IDs that failed to create
-  int failed_ids_count;      // Number of failed IDs
-  int failed_ids_capacity;   // Capacity of failed_ids array
-  
+  uint64_t *failed_ids;    // Array of node IDs that failed to create
+  int failed_ids_count;    // Number of failed IDs
+  int failed_ids_capacity; // Capacity of failed_ids array
+
   // Atomic node ID allocation
-  _Atomic int next_node_id;  // Next node ID to allocate (thread-safe)
+  _Atomic int next_node_id; // Next node ID to allocate (thread-safe)
 } LiveGraph;
 
 // ===================== Worker Pool / Engine =====================
 
 typedef struct Engine {
-  int crossfade_len; // total blocks to crossfade when swapping
-
   pthread_t *threads;
   int workerCount;
   _Atomic int runFlag;
@@ -143,7 +142,8 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
                              const char *label);
 void destroy_live_graph(LiveGraph *lg);
 int apply_add_node(LiveGraph *lg, NodeVTable vtable, void *state,
-                   uint64_t logical_id, const char *name, int nInputs, int nOutputs);
+                   uint64_t logical_id, const char *name, int nInputs,
+                   int nOutputs);
 int live_add_oscillator(LiveGraph *lg, float freq_hz, const char *name);
 int live_add_gain(LiveGraph *lg, float gain_value, const char *name);
 int live_add_number(LiveGraph *lg, float value, const char *name);
@@ -157,11 +157,15 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
 bool apply_delete_node(LiveGraph *lg, int node_id);
 void process_live_block(LiveGraph *lg, int nframes);
 
-// ===================== Queue-based API (Pre-allocated IDs) =====================
-int add_node(LiveGraph *lg, NodeVTable vtable, void *state, const char *name, int nInputs, int nOutputs);
+// ===================== Queue-based API (Pre-allocated IDs)
+// =====================
+int add_node(LiveGraph *lg, NodeVTable vtable, void *state, const char *name,
+             int nInputs, int nOutputs);
 bool delete_node(LiveGraph *lg, int node_id);
-bool connect(LiveGraph *lg, int src_node, int src_port, int dst_node, int dst_port);
-bool disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node, int dst_port);
+bool connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
+             int dst_port);
+bool disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
+                int dst_port);
 bool is_failed_node(LiveGraph *lg, int node_id);
 void add_failed_id(LiveGraph *lg, uint64_t logical_id);
 int find_live_output(LiveGraph *lg);

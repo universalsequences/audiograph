@@ -867,6 +867,8 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
     // Unwire the destination port
     D->inEdgeId[dst_port] = -1;
     lg->indegree[dst_node]--;
+    if (lg->indegree[dst_node] < 0)
+      lg->indegree[dst_node] = 0;
 
     // Update successor list on the source node
     if (!still_connected_S_to_D(lg, src_node, dst_node)) {
@@ -903,6 +905,9 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
     // Disconnect src_node from SUM
     SUM->inEdgeId[sum_input_idx] = -1;
     lg->indegree[sum_id]--;
+    if (lg->indegree[sum_id] < 0)
+      lg->indegree[sum_id] = 0;
+
     if (!still_connected_S_to_D(lg, src_node, sum_id)) {
       remove_successor(S, sum_id);
     }
@@ -929,6 +934,8 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       D->inEdgeId[dst_port] = -1;
       D->fanin_sum_node_id[dst_port] = -1;
       lg->indegree[dst_node]--;
+      if (lg->indegree[dst_node] < 0)
+        lg->indegree[dst_node] = 0;
 
       // Retire SUM's output edge
       int sum_out = SUM->outEdgeId[0];
@@ -974,11 +981,16 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       // Disconnect SUM from destination
       lg->edges[sum_out].refcount--;
       lg->indegree[dst_node]--;
+      if (lg->indegree[dst_node] < 0)
+        lg->indegree[dst_node] = 0;
+
       remove_successor(SUM, dst_node);
 
       // Disconnect remaining source from SUM
       lg->edges[remaining_eid].refcount--;
       lg->indegree[sum_id]--;
+      if (lg->indegree[sum_id] < 0)
+        lg->indegree[sum_id] = 0;
 
       // Retire SUM's edges and delete SUM
       retire_edge(lg, sum_out);
@@ -1334,16 +1346,20 @@ void process_next_block(LiveGraph *lg, float *output_buffer, int nframes) {
   apply_graph_edits(lg->graphEditQueue, lg);
   apply_params(lg);
   process_live_block(lg, nframes);
+
   int output_node = find_live_output(lg);
+  float *src;
   if (output_node >= 0 && lg->nodes[output_node].nInputs > 0) {
     int master_edge_id = lg->nodes[output_node].inEdgeId[0];
     if (master_edge_id >= 0 && master_edge_id < lg->edge_capacity) {
-      memcpy(output_buffer, lg->edges[master_edge_id].buf,
-             nframes * sizeof(float));
+      src = lg->edges[master_edge_id].buf;
     }
-  } else {
+  }
+  if (!src) {
     // handle case where theres no output node (silence)
     memset(output_buffer, 0, nframes * sizeof(float));
+  } else {
+    memcpy(output_buffer, src, nframes * sizeof(float));
   }
 }
 
