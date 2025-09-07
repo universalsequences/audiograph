@@ -10,10 +10,10 @@ void test_auto_sum() {
   assert(lg != NULL);
   
   // Create test nodes: 3 oscillators and 1 gain
-  int osc1 = apply_add_node(lg, OSC_VTABLE, NULL, 1, "osc1", 0, 1);
-  int osc2 = apply_add_node(lg, OSC_VTABLE, NULL, 2, "osc2", 0, 1);
-  int osc3 = apply_add_node(lg, OSC_VTABLE, NULL, 3, "osc3", 0, 1);
-  int gain = apply_add_node(lg, GAIN_VTABLE, NULL, 4, "gain", 1, 1);
+  int osc1 = apply_add_node(lg, OSC_VTABLE, OSC_MEMORY_SIZE * sizeof(float), 1, "osc1", 0, 1);
+  int osc2 = apply_add_node(lg, OSC_VTABLE, OSC_MEMORY_SIZE * sizeof(float), 2, "osc2", 0, 1);
+  int osc3 = apply_add_node(lg, OSC_VTABLE, OSC_MEMORY_SIZE * sizeof(float), 3, "osc3", 0, 1);
+  int gain = apply_add_node(lg, GAIN_VTABLE, GAIN_MEMORY_SIZE * sizeof(float), 4, "gain", 1, 1);
   
   assert(osc1 >= 0 && osc2 >= 0 && osc3 >= 0 && gain >= 0);
   printf("✓ Created test nodes: osc1=%d, osc2=%d, osc3=%d, gain=%d\n", 

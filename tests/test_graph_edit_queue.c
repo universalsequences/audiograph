@@ -98,13 +98,10 @@ int main() {
   // Test 3: Queue add_node commands
   printf("\nTest 3: Queueing add_node commands...\n");
 
-  // Prepare state for a new gain node
-  float *gain_state = malloc(sizeof(float) * GAIN_MEMORY_SIZE);
-  gain_state[GAIN_VALUE] = 0.7f;
-
+  // Memory is now allocated by the library
   GraphEditCmd add_node_cmd = {.op = GE_ADD_NODE,
                                .u.add_node = {.vt = GAIN_VTABLE,
-                                              .state = gain_state,
+                                              .state_size = GAIN_MEMORY_SIZE * sizeof(float),
                                               .logical_id = lg->node_count,
                                               .name = "queued_gain",
                                               .nInputs = 1,
@@ -243,8 +240,7 @@ int main() {
   printf("   - Runtime integration with block processing works\n");
   printf("   - Queue overflow handled safely\n");
 
-  // Cleanup
-  free(gain_state);
+  // No cleanup needed - memory is managed by the library
 
   return 0;
 }

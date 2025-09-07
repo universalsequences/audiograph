@@ -82,16 +82,16 @@ void test_multi_port_routing() {
     
     // Step 1: Create the dual-output node (Node 1)
     // 2 inputs (unused), 2 outputs (0.25, 0.5)
-    void *dual_output_state = calloc(1, sizeof(float)); // Minimal allocation
-    int node1 = add_node(lg, DUAL_OUTPUT_VTABLE, dual_output_state, 
+    // No state needed (memory size = 0)
+    int node1 = add_node(lg, DUAL_OUTPUT_VTABLE, 0, 
                          "dual_output", 2, 2); // 2 inputs, 2 outputs
     assert(node1 >= 0);
     printf("✓ Created dual-output node: id=%d (outputs 0.25, 0.5)\n", node1);
     
     // Step 2: Create the dual-input summing node (Node 2) 
     // 2 inputs, 1 output (sums inputs)
-    void *dual_sum_state = calloc(1, sizeof(float)); // Minimal allocation
-    int node2 = add_node(lg, DUAL_INPUT_SUM_VTABLE, dual_sum_state,
+    // No state needed (memory size = 0)
+    int node2 = add_node(lg, DUAL_INPUT_SUM_VTABLE, 0,
                          "dual_sum", 2, 1); // 2 inputs, 1 output
     assert(node2 >= 0);
     printf("✓ Created dual-input sum node: id=%d (sums two inputs)\n", node2);
@@ -233,8 +233,8 @@ void test_workaround_with_intermediate_nodes() {
     assert(lg != NULL);
     
     // Create the same dual-output source node
-    void *dual_output_state = calloc(1, sizeof(float));
-    int node1 = add_node(lg, DUAL_OUTPUT_VTABLE, dual_output_state, 
+    // No state needed (memory size = 0)
+    int node1 = add_node(lg, DUAL_OUTPUT_VTABLE, 0, 
                          "dual_output", 2, 2);
     assert(node1 >= 0);
     
@@ -244,8 +244,7 @@ void test_workaround_with_intermediate_nodes() {
     assert(gain1 >= 0 && gain2 >= 0);
     
     // Create the final sum node  
-    void *dual_sum_state = calloc(1, sizeof(float));
-    int sum_node = add_node(lg, DUAL_INPUT_SUM_VTABLE, dual_sum_state,
+    int sum_node = add_node(lg, DUAL_INPUT_SUM_VTABLE, DUAL_INPUT_SUM_MEMORY_SIZE,
                             "sum_node", 2, 1);
     assert(sum_node >= 0);
     

@@ -101,9 +101,19 @@ bool apply_hot_swap(LiveGraph *lg, GEHotSwapNode *p) {
   if (!resize_ports_preserve(n, p->new_nInputs, p->new_nOutputs))
     return false;
 
+  // Allocate new state memory if needed
+  void *new_state = NULL;
+  if (p->state_size > 0) {
+    new_state = alloc_aligned(64, p->state_size);
+    if (!new_state) {
+      return false; // Memory allocation failed
+    }
+    memset(new_state, 0, p->state_size); // Zero-initialize the new state
+  }
+
   void *old_state = n->state;
 
-  n->state = p->state;
+  n->state = new_state;
   n->vtable = p->vt;
 
   retire_later(lg, old_state, free);
@@ -175,10 +185,19 @@ bool apply_replace_keep_edges(LiveGraph *lg, GEReplaceKeepEdges *p) {
   if (!resize_ports_preserve(n, p->new_nInputs, p->new_nOutputs))
     return false;
 
-  // 4) Install new state/vtable
+  // 4) Allocate and install new state/vtable
+  void *new_state = NULL;
+  if (p->state_size > 0) {
+    new_state = alloc_aligned(64, p->state_size);
+    if (!new_state) {
+      return false; // Memory allocation failed
+    }
+    memset(new_state, 0, p->state_size); // Zero-initialize the new state
+  }
+
   void *old_state = n->state;
 
-  n->state = p->state;
+  n->state = new_state;
   n->vtable = p->vt;
 
   retire_later(lg, old_state, free);

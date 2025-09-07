@@ -154,7 +154,7 @@ void apply_params(LiveGraph *g);
 LiveGraph *create_live_graph(int initial_capacity, int block_size,
                              const char *label);
 void destroy_live_graph(LiveGraph *lg);
-int apply_add_node(LiveGraph *lg, NodeVTable vtable, void *state,
+int apply_add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
                    uint64_t logical_id, const char *name, int nInputs,
                    int nOutputs);
 int live_add_oscillator(LiveGraph *lg, float freq_hz, const char *name);
@@ -172,20 +172,20 @@ void process_live_block(LiveGraph *lg, int nframes);
 
 // ===================== Queue-based API (Pre-allocated IDs)
 // =====================
-int add_node(LiveGraph *lg, NodeVTable vtable, void *state, const char *name,
-             int nInputs, int nOutputs);
+int add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
+             const char *name, int nInputs, int nOutputs);
 bool delete_node(LiveGraph *lg, int node_id);
-bool connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
-             int dst_port);
-bool disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
-                int dst_port);
+bool graph_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
+                   int dst_port);
+bool graph_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
+                      int dst_port);
 
-bool hot_swap_node(LiveGraph *lg, int node_id, NodeVTable vt, void *state,
+bool hot_swap_node(LiveGraph *lg, int node_id, NodeVTable vt, size_t state_size,
                    int nin, int nout, bool xfade,
                    void (*migrate)(void *, void *));
 
-bool replace_keep_edges(LiveGraph *lg, int node_id, NodeVTable vt, void *state,
-                        int nin, int nout, bool xfade,
+bool replace_keep_edges(LiveGraph *lg, int node_id, NodeVTable vt,
+                        size_t state_size, int nin, int nout, bool xfade,
                         void (*migrate)(void *, void *));
 
 bool is_failed_node(LiveGraph *lg, int node_id);

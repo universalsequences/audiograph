@@ -211,7 +211,7 @@ typedef enum {
 
 typedef struct {
   NodeVTable vt;
-  void *state; // ownership transfers to graph on success
+  size_t state_size; // size of memory to allocate for state
   int node_id; // target slot to swap
   int new_nInputs;
   int new_nOutputs;
@@ -219,7 +219,7 @@ typedef struct {
 
 typedef struct {
   NodeVTable vt;
-  void *state; // ownership transfers to graph on success
+  size_t state_size; // size of memory to allocate for state
   int node_id; // target slot to replace
   int new_nInputs;
   int new_nOutputs;
@@ -234,7 +234,7 @@ typedef struct {
   union {
     struct {
       NodeVTable vt;
-      void *state;
+      size_t state_size;
       uint64_t logical_id;
       char *name;
       int nInputs;

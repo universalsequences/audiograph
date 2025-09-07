@@ -29,8 +29,8 @@ void destroy_live_graph(LiveGraph *lg);
 // ===================== Node Management =====================
 
 // Generic node creation (returns pre-allocated node ID)
-int add_node(LiveGraph *lg, NodeVTable vtable, void *state, const char *name,
-             int nInputs, int nOutputs);
+int add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
+             const char *name, int nInputs, int nOutputs);
 
 // Convenient factory functions for common node types
 int live_add_oscillator(LiveGraph *lg, float freq_hz, const char *name);
@@ -49,19 +49,19 @@ bool is_failed_node(LiveGraph *lg, int node_id);
 // ===================== Port-based Connections =====================
 
 // Connect specific ports between nodes
-bool connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
-             int dst_port);
+bool graph_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
+                   int dst_port);
 
 // Disconnect specific port connections
-bool disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
-                int dst_port);
+bool graph_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
+                      int dst_port);
 
-bool hot_swap_node(LiveGraph *lg, int node_id, NodeVTable vt, void *state,
+bool hot_swap_node(LiveGraph *lg, int node_id, NodeVTable vt, size_t state_size,
                    int nin, int nout, bool xfade,
                    void (*migrate)(void *, void *));
 
-bool replace_keep_edges(LiveGraph *lg, int node_id, NodeVTable vt, void *state,
-                        int nin, int nout, bool xfade,
+bool replace_keep_edges(LiveGraph *lg, int node_id, NodeVTable vt,
+                        size_t state_size, int nin, int nout, bool xfade,
                         void (*migrate)(void *, void *));
 
 // ===================== Real-time Audio Processing =====================

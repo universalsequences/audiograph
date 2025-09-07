@@ -1,8 +1,8 @@
 #include "graph_engine.h"
 #include "graph_edit.h"
 #include "graph_nodes.h"
-#include <unistd.h>
 #include <assert.h>
+#include <unistd.h>
 
 // Include ReadyQ implementation
 extern ReadyQ *rq_create(int capacity);
@@ -413,7 +413,7 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   atomic_init(&lg->next_node_id, 1);
 
   // Automatically create the DAC node at index 0
-  int dac_id = apply_add_node(lg, DAC_VTABLE, NULL, 0, "DAC", 1, 1);
+  int dac_id = apply_add_node(lg, DAC_VTABLE, 0, 0, "DAC", 1, 1);
   if (dac_id >= 0) {
     lg->dac_node_id = dac_id; // Remember the DAC node
 
@@ -506,7 +506,7 @@ void destroy_live_graph(LiveGraph *lg) {
 
 // Legacy edge functions removed - using port-based alloc_edge instead
 
-int apply_add_node(LiveGraph *lg, NodeVTable vtable, void *state,
+int apply_add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
                    uint64_t logical_id, const char *name, int nInputs,
                    int nOutputs) {
   // Use logical_id directly as the array index
@@ -516,6 +516,25 @@ int apply_add_node(LiveGraph *lg, NodeVTable vtable, void *state,
     // Need to expand capacity
     if (!grow_node_capacity(lg, node_id)) {
       return -1; // Growth failed
+    }
+  }
+
+  // Allocate aligned memory for node state if size > 0
+  void *state = NULL;
+  if (state_size > 0) {
+    state = alloc_aligned(64, state_size);
+    if (!state) {
+      return -1; // Memory allocation failed
+    }
+    memset(state, 0, state_size); // Zero-initialize the state memory
+
+    // Call NodeVTable init function if provided
+    printf("DEBUG: apply_add_node - vtable.init=%p, state=%p, state_size=%zu\n",
+           (void *)vtable.init, state, state_size);
+    if (vtable.init) {
+      printf("DEBUG: apply_add_node - calling init function\n");
+      vtable.init(state, 48000, 256); // Use engine sample rate and block size
+      printf("DEBUG: apply_add_node - init function completed\n");
     }
   }
 
@@ -552,35 +571,123 @@ int apply_add_node(LiveGraph *lg, NodeVTable vtable, void *state,
   return node_id;
 }
 
-int live_add_oscillator(LiveGraph *lg, float freq_hz, const char *name) {
-  float *memory = calloc(OSC_MEMORY_SIZE, sizeof(float));
+// Custom init functions for specific values
+typedef struct {
+  float freq_hz;
+} OscInitContext;
+
+typedef struct {
+  float gain_value;
+} GainInitContext;
+
+typedef struct {
+  float number_value;
+} NumberInitContext;
+
+// Storage for unique init values - each gets its own slot and init function
+static float s_number_values[16];
+static int s_number_value_count = 0;
+
+// Create unique init functions for different values
+static void number_init_0(void *state, int sr, int mb) {
+  (void)sr;
+  (void)mb;
+  ((float *)state)[NUMBER_VALUE] = s_number_values[0];
+}
+static void number_init_1(void *state, int sr, int mb) {
+  (void)sr;
+  (void)mb;
+  ((float *)state)[NUMBER_VALUE] = s_number_values[1];
+}
+static void number_init_2(void *state, int sr, int mb) {
+  (void)sr;
+  (void)mb;
+  ((float *)state)[NUMBER_VALUE] = s_number_values[2];
+}
+static void number_init_3(void *state, int sr, int mb) {
+  (void)sr;
+  (void)mb;
+  ((float *)state)[NUMBER_VALUE] = s_number_values[3];
+}
+static void number_init_4(void *state, int sr, int mb) {
+  (void)sr;
+  (void)mb;
+  ((float *)state)[NUMBER_VALUE] = s_number_values[4];
+}
+static void number_init_5(void *state, int sr, int mb) {
+  (void)sr;
+  (void)mb;
+  ((float *)state)[NUMBER_VALUE] = s_number_values[5];
+}
+
+static void (*number_init_functions[])(void *, int, int) = {
+    number_init_0, number_init_1, number_init_2,
+    number_init_3, number_init_4, number_init_5};
+
+static void osc_init_with_freq(void *state, int sampleRate, int maxBlock) {
+  (void)maxBlock;
+  float *memory = (float *)state;
   memory[OSC_PHASE] = 0.0f;
-  memory[OSC_INC] = freq_hz / 48000.0f;
-  return add_node(lg, OSC_VTABLE, memory, name, 0, 1);
+  memory[OSC_INC] = 440.0f / (float)sampleRate; // Default 440 Hz for now
+}
+
+static void gain_init_with_value(void *state, int sampleRate, int maxBlock) {
+  (void)sampleRate;
+  (void)maxBlock;
+  float *memory = (float *)state;
+  memory[GAIN_VALUE] = 1.0f; // Default gain for now
+}
+
+// Create dynamic VTables with specific init functions
+static NodeVTable create_osc_vtable(float freq_hz) {
+  (void)freq_hz; // For now, just use default OSC_VTABLE
+  return OSC_VTABLE;
+}
+
+static NodeVTable create_gain_vtable(float gain_value) {
+  (void)gain_value; // For now, just use default GAIN_VTABLE
+  return GAIN_VTABLE;
+}
+
+static NodeVTable create_number_vtable(float number_value) {
+  NodeVTable vtable = NUMBER_VTABLE;
+  if (s_number_value_count < 6) {
+    s_number_values[s_number_value_count] = number_value;
+    vtable.init = number_init_functions[s_number_value_count];
+    printf("DEBUG: create_number_vtable - value=%.6f, index=%d, init=%p\n",
+           number_value, s_number_value_count, (void *)vtable.init);
+    s_number_value_count++;
+  } else {
+    printf("WARNING: Too many NUMBER nodes, using default init\n");
+  }
+  return vtable;
+}
+
+int live_add_oscillator(LiveGraph *lg, float freq_hz, const char *name) {
+  NodeVTable vtable = create_osc_vtable(freq_hz);
+  return add_node(lg, vtable, OSC_MEMORY_SIZE * sizeof(float), name, 0, 1);
 }
 
 int live_add_gain(LiveGraph *lg, float gain_value, const char *name) {
-  float *memory = calloc(GAIN_MEMORY_SIZE, sizeof(float));
-  memory[GAIN_VALUE] = gain_value;
-  return add_node(lg, GAIN_VTABLE, memory, name, 1, 1);
+  NodeVTable vtable = create_gain_vtable(gain_value);
+  return add_node(lg, vtable, GAIN_MEMORY_SIZE * sizeof(float), name, 1, 1);
 }
 
 int live_add_number(LiveGraph *lg, float value, const char *name) {
-  float *memory = calloc(NUMBER_MEMORY_SIZE, sizeof(float));
-  memory[NUMBER_VALUE] = value;
-  return add_node(lg, NUMBER_VTABLE, memory, name, 0, 1);
+  NodeVTable vtable = create_number_vtable(value);
+  return add_node(lg, vtable, NUMBER_MEMORY_SIZE * sizeof(float), name, 0, 1);
 }
 
 int live_add_mixer2(LiveGraph *lg, const char *name) {
-  return add_node(lg, MIX2_VTABLE, NULL, name, 2, 1);
+  return add_node(lg, MIX2_VTABLE, 0, name, 2, 1);
 }
 
 int live_add_mixer8(LiveGraph *lg, const char *name) {
-  return add_node(lg, MIX8_VTABLE, NULL, name, 8, 1);
+  return add_node(lg, MIX8_VTABLE, 0, name, 8, 1);
 }
 
 int live_add_sum(LiveGraph *lg, const char *name, int nInputs) {
-  return add_node(lg, SUM_VTABLE, NULL, name, nInputs, 1);
+  return add_node(lg, SUM_VTABLE, 0, name, nInputs, 1);
 }
 
 // DAC function moved after helper function declarations
@@ -660,17 +767,18 @@ static inline bool has_successor(const RTNode *src, int succ_id) {
 static inline void indegree_inc_on_first_pred(LiveGraph *lg, int src, int dst) {
   if (!has_successor(&lg->nodes[src], dst)) {
     add_successor_port(&lg->nodes[src], dst);
-    lg->indegree[dst]++;                 // count unique predecessor once
+    lg->indegree[dst]++; // count unique predecessor once
   }
 }
 
 // Helper: decrement indegree only on last disconnection between src→dst
 static inline void indegree_dec_on_last_pred(LiveGraph *lg, int src, int dst) {
-  // For hot swap scenarios, we need to check if this specific edge being 
+  // For hot swap scenarios, we need to check if this specific edge being
   // disconnected was the last connection, not just if connections still exist
   // after this disconnect operation completes
   if (!still_connected_S_to_D(lg, src, dst)) {
-    if (lg->indegree[dst] > 0) lg->indegree[dst]--;
+    if (lg->indegree[dst] > 0)
+      lg->indegree[dst]--;
     remove_successor(&lg->nodes[src], dst);
   }
 }
@@ -679,21 +787,27 @@ static inline void indegree_dec_on_last_pred(LiveGraph *lg, int src, int dst) {
 void assert_unique_pred_invariants(LiveGraph *lg) {
 #ifndef NDEBUG
   for (int d = 0; d < lg->node_count; d++) {
-    if (lg->is_orphaned[d]) continue;
+    if (lg->is_orphaned[d])
+      continue;
     bool seen[8192] = {0}; // Assume max nodes < 8192
     int uniq = 0;
     RTNode *D = &lg->nodes[d];
     if (D->inEdgeId) {
       for (int di = 0; di < D->nInputs; di++) {
         int eid = D->inEdgeId[di];
-        if (eid < 0) continue;
+        if (eid < 0)
+          continue;
         int s = lg->edges[eid].src_node;
-        if (s >= 0 && s < 8192 && !seen[s]) { seen[s] = true; uniq++; }
+        if (s >= 0 && s < 8192 && !seen[s]) {
+          seen[s] = true;
+          uniq++;
+        }
       }
     }
     if (lg->indegree[d] != uniq) {
-      printf("INVARIANT VIOLATED: Node %d has indegree=%d but %d unique preds\n", 
-             d, lg->indegree[d], uniq);
+      printf(
+          "INVARIANT VIOLATED: Node %d has indegree=%d but %d unique preds\n",
+          d, lg->indegree[d], uniq);
       assert(lg->indegree[d] == uniq);
     }
   }
@@ -815,8 +929,8 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
     }
     D->inEdgeId[dst_port] = eid;
     lg->edges[eid].refcount++;
-    if (!has_successor(S, dst_node)) {           // first S→D connection
-      lg->indegree[dst_node]++;                  // count unique predecessor S
+    if (!has_successor(S, dst_node)) { // first S→D connection
+      lg->indegree[dst_node]++;        // count unique predecessor S
       add_successor_port(S, dst_node);
     } else {
       // successor already recorded; do NOT increment indegree again
@@ -837,7 +951,7 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       if (free_id == -1) {
         free_id = atomic_fetch_add(&lg->next_node_id, 1);
       }
-      sum_id = apply_add_node(lg, SUM_VTABLE, NULL, free_id, "SUM", 2, 1);
+      sum_id = apply_add_node(lg, SUM_VTABLE, 0, free_id, "SUM", 2, 1);
       if (sum_id < 0)
         return false;
       RTNode *SUM = &lg->nodes[sum_id];
@@ -888,8 +1002,9 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       // SUM.out0 → D:dst_port
       D->inEdgeId[dst_port] = sum_out;
       lg->edges[sum_out].refcount++;
-      indegree_inc_on_first_pred(lg, sum_id, dst_node); // Restore indegree since destination now
-                                                         // depends on SUM
+      indegree_inc_on_first_pred(lg, sum_id,
+                                 dst_node); // Restore indegree since
+                                            // destination now depends on SUM
 
       // Remember the SUM
       D->fanin_sum_node_id[dst_port] = sum_id;
@@ -915,7 +1030,8 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       }
       SUM->inEdgeId[newN - 1] = new_eid;
       lg->edges[new_eid].refcount++;
-      indegree_inc_on_first_pred(lg, src_node, sum_id);  // ✅ only if first edge from S
+      indegree_inc_on_first_pred(lg, src_node,
+                                 sum_id); // ✅ only if first edge from S
     }
   }
 
@@ -971,7 +1087,7 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
 
     // Update successor list and indegree on the source node
     if (!still_connected_S_to_D(lg, src_node, dst_node)) {
-      lg->indegree[dst_node]--;                  // last S→D connection gone
+      lg->indegree[dst_node]--; // last S→D connection gone
       remove_successor(S, dst_node);
     }
     if (lg->indegree[dst_node] < 0)
@@ -1006,7 +1122,8 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
 
     // Disconnect src_node from SUM
     SUM->inEdgeId[sum_input_idx] = -1;
-    indegree_dec_on_last_pred(lg, src_node, sum_id);    // ✅ only if last edge S→SUM
+    indegree_dec_on_last_pred(lg, src_node,
+                              sum_id); // ✅ only if last edge S→SUM
 
     // Handle edge refcount
     LiveEdge *e = &lg->edges[src_eid];
@@ -1076,11 +1193,12 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       // Clean up SUM connections before deleting
       // Disconnect SUM from destination
       lg->edges[sum_out].refcount--;
-      indegree_dec_on_last_pred(lg, sum_id, dst_node);    // ✅ single predecessor (SUM)
+      indegree_dec_on_last_pred(lg, sum_id,
+                                dst_node); // ✅ single predecessor (SUM)
 
       // Disconnect remaining source from SUM
       lg->edges[remaining_eid].refcount--;
-      indegree_dec_on_last_pred(lg, remaining_src, sum_id);  // ✅
+      indegree_dec_on_last_pred(lg, remaining_src, sum_id); // ✅
 
       // Retire SUM's edges and delete SUM
       retire_edge(lg, sum_out);
@@ -1091,7 +1209,8 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       apply_delete_node(lg, sum_id);
 
       // Update scheduling for direct connection
-      if (added) lg->indegree[dst_node]++;      // ✅ only if first S→D edge
+      if (added)
+        lg->indegree[dst_node]++; // ✅ only if first S→D edge
     }
     // If SUM->nInputs > 1, SUM continues to exist with fewer inputs
   }
@@ -1160,7 +1279,7 @@ bool apply_delete_node(LiveGraph *lg, int node_id) {
   if (node->outEdgeId && node->nOutputs > 0) {
     // Track which destinations we've touched to avoid multi-decrement per dst
     bool *touched = calloc(lg->node_count, sizeof(bool));
-    
+
     for (int src_port = 0; src_port < node->nOutputs; src_port++) {
       int edge_id = node->outEdgeId[src_port];
       if (edge_id < 0)
@@ -1180,7 +1299,9 @@ bool apply_delete_node(LiveGraph *lg, int node_id) {
             dst->inEdgeId[dst_port] = -1;
             // Mark this destination as touched and decrement indegree once
             if (!touched[dst_node]) {
-              indegree_dec_on_last_pred(lg, node_id, dst_node);  // last connection check handles multi-port
+              indegree_dec_on_last_pred(
+                  lg, node_id,
+                  dst_node); // last connection check handles multi-port
               touched[dst_node] = true;
             }
           }
@@ -1196,7 +1317,7 @@ bool apply_delete_node(LiveGraph *lg, int node_id) {
       }
       node->outEdgeId[src_port] = -1; // Clear this node's output
     }
-    
+
     free(touched);
   }
 
@@ -1464,8 +1585,8 @@ bool is_failed_node(LiveGraph *lg, int logical_id) {
 
 // ===================== Queue-based API =====================
 
-int add_node(LiveGraph *lg, NodeVTable vtable, void *state, const char *name,
-             int nInputs, int nOutputs) {
+int add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
+             const char *name, int nInputs, int nOutputs) {
   // Atomically allocate the next node ID (which is also the array index)
   int node_id = atomic_fetch_add(&lg->next_node_id, 1);
 
@@ -1474,7 +1595,7 @@ int add_node(LiveGraph *lg, NodeVTable vtable, void *state, const char *name,
       .op = GE_ADD_NODE,
       .u.add_node = {
           .vt = vtable,
-          .state = state,
+          .state_size = state_size,
           .logical_id =
               node_id, // Use node_id as the logical_id (they're the same)
           .name = (char *)name,
@@ -1499,8 +1620,8 @@ bool delete_node(LiveGraph *lg, int node_id) {
   return geq_push(lg->graphEditQueue, &cmd);
 }
 
-bool connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
-             int dst_port) {
+bool graph_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
+                   int dst_port) {
   // Check if either node has failed
   if (is_failed_node(lg, src_node) || is_failed_node(lg, dst_node)) {
     return false;
@@ -1515,8 +1636,8 @@ bool connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
   return geq_push(lg->graphEditQueue, &cmd);
 }
 
-bool disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
-                int dst_port) {
+bool graph_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
+                      int dst_port) {
   GraphEditCmd cmd = {.op = GE_DISCONNECT,
                       .u.disconnect = {.src_id = src_node,
                                        .src_port = src_port,
@@ -1526,7 +1647,7 @@ bool disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
   return geq_push(lg->graphEditQueue, &cmd);
 }
 
-bool hot_swap_node(LiveGraph *lg, int node_id, NodeVTable vt, void *state,
+bool hot_swap_node(LiveGraph *lg, int node_id, NodeVTable vt, size_t state_size,
                    int nin, int nout, bool xfade,
                    void (*migrate)(void *, void *)) {
   if (is_failed_node(lg, node_id)) {
@@ -1537,7 +1658,7 @@ bool hot_swap_node(LiveGraph *lg, int node_id, NodeVTable vt, void *state,
                       .u.hot_swap_node =
                           {
                               .vt = vt,
-                              .state = state,
+                              .state_size = state_size,
                               .node_id = node_id,
                               .new_nInputs = nin,
                               .new_nOutputs = nout,
@@ -1547,13 +1668,13 @@ bool hot_swap_node(LiveGraph *lg, int node_id, NodeVTable vt, void *state,
   return geq_push(lg->graphEditQueue, &cmd);
 }
 
-bool replace_keep_edges(LiveGraph *lg, int node_id, NodeVTable vt, void *state,
-                        int nin, int nout, bool xfade,
+bool replace_keep_edges(LiveGraph *lg, int node_id, NodeVTable vt,
+                        size_t state_size, int nin, int nout, bool xfade,
                         void (*migrate)(void *, void *)) {
   GraphEditCmd cmd = {.op = GE_REPLACE_KEEP_EDGES,
                       .u.replace_keep_edges = {
                           .vt = vt,
-                          .state = state,
+                          .state_size = state_size,
                           .node_id = node_id,
                           .new_nInputs = nin,
                           .new_nOutputs = nout,

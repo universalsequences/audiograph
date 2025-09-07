@@ -19,7 +19,7 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
     // then we have a cmd to run
     switch (cmd.op) {
     case GE_ADD_NODE: {
-      int nid = apply_add_node(lg, cmd.u.add_node.vt, cmd.u.add_node.state,
+      int nid = apply_add_node(lg, cmd.u.add_node.vt, cmd.u.add_node.state_size,
                                cmd.u.add_node.logical_id, cmd.u.add_node.name,
                                cmd.u.add_node.nInputs, cmd.u.add_node.nOutputs);
       ok = nid >= 0;

@@ -29,3 +29,7 @@ test_sum_chain
 tests/test_auto_sum
 tests/test_hot_swap
 tests/test_multi_port_routing
+tests/test_hot_swap
+tests/test_hot_swap
+tests/test_multi_port_routing
+tests/test_multi_port_routing

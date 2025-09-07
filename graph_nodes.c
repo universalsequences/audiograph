@@ -136,11 +136,21 @@ const NodeVTable OSC_VTABLE = {.process = osc_process,
                                .reset = NULL,
                                .migrate = osc_migrate};
 
+static void gain_init(void *state, int sampleRate, int maxBlock) {
+  float *memory = (float *)state;
+  memory[GAIN_VALUE] = 1.0f; // Default gain of 1.0 (pass-through)
+}
+
 const NodeVTable GAIN_VTABLE = {
-    .process = gain_process, .init = NULL, .reset = NULL, .migrate = NULL};
+    .process = gain_process, .init = gain_init, .reset = NULL, .migrate = NULL};
+
+static void number_init(void *state, int sampleRate, int maxBlock) {
+  float *memory = (float *)state;
+  memory[NUMBER_VALUE] = 0.0f; // Default number value of 0.0
+}
 
 const NodeVTable NUMBER_VTABLE = {
-    .process = number_process, .init = NULL, .reset = NULL, .migrate = NULL};
+    .process = number_process, .init = number_init, .reset = NULL, .migrate = NULL};
 
 const NodeVTable MIX2_VTABLE = {
     .process = mix2_process, .init = NULL, .reset = NULL, .migrate = NULL};
