@@ -203,7 +203,31 @@ typedef enum {
   GE_REMOVE_NODE,
   GE_CONNECT,
   GE_DISCONNECT,
+  GE_HOT_SWAP_NODE, // port compatible: swap vtable+state (option xfade/migrate)
+  GE_REPLACE_KEEP_EDGES // incompatible signature: remap/auto-disconnect, keep
+                        // slot
+
 } GraphEditOp;
+
+typedef struct {
+  NodeVTable vt;
+  void *state; // ownership transfers to graph on success
+  int node_id; // target slot to swap
+  int new_nInputs;
+  int new_nOutputs;
+} GEHotSwapNode;
+
+typedef struct {
+  NodeVTable vt;
+  void *state; // ownership transfers to graph on success
+  int node_id; // target slot to replace
+  int new_nInputs;
+  int new_nOutputs;
+  // Policy flags:
+  // - if shrinking inputs/outputs, auto-disconnect excess ports
+  // deterministically
+  // - if growing, new ports initialize to -1
+} GEReplaceKeepEdges;
 
 typedef struct {
   GraphEditOp op;
@@ -225,6 +249,8 @@ typedef struct {
     struct {
       int src_id, src_port, dst_id, dst_port;
     } disconnect;
+    GEHotSwapNode hot_swap_node;
+    GEReplaceKeepEdges replace_keep_edges;
   } u;
 } GraphEditCmd;
 
@@ -237,15 +263,17 @@ typedef struct GraphEditQueue {
   _Atomic uint32_t tail; // consumer reads
 } GraphEditQueue;
 
-// ===================== Ready Queue (MPMC + length + semaphore) =====================
+// ===================== Ready Queue (MPMC + length + semaphore)
+// =====================
 
 #ifdef __APPLE__
 #include <dispatch/dispatch.h>
-// macOS doesn't support POSIX unnamed semaphores, use dispatch_semaphore instead
+// macOS doesn't support POSIX unnamed semaphores, use dispatch_semaphore
+// instead
 typedef struct {
-  MPMCQueue *ring;         // Existing MPMC queue for thread-safe node storage
-  _Atomic int qlen;        // Logical queue length for counting
-  dispatch_semaphore_t items;  // dispatch_semaphore for 0→1 wake optimization
+  MPMCQueue *ring;  // Existing MPMC queue for thread-safe node storage
+  _Atomic int qlen; // Logical queue length for counting
+  dispatch_semaphore_t items; // dispatch_semaphore for 0→1 wake optimization
 } ReadyQ;
 #else
 #include <semaphore.h>
@@ -271,7 +299,7 @@ void rq_destroy(ReadyQ *q);
 bool rq_push(ReadyQ *q, int32_t nid);
 bool rq_try_pop(ReadyQ *q, int32_t *out);
 bool rq_wait_nonempty(ReadyQ *q, int timeout_us);
-void rq_reset(ReadyQ *q);  // Reset/drain queue for clean block start
-void rq_push_or_spin(ReadyQ *q, int32_t nid);  // Retry until enqueue succeeds
+void rq_reset(ReadyQ *q); // Reset/drain queue for clean block start
+void rq_push_or_spin(ReadyQ *q, int32_t nid); // Retry until enqueue succeeds
 
 #endif // GRAPH_TYPES_H

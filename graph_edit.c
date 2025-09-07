@@ -1,4 +1,5 @@
 #include "graph_edit.h"
+#include "hot_swap.h"
 
 // to be called from block-boundary (i.e. before each block is executed)
 bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
@@ -9,7 +10,6 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
   bool all_ok = true;
 
   while (geq_pop(r, &cmd)) {
-    printf("APPLYING GRAPH EDIT!\n");
     if (MAX_CMDS_PER_BLOCK && applied >= MAX_CMDS_PER_BLOCK) {
       break;
     }
@@ -43,6 +43,12 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
                             cmd.u.disconnect.dst_port);
       break;
     }
+    case GE_HOT_SWAP_NODE:
+      ok = apply_hot_swap(lg, &cmd.u.hot_swap_node);
+      break;
+    case GE_REPLACE_KEEP_EDGES:
+      ok = apply_replace_keep_edges(lg, &cmd.u.replace_keep_edges);
+      break;
     default: {
       ok = false; // unknown op
       break;

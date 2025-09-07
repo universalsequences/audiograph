@@ -68,6 +68,11 @@ void free_graph(GraphState *g);
 
 // ===================== Live Editing System =====================
 
+typedef struct RetireEntry {
+  void *ptr;
+  void (*deleter)(void *); // e.g., free; or custom
+} RetireEntry;
+
 typedef struct LiveGraph {
   RTNode *nodes;
   int node_count, node_capacity;
@@ -86,8 +91,8 @@ typedef struct LiveGraph {
 
   // Scheduling state (same as GraphState)
   atomic_int *pending;
-  int *indegree; // maintained incrementally at edits for port-based system
-  ReadyQ *readyQueue;    // Ready queue with counting length and semaphore
+  int *indegree;      // maintained incrementally at edits for port-based system
+  ReadyQ *readyQueue; // Ready queue with counting length and semaphore
   _Atomic int jobsInFlight;
 
   // Parameter mailbox
@@ -100,6 +105,11 @@ typedef struct LiveGraph {
 
   // Graph Edit Queue
   GraphEditQueue *graphEditQueue;
+
+  // one-block retire list (old states, optional wrappers)
+  RetireEntry *retire_list;
+  int retire_count;
+  int retire_capacity;
 
   // Failed operation tracking
   uint64_t *failed_ids;    // Array of node IDs that failed to create
@@ -115,14 +125,13 @@ typedef struct LiveGraph {
 typedef struct Engine {
   pthread_t *threads;
   int workerCount;
-  _Atomic int runFlag;                    // 1 = running, 0 = shutdown
+  _Atomic int runFlag; // 1 = running, 0 = shutdown
 
-  _Atomic(LiveGraph *)
-      workSession; // published at block start, NULL after
+  _Atomic(LiveGraph *) workSession; // published at block start, NULL after
 
   // Block-start wake mechanism
-  pthread_mutex_t sess_mtx;               // protects sess_cv wait/signal
-  pthread_cond_t  sess_cv;                // workers sleep here between blocks
+  pthread_mutex_t sess_mtx; // protects sess_cv wait/signal
+  pthread_cond_t sess_cv;   // workers sleep here between blocks
 
   int sampleRate;
   int blockSize;
@@ -170,6 +179,15 @@ bool connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
              int dst_port);
 bool disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
                 int dst_port);
+
+bool hot_swap_node(LiveGraph *lg, int node_id, NodeVTable vt, void *state,
+                   int nin, int nout, bool xfade,
+                   void (*migrate)(void *, void *));
+
+bool replace_keep_edges(LiveGraph *lg, int node_id, NodeVTable vt, void *state,
+                        int nin, int nout, bool xfade,
+                        void (*migrate)(void *, void *));
+
 bool is_failed_node(LiveGraph *lg, int node_id);
 void add_failed_id(LiveGraph *lg, uint64_t logical_id);
 int find_live_output(LiveGraph *lg);
@@ -177,6 +195,9 @@ int find_live_output(LiveGraph *lg);
 // ===================== Live Engine Operations =====================
 
 void process_next_block(LiveGraph *lg, float *output_buffer, int nframes);
+void retire_later(LiveGraph *lg, void *ptr, void (*deleter)(void *));
+
+void update_orphaned_status(LiveGraph *lg);
 
 // ===================== Global Engine Instance =====================
 

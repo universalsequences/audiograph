@@ -92,9 +92,12 @@ void apply_params(LiveGraph *g) {
 static void wait_for_block_start_or_shutdown(void) {
   pthread_mutex_lock(&g_engine.sess_mtx);
   for (;;) {
-    if (!atomic_load_explicit(&g_engine.runFlag, memory_order_acquire)) break;
-    LiveGraph *lg = atomic_load_explicit(&g_engine.workSession, memory_order_acquire);
-    if (lg && atomic_load_explicit(&lg->jobsInFlight, memory_order_acquire) > 0) break;
+    if (!atomic_load_explicit(&g_engine.runFlag, memory_order_acquire))
+      break;
+    LiveGraph *lg =
+        atomic_load_explicit(&g_engine.workSession, memory_order_acquire);
+    if (lg && atomic_load_explicit(&lg->jobsInFlight, memory_order_acquire) > 0)
+      break;
     pthread_cond_wait(&g_engine.sess_cv, &g_engine.sess_mtx);
   }
   pthread_mutex_unlock(&g_engine.sess_mtx);
@@ -103,14 +106,18 @@ static void wait_for_block_start_or_shutdown(void) {
 static void *worker_main(void *arg) {
   (void)arg;
   for (;;) {
-    if (!atomic_load_explicit(&g_engine.runFlag, memory_order_acquire)) break;
+    if (!atomic_load_explicit(&g_engine.runFlag, memory_order_acquire))
+      break;
 
     // Park until a block is published
     wait_for_block_start_or_shutdown();
-    if (!atomic_load_explicit(&g_engine.runFlag, memory_order_acquire)) break;
+    if (!atomic_load_explicit(&g_engine.runFlag, memory_order_acquire))
+      break;
 
-    LiveGraph *lg = atomic_load_explicit(&g_engine.workSession, memory_order_acquire);
-    if (!lg) continue;  // spurious wake or block already ended
+    LiveGraph *lg =
+        atomic_load_explicit(&g_engine.workSession, memory_order_acquire);
+    if (!lg)
+      continue; // spurious wake or block already ended
 
     // Hot loop: run until this block is complete
     for (;;) {
@@ -122,7 +129,8 @@ static void *worker_main(void *arg) {
       // Tiny spin to catch bursts without kernel call
       bool got = false;
       for (int s = 0; s < 64; s++) {
-        if ((got = rq_try_pop(lg->readyQueue, &nid))) break;
+        if ((got = rq_try_pop(lg->readyQueue, &nid)))
+          break;
         cpu_relax(); // _mm_pause / __yield
       }
       if (!got) {
@@ -145,11 +153,11 @@ static void *worker_main(void *arg) {
 void engine_start_workers(int workers) {
   g_engine.workerCount = workers;
   g_engine.threads = (pthread_t *)calloc(workers, sizeof(pthread_t));
-  
+
   // Initialize mutex and condition variable for block-start wake
   pthread_mutex_init(&g_engine.sess_mtx, NULL);
   pthread_cond_init(&g_engine.sess_cv, NULL);
-  
+
   atomic_store(&g_engine.runFlag, 1);
   for (int i = 0; i < workers; i++) {
     pthread_attr_t attr;
@@ -168,17 +176,17 @@ void engine_stop_workers(void) {
   pthread_mutex_unlock(&g_engine.sess_mtx);
 
   // Also wake any workers blocked in rq_wait_nonempty during a block
-  // We'll iterate through all potential live graphs, but since we're shutting down,
-  // we can just wait for threads to exit naturally
+  // We'll iterate through all potential live graphs, but since we're shutting
+  // down, we can just wait for threads to exit naturally
 
   for (int i = 0; i < g_engine.workerCount; i++) {
     pthread_join(g_engine.threads[i], NULL);
   }
-  
+
   // Clean up synchronization primitives
   pthread_mutex_destroy(&g_engine.sess_mtx);
   pthread_cond_destroy(&g_engine.sess_cv);
-  
+
   free(g_engine.threads);
   g_engine.threads = NULL;
   g_engine.workerCount = 0;
@@ -344,6 +352,11 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   // Edge pool (start with generous capacity)
   lg->edge_capacity = initial_capacity * 4;
   lg->block_size = block_size;
+
+  // Initialize Retire List
+  lg->retire_capacity = 32;
+  lg->retire_count = 0;
+  lg->retire_list = calloc(lg->retire_capacity, sizeof(RetireEntry));
 
   // New port-based edge pool
   lg->edges = calloc(lg->edge_capacity, sizeof(LiveEdge));
@@ -697,7 +710,7 @@ static void mark_reachable_from_dac(LiveGraph *lg, int node_id, bool *visited) {
 }
 
 // Update orphaned status for all nodes based on DAC reachability
-static void update_orphaned_status(LiveGraph *lg) {
+void update_orphaned_status(LiveGraph *lg) {
   // First, mark all nodes as orphaned
   for (int i = 0; i < lg->node_count; i++) {
     lg->is_orphaned[i] = true;
@@ -1218,8 +1231,8 @@ void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
   // CRITICAL FIX: Use thread-local scratch to prevent write-write races
   for (int i = 0; i < node->nOutputs && i < MAX_IO; i++) {
     int eid = node->outEdgeId ? node->outEdgeId[i] : -1;
-    outPtrs[i] = (eid >= 0) ? lg->edges[eid].buf 
-                            : get_tls_out_scratch(i, nframes);
+    outPtrs[i] =
+        (eid >= 0) ? lg->edges[eid].buf : get_tls_out_scratch(i, nframes);
   }
 
   if (node->vtable.process) {
@@ -1238,10 +1251,13 @@ static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes) {
   // Notify successors (node-level)
   for (int i = 0; i < node->succCount; i++) {
     int succ = node->succ[i];
-    if (succ < 0 || succ >= lg->node_count) continue;
-    if (lg->is_orphaned[succ]) continue;
-    if (atomic_fetch_sub_explicit(&lg->pending[succ], 1, memory_order_acq_rel) == 1) {
-      rq_push_or_spin(lg->readyQueue, succ);  // CRITICAL FIX: Never drop work
+    if (succ < 0 || succ >= lg->node_count)
+      continue;
+    if (lg->is_orphaned[succ])
+      continue;
+    if (atomic_fetch_sub_explicit(&lg->pending[succ], 1,
+                                  memory_order_acq_rel) == 1) {
+      rq_push_or_spin(lg->readyQueue, succ); // CRITICAL FIX: Never drop work
     }
   }
 
@@ -1251,7 +1267,8 @@ static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes) {
 static void init_pending_and_seed(LiveGraph *lg) {
   int totalJobs = 0;
 
-  // CRITICAL FIX: Properly reset/drain the ready queue to prevent stale node IDs
+  // CRITICAL FIX: Properly reset/drain the ready queue to prevent stale node
+  // IDs
   rq_reset(lg->readyQueue);
 
   // pending = indegree for reachable nodes, -1 for orphaned/deleted
@@ -1264,7 +1281,7 @@ static void init_pending_and_seed(LiveGraph *lg) {
       continue;
     }
 
-    int indeg = lg->indegree[i];        // maintained incrementally at edits
+    int indeg = lg->indegree[i]; // maintained incrementally at edits
     atomic_store_explicit(&lg->pending[i], indeg, memory_order_relaxed);
 
     bool hasOut = node_has_any_output_connected(lg, i);
@@ -1273,7 +1290,7 @@ static void init_pending_and_seed(LiveGraph *lg) {
     if (hasOut || isSink) {
       totalJobs++;
       if (indeg == 0 && hasOut) {
-        rq_push_or_spin(lg->readyQueue, i);     // CRITICAL FIX: Never drop work
+        rq_push_or_spin(lg->readyQueue, i); // CRITICAL FIX: Never drop work
       }
     }
   }
@@ -1291,6 +1308,14 @@ static bool detect_cycle(LiveGraph *lg) {
       zero_in++;
   }
   return (reachable > 0 && zero_in == 0);
+}
+
+// Call at the end of process_live_block (after all work done)
+static void drain_retire_list(LiveGraph *lg) {
+  for (int i = 0; i < lg->retire_count; i++) {
+    lg->retire_list[i].deleter(lg->retire_list[i].ptr);
+  }
+  lg->retire_count = 0;
 }
 
 void process_live_block(LiveGraph *lg, int nframes) {
@@ -1316,7 +1341,7 @@ void process_live_block(LiveGraph *lg, int nframes) {
   if (g_engine.workerCount > 0) {
     // Publish session & wake workers
     atomic_store_explicit(&g_engine.workSession, lg, memory_order_release);
-    
+
     pthread_mutex_lock(&g_engine.sess_mtx);
     pthread_cond_broadcast(&g_engine.sess_cv);
     pthread_mutex_unlock(&g_engine.sess_mtx);
@@ -1332,26 +1357,6 @@ void process_live_block(LiveGraph *lg, int nframes) {
       }
     }
 
-#ifdef DEBUG
-    // Debug assertions to verify block completion
-    int32_t dummy_node;
-    int remaining_queue_items = 0;
-    // Count any remaining items in the ready queue (should be 0)
-    while (rq_try_pop(lg->readyQueue, &dummy_node)) {
-      remaining_queue_items++;
-    }
-    if (remaining_queue_items > 0) {
-      fprintf(stderr, "ERROR: Block completed but %d items remain in ready queue!\n", 
-              remaining_queue_items);
-    }
-    
-    // Verify ready queue length is consistent
-    int qlen = atomic_load_explicit(&lg->readyQueue->qlen, memory_order_acquire);
-    if (qlen != 0) {
-      fprintf(stderr, "ERROR: Block completed but readyQueue qlen = %d (expected 0)\n", qlen);
-    }
-#endif
-
     // Clear session
     atomic_store_explicit(&g_engine.workSession, NULL, memory_order_release);
   } else {
@@ -1361,6 +1366,8 @@ void process_live_block(LiveGraph *lg, int nframes) {
       execute_and_fanout(lg, nid, nframes);
     }
   }
+
+  drain_retire_list(lg);
 }
 
 int find_live_output(LiveGraph *lg) {
@@ -1481,4 +1488,52 @@ bool disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
                                        .dst_port = dst_port}};
 
   return geq_push(lg->graphEditQueue, &cmd);
+}
+
+bool hot_swap_node(LiveGraph *lg, int node_id, NodeVTable vt, void *state,
+                   int nin, int nout, bool xfade,
+                   void (*migrate)(void *, void *)) {
+  if (is_failed_node(lg, node_id)) {
+    return false;
+  }
+
+  GraphEditCmd cmd = {.op = GE_HOT_SWAP_NODE,
+                      .u.hot_swap_node =
+                          {
+                              .vt = vt,
+                              .state = state,
+                              .node_id = node_id,
+                              .new_nInputs = nin,
+                              .new_nOutputs = nout,
+                          }
+
+  };
+  return geq_push(lg->graphEditQueue, &cmd);
+}
+
+bool replace_keep_edges(LiveGraph *lg, int node_id, NodeVTable vt, void *state,
+                        int nin, int nout, bool xfade,
+                        void (*migrate)(void *, void *)) {
+  GraphEditCmd cmd = {.op = GE_REPLACE_KEEP_EDGES,
+                      .u.replace_keep_edges = {
+                          .vt = vt,
+                          .state = state,
+                          .node_id = node_id,
+                          .new_nInputs = nin,
+                          .new_nOutputs = nout,
+
+                      }};
+  return geq_push(lg->graphEditQueue, &cmd);
+}
+
+void retire_later(LiveGraph *lg, void *ptr, void (*deleter)(void *)) {
+  if (!ptr)
+    return;
+  if (lg->retire_count >= lg->retire_capacity) {
+    lg->retire_capacity = lg->retire_capacity ? lg->retire_capacity * 2 : 16;
+    lg->retire_list =
+        realloc(lg->retire_list, lg->retire_capacity * sizeof(RetireEntry));
+  }
+  lg->retire_list[lg->retire_count++] =
+      (RetireEntry){.ptr = ptr, .deleter = deleter};
 }

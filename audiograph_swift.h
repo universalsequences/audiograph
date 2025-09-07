@@ -4,11 +4,11 @@
 // Audiograph Swift Integration Header
 // Include this header in your Swift bridging header for audiograph integration
 
-#include "graph_types.h"
-#include "graph_engine.h"
 #include "graph_api.h"
 #include "graph_edit.h"
+#include "graph_engine.h"
 #include "graph_nodes.h"
+#include "graph_types.h"
 
 // ===================== Core Engine Functions =====================
 
@@ -22,13 +22,15 @@ void engine_stop_workers(void);
 // ===================== Live Graph Management =====================
 
 // Create and destroy live graphs
-LiveGraph *create_live_graph(int initial_capacity, int block_size, const char *label);
+LiveGraph *create_live_graph(int initial_capacity, int block_size,
+                             const char *label);
 void destroy_live_graph(LiveGraph *lg);
 
 // ===================== Node Management =====================
 
 // Generic node creation (returns pre-allocated node ID)
-int add_node(LiveGraph *lg, NodeVTable vtable, void *state, const char *name, int nInputs, int nOutputs);
+int add_node(LiveGraph *lg, NodeVTable vtable, void *state, const char *name,
+             int nInputs, int nOutputs);
 
 // Convenient factory functions for common node types
 int live_add_oscillator(LiveGraph *lg, float freq_hz, const char *name);
@@ -47,10 +49,20 @@ bool is_failed_node(LiveGraph *lg, int node_id);
 // ===================== Port-based Connections =====================
 
 // Connect specific ports between nodes
-bool connect(LiveGraph *lg, int src_node, int src_port, int dst_node, int dst_port);
+bool connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
+             int dst_port);
 
 // Disconnect specific port connections
-bool disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node, int dst_port);
+bool disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
+                int dst_port);
+
+bool hot_swap_node(LiveGraph *lg, int node_id, NodeVTable vt, void *state,
+                   int nin, int nout, bool xfade,
+                   void (*migrate)(void *, void *));
+
+bool replace_keep_edges(LiveGraph *lg, int node_id, NodeVTable vt, void *state,
+                        int nin, int nout, bool xfade,
+                        void (*migrate)(void *, void *));
 
 // ===================== Real-time Audio Processing =====================
 
