@@ -770,9 +770,12 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
     }
     D->inEdgeId[dst_port] = eid;
     lg->edges[eid].refcount++;
-    lg->indegree[dst_node]++;
-    if (!has_successor(S, dst_node))
+    if (!has_successor(S, dst_node)) {           // first S→D connection
+      lg->indegree[dst_node]++;                  // count unique predecessor S
       add_successor_port(S, dst_node);
+    } else {
+      // successor already recorded; do NOT increment indegree again
+    }
   } else {
     // Case 2 or 3: Already has a producer → use/create SUM(D, dst_port)
     int sum_id = D->fanin_sum_node_id[dst_port];
@@ -928,14 +931,14 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
 
     // Unwire the destination port
     D->inEdgeId[dst_port] = -1;
-    lg->indegree[dst_node]--;
-    if (lg->indegree[dst_node] < 0)
-      lg->indegree[dst_node] = 0;
 
-    // Update successor list on the source node
+    // Update successor list and indegree on the source node
     if (!still_connected_S_to_D(lg, src_node, dst_node)) {
+      lg->indegree[dst_node]--;                  // last S→D connection gone
       remove_successor(S, dst_node);
     }
+    if (lg->indegree[dst_node] < 0)
+      lg->indegree[dst_node] = 0;
 
     // Edge refcount and retirement if last consumer
     LiveEdge *e = &lg->edges[eid_in];
@@ -1145,11 +1148,14 @@ bool apply_delete_node(LiveGraph *lg, int node_id) {
 
         for (int dst_port = 0; dst_port < dst->nInputs; dst_port++) {
           if (dst->inEdgeId[dst_port] == edge_id) {
-            // Clear the destination's input port and update scheduling
+            // Clear the destination's input port
             dst->inEdgeId[dst_port] = -1;
-            if (lg->indegree)
-              lg->indegree[dst_node]--;
           }
+        }
+        
+        // Only decrement indegree if this was the last connection from deleted node to dst_node
+        if (lg->indegree && !still_connected_S_to_D(lg, node_id, dst_node)) {
+          lg->indegree[dst_node]--;
         }
       }
 
