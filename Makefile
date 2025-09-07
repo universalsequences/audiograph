@@ -136,6 +136,10 @@ tests/test_number_node: tests/test_number_node.c $(HEADERS) graph_engine.o graph
 tests/test_multi_port_routing: tests/test_multi_port_routing.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o ready_queue.o hot_swap.o
 	$(CC) $(CFLAGS) -I. -o tests/test_multi_port_routing tests/test_multi_port_routing.c graph_engine.o graph_nodes.o graph_edit.o ready_queue.o hot_swap.o
 
+# Build multi-port auto-sum disconnect test (verify auto-sum disconnection doesn't cause dropouts)
+tests/test_multiport_autosum_disconnect: tests/test_multiport_autosum_disconnect.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o ready_queue.o hot_swap.o
+	$(CC) $(CFLAGS) -I. -o tests/test_multiport_autosum_disconnect tests/test_multiport_autosum_disconnect.c graph_engine.o graph_nodes.o graph_edit.o ready_queue.o hot_swap.o
+
 # Build new worker system test (validate block-boundary wake system)
 tests/test_new_worker_system: tests/test_new_worker_system.c $(HEADERS) graph_engine.o graph_nodes.o graph_api.o graph_edit.o ready_queue.o hot_swap.o
 	$(CC) $(CFLAGS) -I. -o tests/test_new_worker_system tests/test_new_worker_system.c graph_engine.o graph_nodes.o graph_api.o graph_edit.o ready_queue.o hot_swap.o

@@ -186,5 +186,22 @@ bool apply_replace_keep_edges(LiveGraph *lg, GEReplaceKeepEdges *p) {
   // Topology changed (some ports disconnected), so refresh orphan flags
   update_orphaned_status(lg);
 
+  // After hot swap replacement, ensure indegree matches actual unique predecessors
+  // This fixes edge cases where port shrinking can leave indegree inconsistent
+  int actual_unique_preds = 0;
+  bool seen[8192] = {0}; // Assume max nodes < 8192
+  if (n->inEdgeId) {
+    for (int di = 0; di < n->nInputs; di++) {
+      int eid = n->inEdgeId[di];
+      if (eid < 0) continue;
+      int s = lg->edges[eid].src_node;
+      if (s >= 0 && s < 8192 && !seen[s]) { 
+        seen[s] = true; 
+        actual_unique_preds++; 
+      }
+    }
+  }
+  lg->indegree[id] = actual_unique_preds;
+
   return true;
 }

@@ -2,6 +2,7 @@
 #include "graph_edit.h"
 #include "graph_nodes.h"
 #include <unistd.h>
+#include <assert.h>
 
 // Include ReadyQ implementation
 extern ReadyQ *rq_create(int capacity);
@@ -655,6 +656,50 @@ static inline bool has_successor(const RTNode *src, int succ_id) {
   return false;
 }
 
+// Helper: increment indegree only on first connection between src→dst
+static inline void indegree_inc_on_first_pred(LiveGraph *lg, int src, int dst) {
+  if (!has_successor(&lg->nodes[src], dst)) {
+    add_successor_port(&lg->nodes[src], dst);
+    lg->indegree[dst]++;                 // count unique predecessor once
+  }
+}
+
+// Helper: decrement indegree only on last disconnection between src→dst
+static inline void indegree_dec_on_last_pred(LiveGraph *lg, int src, int dst) {
+  // For hot swap scenarios, we need to check if this specific edge being 
+  // disconnected was the last connection, not just if connections still exist
+  // after this disconnect operation completes
+  if (!still_connected_S_to_D(lg, src, dst)) {
+    if (lg->indegree[dst] > 0) lg->indegree[dst]--;
+    remove_successor(&lg->nodes[src], dst);
+  }
+}
+
+// Debug: assert unique predecessor invariants (saves hours of debugging)
+void assert_unique_pred_invariants(LiveGraph *lg) {
+#ifndef NDEBUG
+  for (int d = 0; d < lg->node_count; d++) {
+    if (lg->is_orphaned[d]) continue;
+    bool seen[8192] = {0}; // Assume max nodes < 8192
+    int uniq = 0;
+    RTNode *D = &lg->nodes[d];
+    if (D->inEdgeId) {
+      for (int di = 0; di < D->nInputs; di++) {
+        int eid = D->inEdgeId[di];
+        if (eid < 0) continue;
+        int s = lg->edges[eid].src_node;
+        if (s >= 0 && s < 8192 && !seen[s]) { seen[s] = true; uniq++; }
+      }
+    }
+    if (lg->indegree[d] != uniq) {
+      printf("INVARIANT VIOLATED: Node %d has indegree=%d but %d unique preds\n", 
+             d, lg->indegree[d], uniq);
+      assert(lg->indegree[d] == uniq);
+    }
+  }
+#endif
+}
+
 // Allocate (or reuse from pool) an edge buffer; returns edge id or -1
 static int alloc_edge(LiveGraph *lg) {
   for (int i = 0; i < lg->edge_capacity; i++) {
@@ -813,9 +858,7 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       // Hook old_src → SUM.in0 (reuse existing edge)
       SUM->inEdgeId[0] = existing_eid;
       lg->edges[existing_eid].refcount++; // SUM consumes it now
-      if (!has_successor(&lg->nodes[old_src], sum_id))
-        add_successor_port(&lg->nodes[old_src], sum_id);
-      lg->indegree[sum_id]++;
+      indegree_inc_on_first_pred(lg, old_src, sum_id);
 
       // Ensure SUM has an output edge
       int sum_out = SUM->outEdgeId[0];
@@ -840,17 +883,13 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       }
       SUM->inEdgeId[1] = new_eid;
       lg->edges[new_eid].refcount++;
-      if (!has_successor(S, sum_id))
-        add_successor_port(S, sum_id);
-      lg->indegree[sum_id]++;
+      indegree_inc_on_first_pred(lg, src_node, sum_id);
 
       // SUM.out0 → D:dst_port
       D->inEdgeId[dst_port] = sum_out;
       lg->edges[sum_out].refcount++;
-      if (!has_successor(SUM, dst_node))
-        add_successor_port(SUM, dst_node);
-      lg->indegree[dst_node]++; // Restore indegree since destination now
-                                // depends on SUM
+      indegree_inc_on_first_pred(lg, sum_id, dst_node); // Restore indegree since destination now
+                                                         // depends on SUM
 
       // Remember the SUM
       D->fanin_sum_node_id[dst_port] = sum_id;
@@ -876,9 +915,7 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       }
       SUM->inEdgeId[newN - 1] = new_eid;
       lg->edges[new_eid].refcount++;
-      if (!has_successor(S, sum_id))
-        add_successor_port(S, sum_id);
-      lg->indegree[sum_id]++;
+      indegree_inc_on_first_pred(lg, src_node, sum_id);  // ✅ only if first edge from S
     }
   }
 
@@ -969,13 +1006,7 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
 
     // Disconnect src_node from SUM
     SUM->inEdgeId[sum_input_idx] = -1;
-    lg->indegree[sum_id]--;
-    if (lg->indegree[sum_id] < 0)
-      lg->indegree[sum_id] = 0;
-
-    if (!still_connected_S_to_D(lg, src_node, sum_id)) {
-      remove_successor(S, sum_id);
-    }
+    indegree_dec_on_last_pred(lg, src_node, sum_id);    // ✅ only if last edge S→SUM
 
     // Handle edge refcount
     LiveEdge *e = &lg->edges[src_eid];
@@ -998,9 +1029,7 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       // No inputs left - remove SUM and clear destination
       D->inEdgeId[dst_port] = -1;
       D->fanin_sum_node_id[dst_port] = -1;
-      lg->indegree[dst_node]--;
-      if (lg->indegree[dst_node] < 0)
-        lg->indegree[dst_node] = 0;
+      indegree_dec_on_last_pred(lg, sum_id, dst_node);
 
       // Retire SUM's output edge
       int sum_out = SUM->outEdgeId[0];
@@ -1030,10 +1059,12 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       lg->edges[direct_eid].refcount = 1; // consumed by destination
 
       // Wire source to new edge and destination to new edge
+      bool added = false;
       if (remaining_src >= 0) {
         lg->nodes[remaining_src].outEdgeId[remaining_src_port] = direct_eid;
         if (!has_successor(&lg->nodes[remaining_src], dst_node)) {
           add_successor_port(&lg->nodes[remaining_src], dst_node);
+          added = true;
         }
         // Remove SUM from source's successors
         remove_successor(&lg->nodes[remaining_src], sum_id);
@@ -1045,17 +1076,11 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       // Clean up SUM connections before deleting
       // Disconnect SUM from destination
       lg->edges[sum_out].refcount--;
-      lg->indegree[dst_node]--;
-      if (lg->indegree[dst_node] < 0)
-        lg->indegree[dst_node] = 0;
-
-      remove_successor(SUM, dst_node);
+      indegree_dec_on_last_pred(lg, sum_id, dst_node);    // ✅ single predecessor (SUM)
 
       // Disconnect remaining source from SUM
       lg->edges[remaining_eid].refcount--;
-      lg->indegree[sum_id]--;
-      if (lg->indegree[sum_id] < 0)
-        lg->indegree[sum_id] = 0;
+      indegree_dec_on_last_pred(lg, remaining_src, sum_id);  // ✅
 
       // Retire SUM's edges and delete SUM
       retire_edge(lg, sum_out);
@@ -1066,7 +1091,7 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       apply_delete_node(lg, sum_id);
 
       // Update scheduling for direct connection
-      lg->indegree[dst_node]++;
+      if (added) lg->indegree[dst_node]++;      // ✅ only if first S→D edge
     }
     // If SUM->nInputs > 1, SUM continues to exist with fewer inputs
   }
@@ -1133,6 +1158,9 @@ bool apply_delete_node(LiveGraph *lg, int node_id) {
   // 2) Disconnect all outbound connections (clean up other nodes' inputs from
   // this node)
   if (node->outEdgeId && node->nOutputs > 0) {
+    // Track which destinations we've touched to avoid multi-decrement per dst
+    bool *touched = calloc(lg->node_count, sizeof(bool));
+    
     for (int src_port = 0; src_port < node->nOutputs; src_port++) {
       int edge_id = node->outEdgeId[src_port];
       if (edge_id < 0)
@@ -1150,12 +1178,12 @@ bool apply_delete_node(LiveGraph *lg, int node_id) {
           if (dst->inEdgeId[dst_port] == edge_id) {
             // Clear the destination's input port
             dst->inEdgeId[dst_port] = -1;
+            // Mark this destination as touched and decrement indegree once
+            if (!touched[dst_node]) {
+              indegree_dec_on_last_pred(lg, node_id, dst_node);  // last connection check handles multi-port
+              touched[dst_node] = true;
+            }
           }
-        }
-        
-        // Only decrement indegree if this was the last connection from deleted node to dst_node
-        if (lg->indegree && !still_connected_S_to_D(lg, node_id, dst_node)) {
-          lg->indegree[dst_node]--;
         }
       }
 
@@ -1168,6 +1196,8 @@ bool apply_delete_node(LiveGraph *lg, int node_id) {
       }
       node->outEdgeId[src_port] = -1; // Clear this node's output
     }
+    
+    free(touched);
   }
 
   // 3) Free node's memory
