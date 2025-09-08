@@ -104,7 +104,7 @@ bool apply_hot_swap(LiveGraph *lg, GEHotSwapNode *p) {
   // Allocate new state memory if needed
   void *new_state = NULL;
   if (p->state_size > 0) {
-    new_state = alloc_state_f32(64, p->state_size);
+    new_state = alloc_state_f32(p->state_size, 64);
     if (!new_state) {
       return false; // Memory allocation failed
     }
@@ -196,11 +196,10 @@ bool apply_replace_keep_edges(LiveGraph *lg, GEReplaceKeepEdges *p) {
   // 4) Allocate and install new state/vtable
   void *new_state = NULL;
   if (p->state_size > 0) {
-    new_state = alloc_state_f32(64, p->state_size);
+    new_state = alloc_state_f32(p->state_size, 64);
     if (!new_state) {
       return false; // Memory allocation failed
     }
-    memset(new_state, 0, p->state_size); // Zero-initialize the new state
 
     // Call NodeVTable init function if provided
     if (p->vt.init) {
