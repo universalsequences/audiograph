@@ -24,6 +24,21 @@ static inline void *alloc_aligned(size_t alignment, size_t size) {
   return p;
 }
 
+static inline float *alloc_state_f32(size_t n_floats, size_t alignment) {
+  // guard overflow
+  size_t bytes = n_floats * sizeof(float);
+#if defined(__has_builtin) && __has_builtin(__builtin_mul_overflow)
+  if (__builtin_mul_overflow(n_floats, sizeof(float), &bytes))
+    return NULL;
+#endif
+  void *p = NULL;
+  int rc = posix_memalign(&p, alignment, bytes);
+  if (rc != 0)
+    return NULL;
+  memset(p, 0, bytes);
+  return (float *)p;
+}
+
 static inline uint64_t nsec_now(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -212,7 +227,7 @@ typedef enum {
 typedef struct {
   NodeVTable vt;
   size_t state_size; // size of memory to allocate for state
-  int node_id; // target slot to swap
+  int node_id;       // target slot to swap
   int new_nInputs;
   int new_nOutputs;
 } GEHotSwapNode;
@@ -220,7 +235,7 @@ typedef struct {
 typedef struct {
   NodeVTable vt;
   size_t state_size; // size of memory to allocate for state
-  int node_id; // target slot to replace
+  int node_id;       // target slot to replace
   int new_nInputs;
   int new_nOutputs;
   // Policy flags:

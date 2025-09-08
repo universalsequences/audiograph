@@ -267,8 +267,68 @@ void test_complex_topology() {
     printf("Edge capacity in graph: %d\n", lg->edge_capacity);
     printf("✓ Graph topology verification complete\n");
     
+    printf("\n=== Phase 9: Testing Disconnection from Multi-Input ===\n");
+    
+    // Process a block to establish baseline
+    process_next_block(lg, output_buffer, block_size);
+    float baseline_output = output_buffer[0];
+    printf("✓ Baseline output with both connections: %.6f\n", baseline_output);
+    
+    // Disconnect Node 1 port 1 from Node 3 (remove one input from the SUM)
+    printf("Disconnecting Node 1 port 1 -> Node 3 port 0...\n");
+    bool disconnect_result = graph_disconnect(lg, node1, 1, node3, 0);
+    assert(disconnect_result);
+    printf("✓ Disconnection queued successfully\n");
+    
+    // Apply the disconnection
+    apply_graph_edits(lg->graphEditQueue, lg);
+    printf("✓ Disconnection applied\n");
+    
+    // Process multiple blocks to see if there are artifacts
+    printf("Processing blocks after disconnection:\n");
+    for (int i = 0; i < 5; i++) {
+        process_next_block(lg, output_buffer, block_size);
+        float current_output = output_buffer[0];
+        printf("  Block %d: %.6f\n", i+1, current_output);
+        
+        // After disconnection, Node 3 should only receive 20.0 from Node 2
+        // Expected: Node 3 = 20.0 * 3.0 = 60.0, DAC = 20.0 + 60.0 = 80.0
+        float expected_after_disconnect = 80.0f;
+        
+        if (i >= 1) { // Allow first block for transition
+            bool output_correct = fabs(current_output - expected_after_disconnect) < 0.001f;
+            if (!output_correct) {
+                printf("  🐛 ARTIFACT DETECTED: Expected %.6f, got %.6f (diff: %.6f)\n", 
+                       expected_after_disconnect, current_output, 
+                       fabs(current_output - expected_after_disconnect));
+                printf("  This suggests the SUM node is holding stale data from the disconnected input\n");
+            } else if (i == 1) {
+                printf("  ✓ Output stabilized to correct value after disconnection\n");
+            }
+        }
+    }
+    
+    // Check if SUM node still exists and what its state is
+    printf("\nPost-disconnection SUM node analysis:\n");
+    if (lg->nodes[node3].fanin_sum_node_id[0] >= 0) {
+        int sum_node = lg->nodes[node3].fanin_sum_node_id[0];
+        printf("  SUM node %d still exists\n", sum_node);
+        printf("  SUM node inputs: %d, outputs: %d\n", 
+               lg->nodes[sum_node].nInputs, lg->nodes[sum_node].nOutputs);
+        printf("  SUM node indegree: %d\n", lg->indegree[sum_node]);
+        
+        // Check if SUM node should be removed (only 1 input remaining)
+        if (lg->indegree[sum_node] <= 1) {
+            printf("  ⚠️  SUM node should potentially be removed (only %d input remaining)\n", 
+                   lg->indegree[sum_node]);
+        }
+    } else {
+        printf("  SUM node has been removed (fanin_sum_node_id = -1)\n");
+        printf("  Node 3 should now have direct connection\n");
+    }
+
     destroy_live_graph(lg);
-    printf("\n🎉 Complex topology test passed!\n");
+    printf("\n🎉 Complex topology and disconnection test completed!\n");
 }
 
 int main() {

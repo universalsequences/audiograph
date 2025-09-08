@@ -104,16 +104,17 @@ bool apply_hot_swap(LiveGraph *lg, GEHotSwapNode *p) {
   // Allocate new state memory if needed
   void *new_state = NULL;
   if (p->state_size > 0) {
-    new_state = alloc_aligned(64, p->state_size);
+    new_state = alloc_state_f32(64, p->state_size);
     if (!new_state) {
       return false; // Memory allocation failed
     }
     memset(new_state, 0, p->state_size); // Zero-initialize the new state
-    
+
     // Call NodeVTable init function if provided
     if (p->vt.init) {
       printf("DEBUG: apply_hot_swap - calling init function\n");
-      p->vt.init(new_state, 48000, 256); // Use engine sample rate and block size
+      p->vt.init(new_state, 48000,
+                 256); // Use engine sample rate and block size
       printf("DEBUG: apply_hot_swap - init function completed\n");
     }
   }
@@ -195,16 +196,17 @@ bool apply_replace_keep_edges(LiveGraph *lg, GEReplaceKeepEdges *p) {
   // 4) Allocate and install new state/vtable
   void *new_state = NULL;
   if (p->state_size > 0) {
-    new_state = alloc_aligned(64, p->state_size);
+    new_state = alloc_state_f32(64, p->state_size);
     if (!new_state) {
       return false; // Memory allocation failed
     }
     memset(new_state, 0, p->state_size); // Zero-initialize the new state
-    
+
     // Call NodeVTable init function if provided
     if (p->vt.init) {
       printf("DEBUG: apply_replace_keep_edges - calling init function\n");
-      p->vt.init(new_state, 48000, 256); // Use engine sample rate and block size
+      p->vt.init(new_state, 48000,
+                 256); // Use engine sample rate and block size
       printf("DEBUG: apply_replace_keep_edges - init function completed\n");
     }
   }
@@ -219,18 +221,20 @@ bool apply_replace_keep_edges(LiveGraph *lg, GEReplaceKeepEdges *p) {
   // Topology changed (some ports disconnected), so refresh orphan flags
   update_orphaned_status(lg);
 
-  // After hot swap replacement, ensure indegree matches actual unique predecessors
-  // This fixes edge cases where port shrinking can leave indegree inconsistent
+  // After hot swap replacement, ensure indegree matches actual unique
+  // predecessors This fixes edge cases where port shrinking can leave indegree
+  // inconsistent
   int actual_unique_preds = 0;
   bool seen[8192] = {0}; // Assume max nodes < 8192
   if (n->inEdgeId) {
     for (int di = 0; di < n->nInputs; di++) {
       int eid = n->inEdgeId[di];
-      if (eid < 0) continue;
+      if (eid < 0)
+        continue;
       int s = lg->edges[eid].src_node;
-      if (s >= 0 && s < 8192 && !seen[s]) { 
-        seen[s] = true; 
-        actual_unique_preds++; 
+      if (s >= 0 && s < 8192 && !seen[s]) {
+        seen[s] = true;
+        actual_unique_preds++;
       }
     }
   }

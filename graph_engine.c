@@ -522,8 +522,7 @@ int apply_add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
   // Allocate aligned memory for node state if size > 0
   void *state = NULL;
   if (state_size > 0) {
-    size_t bytes = state_size * sizeof(float);
-    state = alloc_aligned(64, bytes);
+    state = alloc_state_f32(64, state_size);
     if (!state) {
       printf("MEMORY ALLOCATION FAILED!!!\n");
       return -1; // Memory allocation
