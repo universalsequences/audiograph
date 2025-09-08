@@ -199,6 +199,12 @@ void retire_later(LiveGraph *lg, void *ptr, void (*deleter)(void *));
 
 void update_orphaned_status(LiveGraph *lg);
 
+// ===================== VTable Creation Functions =====================
+
+NodeVTable create_osc_vtable(float freq_hz);
+NodeVTable create_gain_vtable(float gain_value);  
+NodeVTable create_number_vtable(float number_value);
+
 // ===================== Global Engine Instance =====================
 
 extern Engine g_engine;

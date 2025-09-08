@@ -153,8 +153,9 @@ void test_replace_keep_edges_basic() {
   printf("✓ Original chain outputs correct value: %.3f\n", output_buffer[0]);
 
   // Now replace the gain node with a different gain value, keeping edges
-  // Memory will be allocated by library (starts with zero gain)
-  GEReplaceKeepEdges replace = {.vt = GAIN_VTABLE,
+  // Use create_gain_vtable to get proper initialization with gain = 5.0
+  NodeVTable gain_5_vtable = create_gain_vtable(5.0f);
+  GEReplaceKeepEdges replace = {.vt = gain_5_vtable,
                                 .state_size = GAIN_MEMORY_SIZE * sizeof(float),
                                 .node_id = gain,
                                 .new_nInputs = 1, // Same port configuration
@@ -168,7 +169,11 @@ void test_replace_keep_edges_basic() {
   process_next_block(lg, output_buffer, block_size);
 
   expected = 10.0f * 5.0f; // 50.0
+  printf("DEBUG: After replace keep edges: actual=%.6f, expected=%.6f\n", output_buffer[0], expected);
   output_correct = fabs(output_buffer[0] - expected) < 0.001f;
+  if (!output_correct) {
+    printf("ERROR: Replace keep edges failed - got %.6f, expected %.6f\n", output_buffer[0], expected);
+  }
   assert(output_correct);
   printf("✓ Replaced node outputs correct new value: %.3f\n", output_buffer[0]);
 
@@ -301,7 +306,7 @@ void test_hot_swap_stress() {
 
   for (int i = 1; i < 5; i++) {
     // Memory will be allocated by library (starts with zero gain)
-    GEHotSwapNode hot_swap = {.vt = GAIN_VTABLE,
+    GEHotSwapNode hot_swap = {.vt = create_gain_vtable(new_gains[i-1]),
                               .state_size = GAIN_MEMORY_SIZE * sizeof(float),
                               .node_id = nodes[i],
                               .new_nInputs = 1,

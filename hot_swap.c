@@ -109,6 +109,13 @@ bool apply_hot_swap(LiveGraph *lg, GEHotSwapNode *p) {
       return false; // Memory allocation failed
     }
     memset(new_state, 0, p->state_size); // Zero-initialize the new state
+    
+    // Call NodeVTable init function if provided
+    if (p->vt.init) {
+      printf("DEBUG: apply_hot_swap - calling init function\n");
+      p->vt.init(new_state, 48000, 256); // Use engine sample rate and block size
+      printf("DEBUG: apply_hot_swap - init function completed\n");
+    }
   }
 
   void *old_state = n->state;
@@ -193,6 +200,13 @@ bool apply_replace_keep_edges(LiveGraph *lg, GEReplaceKeepEdges *p) {
       return false; // Memory allocation failed
     }
     memset(new_state, 0, p->state_size); // Zero-initialize the new state
+    
+    // Call NodeVTable init function if provided
+    if (p->vt.init) {
+      printf("DEBUG: apply_replace_keep_edges - calling init function\n");
+      p->vt.init(new_state, 48000, 256); // Use engine sample rate and block size
+      printf("DEBUG: apply_replace_keep_edges - init function completed\n");
+    }
   }
 
   void *old_state = n->state;

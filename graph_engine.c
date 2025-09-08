@@ -522,9 +522,12 @@ int apply_add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
   // Allocate aligned memory for node state if size > 0
   void *state = NULL;
   if (state_size > 0) {
-    state = alloc_aligned(64, state_size);
+    size_t bytes = state_size * sizeof(float);
+    state = alloc_aligned(64, bytes);
     if (!state) {
-      return -1; // Memory allocation failed
+      printf("MEMORY ALLOCATION FAILED!!!\n");
+      return -1; // Memory allocation
+                 // failed
     }
     memset(state, 0, state_size); // Zero-initialize the state memory
 
@@ -585,7 +588,7 @@ typedef struct {
 } NumberInitContext;
 
 // Storage for unique init values - each gets its own slot and init function
-static float s_number_values[16];
+static float s_number_values[32];
 static int s_number_value_count = 0;
 
 // Create unique init functions for different values
@@ -619,10 +622,177 @@ static void number_init_5(void *state, int sr, int mb) {
   (void)mb;
   ((float *)state)[NUMBER_VALUE] = s_number_values[5];
 }
+static void number_init_6(void *state, int sr, int mb) {
+  (void)sr;
+  (void)mb;
+  ((float *)state)[NUMBER_VALUE] = s_number_values[6];
+}
+static void number_init_7(void *state, int sr, int mb) {
+  (void)sr;
+  (void)mb;
+  ((float *)state)[NUMBER_VALUE] = s_number_values[7];
+}
+static void number_init_8(void *state, int sr, int mb) {
+  (void)sr;
+  (void)mb;
+  ((float *)state)[NUMBER_VALUE] = s_number_values[8];
+}
+static void number_init_9(void *state, int sr, int mb) {
+  (void)sr;
+  (void)mb;
+  ((float *)state)[NUMBER_VALUE] = s_number_values[9];
+}
+static void number_init_10(void *state, int sr, int mb) {
+  (void)sr;
+  (void)mb;
+  ((float *)state)[NUMBER_VALUE] = s_number_values[10];
+}
 
 static void (*number_init_functions[])(void *, int, int) = {
-    number_init_0, number_init_1, number_init_2,
-    number_init_3, number_init_4, number_init_5};
+    number_init_0, number_init_1, number_init_2, number_init_3,
+    number_init_4, number_init_5, number_init_6, number_init_7,
+    number_init_8, number_init_9, number_init_10};
+
+// Storage for oscillator frequencies and gain values
+static float s_osc_frequencies[32];
+static int s_osc_freq_count = 0;
+static float s_gain_values[32];
+static int s_gain_value_count = 0;
+
+// Create unique init functions for different OSCILLATOR frequencies
+static void osc_init_freq_0(void *state, int sr, int mb) {
+  (void)mb;
+  float *mem = (float *)state;
+  mem[OSC_PHASE] = 0.0f;
+  mem[OSC_INC] = s_osc_frequencies[0] / (float)sr;
+}
+static void osc_init_freq_1(void *state, int sr, int mb) {
+  (void)mb;
+  float *mem = (float *)state;
+  mem[OSC_PHASE] = 0.0f;
+  mem[OSC_INC] = s_osc_frequencies[1] / (float)sr;
+}
+static void osc_init_freq_2(void *state, int sr, int mb) {
+  (void)mb;
+  float *mem = (float *)state;
+  mem[OSC_PHASE] = 0.0f;
+  mem[OSC_INC] = s_osc_frequencies[2] / (float)sr;
+}
+static void osc_init_freq_3(void *state, int sr, int mb) {
+  (void)mb;
+  float *mem = (float *)state;
+  mem[OSC_PHASE] = 0.0f;
+  mem[OSC_INC] = s_osc_frequencies[3] / (float)sr;
+}
+static void osc_init_freq_4(void *state, int sr, int mb) {
+  (void)mb;
+  float *mem = (float *)state;
+  mem[OSC_PHASE] = 0.0f;
+  mem[OSC_INC] = s_osc_frequencies[4] / (float)sr;
+}
+static void osc_init_freq_5(void *state, int sr, int mb) {
+  (void)mb;
+  float *mem = (float *)state;
+  mem[OSC_PHASE] = 0.0f;
+  mem[OSC_INC] = s_osc_frequencies[5] / (float)sr;
+}
+static void osc_init_freq_6(void *state, int sr, int mb) {
+  (void)mb;
+  float *mem = (float *)state;
+  mem[OSC_PHASE] = 0.0f;
+  mem[OSC_INC] = s_osc_frequencies[6] / (float)sr;
+}
+static void osc_init_freq_7(void *state, int sr, int mb) {
+  (void)mb;
+  float *mem = (float *)state;
+  mem[OSC_PHASE] = 0.0f;
+  mem[OSC_INC] = s_osc_frequencies[7] / (float)sr;
+}
+static void osc_init_freq_8(void *state, int sr, int mb) {
+  (void)mb;
+  float *mem = (float *)state;
+  mem[OSC_PHASE] = 0.0f;
+  mem[OSC_INC] = s_osc_frequencies[8] / (float)sr;
+}
+static void osc_init_freq_9(void *state, int sr, int mb) {
+  (void)mb;
+  float *mem = (float *)state;
+  mem[OSC_PHASE] = 0.0f;
+  mem[OSC_INC] = s_osc_frequencies[9] / (float)sr;
+}
+static void osc_init_freq_10(void *state, int sr, int mb) {
+  (void)mb;
+  float *mem = (float *)state;
+  mem[OSC_PHASE] = 0.0f;
+  mem[OSC_INC] = s_osc_frequencies[10] / (float)sr;
+}
+
+static void (*osc_init_functions[])(void *, int, int) = {
+    osc_init_freq_0, osc_init_freq_1, osc_init_freq_2, osc_init_freq_3,
+    osc_init_freq_4, osc_init_freq_5, osc_init_freq_6, osc_init_freq_7,
+    osc_init_freq_8, osc_init_freq_9, osc_init_freq_10};
+
+// Create unique init functions for different GAIN values
+static void gain_init_value_0(void *state, int sr, int mb) {
+  (void)sr;
+  (void)mb;
+  ((float *)state)[GAIN_VALUE] = s_gain_values[0];
+}
+static void gain_init_value_1(void *state, int sr, int mb) {
+  (void)sr;
+  (void)mb;
+  ((float *)state)[GAIN_VALUE] = s_gain_values[1];
+}
+static void gain_init_value_2(void *state, int sr, int mb) {
+  (void)sr;
+  (void)mb;
+  ((float *)state)[GAIN_VALUE] = s_gain_values[2];
+}
+static void gain_init_value_3(void *state, int sr, int mb) {
+  (void)sr;
+  (void)mb;
+  ((float *)state)[GAIN_VALUE] = s_gain_values[3];
+}
+static void gain_init_value_4(void *state, int sr, int mb) {
+  (void)sr;
+  (void)mb;
+  ((float *)state)[GAIN_VALUE] = s_gain_values[4];
+}
+static void gain_init_value_5(void *state, int sr, int mb) {
+  (void)sr;
+  (void)mb;
+  ((float *)state)[GAIN_VALUE] = s_gain_values[5];
+}
+static void gain_init_value_6(void *state, int sr, int mb) {
+  (void)sr;
+  (void)mb;
+  ((float *)state)[GAIN_VALUE] = s_gain_values[6];
+}
+static void gain_init_value_7(void *state, int sr, int mb) {
+  (void)sr;
+  (void)mb;
+  ((float *)state)[GAIN_VALUE] = s_gain_values[7];
+}
+static void gain_init_value_8(void *state, int sr, int mb) {
+  (void)sr;
+  (void)mb;
+  ((float *)state)[GAIN_VALUE] = s_gain_values[8];
+}
+static void gain_init_value_9(void *state, int sr, int mb) {
+  (void)sr;
+  (void)mb;
+  ((float *)state)[GAIN_VALUE] = s_gain_values[9];
+}
+static void gain_init_value_10(void *state, int sr, int mb) {
+  (void)sr;
+  (void)mb;
+  ((float *)state)[GAIN_VALUE] = s_gain_values[10];
+}
+
+static void (*gain_init_functions[])(void *, int, int) = {
+    gain_init_value_0, gain_init_value_1, gain_init_value_2, gain_init_value_3,
+    gain_init_value_4, gain_init_value_5, gain_init_value_6, gain_init_value_7,
+    gain_init_value_8, gain_init_value_9, gain_init_value_10};
 
 static void osc_init_with_freq(void *state, int sampleRate, int maxBlock) {
   (void)maxBlock;
@@ -639,26 +809,48 @@ static void gain_init_with_value(void *state, int sampleRate, int maxBlock) {
 }
 
 // Create dynamic VTables with specific init functions
-static NodeVTable create_osc_vtable(float freq_hz) {
-  (void)freq_hz; // For now, just use default OSC_VTABLE
-  return OSC_VTABLE;
+NodeVTable create_osc_vtable(float freq_hz) {
+  NodeVTable vtable = OSC_VTABLE;
+  if (s_osc_freq_count < 11) {
+    s_osc_frequencies[s_osc_freq_count] = freq_hz;
+    vtable.init = osc_init_functions[s_osc_freq_count];
+    printf("DEBUG: create_osc_vtable - freq=%.6f, index=%d, init=%p\n", freq_hz,
+           s_osc_freq_count, (void *)vtable.init);
+    s_osc_freq_count++;
+  } else {
+    printf("WARNING: Too many OSCILLATOR nodes, using default init\n");
+  }
+  return vtable;
 }
 
-static NodeVTable create_gain_vtable(float gain_value) {
-  (void)gain_value; // For now, just use default GAIN_VTABLE
-  return GAIN_VTABLE;
+NodeVTable create_gain_vtable(float gain_value) {
+  NodeVTable vtable = GAIN_VTABLE;
+  if (s_gain_value_count < 11) {
+    s_gain_values[s_gain_value_count] = gain_value;
+    vtable.init = gain_init_functions[s_gain_value_count];
+    printf("DEBUG: create_gain_vtable - gain=%.6f, index=%d, init=%p\n",
+           gain_value, s_gain_value_count, (void *)vtable.init);
+    s_gain_value_count++;
+  } else {
+    printf("WARNING: Too many GAIN nodes, using default init (count=%d, "
+           "limit=11)\n",
+           s_gain_value_count);
+  }
+  return vtable;
 }
 
-static NodeVTable create_number_vtable(float number_value) {
+NodeVTable create_number_vtable(float number_value) {
   NodeVTable vtable = NUMBER_VTABLE;
-  if (s_number_value_count < 6) {
+  if (s_number_value_count < 11) {
     s_number_values[s_number_value_count] = number_value;
     vtable.init = number_init_functions[s_number_value_count];
     printf("DEBUG: create_number_vtable - value=%.6f, index=%d, init=%p\n",
            number_value, s_number_value_count, (void *)vtable.init);
     s_number_value_count++;
   } else {
-    printf("WARNING: Too many NUMBER nodes, using default init\n");
+    printf("WARNING: Too many NUMBER nodes, using default init (count=%d, "
+           "limit=11)\n",
+           s_number_value_count);
   }
   return vtable;
 }
