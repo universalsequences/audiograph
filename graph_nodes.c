@@ -110,9 +110,9 @@ extern int ap_current_node_ninputs(void);
 void sum_process(float *const *in, float *const *out, int n, void *memory) {
   (void)memory; // SUM is stateless
   float *y = out[0];
-  
+
   // Zero output buffer
-  for (int i = 0; i < n; i++) 
+  for (int i = 0; i < n; i++)
     y[i] = 0.0f;
 
   // Get number of inputs from the current processing context
@@ -120,8 +120,9 @@ void sum_process(float *const *in, float *const *out, int n, void *memory) {
   // Accumulate all inputs
   for (int k = 0; k < nIn; k++) {
     const float *x = in[k];
-    for (int i = 0; i < n; i++) 
+    for (int i = 0; i < n; i++) {
       y[i] += x[i];
+    }
   }
 
   // Optional normalization to avoid gain jump with fan-in:
@@ -149,8 +150,10 @@ static void number_init(void *state, int sampleRate, int maxBlock) {
   memory[NUMBER_VALUE] = 0.0f; // Default number value of 0.0
 }
 
-const NodeVTable NUMBER_VTABLE = {
-    .process = number_process, .init = number_init, .reset = NULL, .migrate = NULL};
+const NodeVTable NUMBER_VTABLE = {.process = number_process,
+                                  .init = number_init,
+                                  .reset = NULL,
+                                  .migrate = NULL};
 
 const NodeVTable MIX2_VTABLE = {
     .process = mix2_process, .init = NULL, .reset = NULL, .migrate = NULL};

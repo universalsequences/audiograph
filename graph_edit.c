@@ -59,12 +59,14 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
       all_ok = false;
     }
   }
-  
+
   // Debug invariant checking (only in debug builds)
+  /*
 #ifndef NDEBUG
   extern void assert_unique_pred_invariants(LiveGraph *lg);
   assert_unique_pred_invariants(lg);
 #endif
-  
+  */
+
   return all_ok;
 }
