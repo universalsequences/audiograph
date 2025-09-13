@@ -1513,18 +1513,56 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       int remaining_src = lg->edges[remaining_eid].src_node;
       int remaining_src_port = lg->edges[remaining_eid].src_port;
 
-      // Reuse the surviving input edge for the direct connection
-      int direct_eid = remaining_eid;
-      printf("Reusing surviving edge eid=%d for direct connection\n", direct_eid);
+      // Create a new edge for the direct connection
+      int direct_eid = alloc_edge(lg);
+      printf("Allocated new direct eid=%d for SUM collapse\n", direct_eid);
+      if (direct_eid < 0)
+        return false;
 
-      // Edge already has correct src_node, src_port, and buffer from original connection
-      // Just update refcount: transfers from SUM consumption to destination consumption
-      lg->edges[direct_eid].refcount = 1;
+      // Set up the new direct edge
+      lg->edges[direct_eid].src_node = remaining_src;
+      lg->edges[direct_eid].src_port = remaining_src_port;
+      lg->edges[direct_eid].refcount = 1; // Start with destination consumption
 
-      // Wire source to new edge and destination to new edge
+      // Ensure buffer is allocated and valid
+      if (!lg->edges[direct_eid].buf) {
+        printf("direct_eid buf not allocated so allocating buf\n");
+        lg->edges[direct_eid].buf =
+            alloc_aligned(64, lg->block_size * sizeof(float));
+        if (!lg->edges[direct_eid].buf) {
+          printf("allocation didnt work so retiring\n");
+          retire_edge(lg, direct_eid);
+          return false;
+        }
+      }
+
+      // Connect destination to new edge
+      D->inEdgeId[dst_port] = direct_eid;
+      D->fanin_sum_node_id[dst_port] = -1;
+
+      // Wire source to new edge and update successor relationships
       bool added = false;
       if (remaining_src >= 0) {
-        lg->nodes[remaining_src].outEdgeId[remaining_src_port] = direct_eid;
+        // CRITICAL FIX: Check if source already has an outgoing edge
+        int existing_out_eid = lg->nodes[remaining_src].outEdgeId[remaining_src_port];
+        if (existing_out_eid >= 0) {
+          // Source already has an outgoing edge - we need to SHARE it, not replace it
+          printf("Source already has outgoing edge %d - sharing instead of replacing\n", existing_out_eid);
+
+          // Retire the new edge we just created since we'll reuse the existing one
+          retire_edge(lg, direct_eid);
+
+          // Use the existing shared edge
+          direct_eid = existing_out_eid;
+          D->inEdgeId[dst_port] = direct_eid;
+
+          // Increment refcount for the new consumer
+          lg->edges[direct_eid].refcount++;
+        } else {
+          // No existing edge - use our new one
+          lg->nodes[remaining_src].outEdgeId[remaining_src_port] = direct_eid;
+        }
+
         if (!has_successor(&lg->nodes[remaining_src], dst_node)) {
           add_successor_port(&lg->nodes[remaining_src], dst_node);
           added = true;
@@ -1532,14 +1570,6 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
         // Remove SUM from source's successors
         remove_successor(&lg->nodes[remaining_src], sum_id);
       }
-
-      D->inEdgeId[dst_port] = direct_eid;
-      D->fanin_sum_node_id[dst_port] = -1;
-
-      // CRITICAL: Clear the SUM's reference to the reused edge before deletion
-      // This prevents apply_delete_node from retiring the edge we just repurposed
-      SUM->inEdgeId[0] = -1;  // Clear the surviving input reference
-      SUM->nInputs = 0;       // Mark SUM as having no inputs
 
       printf("DEBUG: SUM collapse - remaining_src=%d, remaining_src_port=%d, "
              "dst_node=%d, dst_port=%d\n",
