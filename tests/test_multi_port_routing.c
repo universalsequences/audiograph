@@ -83,8 +83,8 @@ void test_multi_port_routing() {
     // Step 1: Create the dual-output node (Node 1)
     // 2 inputs (unused), 2 outputs (0.25, 0.5)
     // No state needed (memory size = 0)
-    int node1 = add_node(lg, DUAL_OUTPUT_VTABLE, 0, 
-                         "dual_output", 2, 2); // 2 inputs, 2 outputs
+    int node1 = add_node(lg, DUAL_OUTPUT_VTABLE, 0,
+                         "dual_output", 2, 2, NULL, 0); // 2 inputs, 2 outputs
     assert(node1 >= 0);
     printf("✓ Created dual-output node: id=%d (outputs 0.25, 0.5)\n", node1);
     
@@ -92,7 +92,7 @@ void test_multi_port_routing() {
     // 2 inputs, 1 output (sums inputs)
     // No state needed (memory size = 0)
     int node2 = add_node(lg, DUAL_INPUT_SUM_VTABLE, 0,
-                         "dual_sum", 2, 1); // 2 inputs, 1 output
+                         "dual_sum", 2, 1, NULL, 0); // 2 inputs, 1 output
     assert(node2 >= 0);
     printf("✓ Created dual-input sum node: id=%d (sums two inputs)\n", node2);
     
@@ -234,8 +234,8 @@ void test_workaround_with_intermediate_nodes() {
     
     // Create the same dual-output source node
     // No state needed (memory size = 0)
-    int node1 = add_node(lg, DUAL_OUTPUT_VTABLE, 0, 
-                         "dual_output", 2, 2);
+    int node1 = add_node(lg, DUAL_OUTPUT_VTABLE, 0,
+                         "dual_output", 2, 2, NULL, 0);
     assert(node1 >= 0);
     
     // Create two intermediate gain nodes (pass-through with gain=1.0)
@@ -245,7 +245,7 @@ void test_workaround_with_intermediate_nodes() {
     
     // Create the final sum node  
     int sum_node = add_node(lg, DUAL_INPUT_SUM_VTABLE, DUAL_INPUT_SUM_MEMORY_SIZE,
-                            "sum_node", 2, 1);
+                            "sum_node", 2, 1, NULL, 0);
     assert(sum_node >= 0);
     
     // Apply all node creations

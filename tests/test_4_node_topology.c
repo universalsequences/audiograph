@@ -56,21 +56,32 @@ static void multiplier_process(float *const *inputs, float *const *outputs,
 }
 
 // Custom node init functions
-static void number_gen_init(void *state, int sr, int mb) {
+static void number_gen_init(void *state, int sr, int mb, const void *initial_state) {
     (void)sr; (void)mb;
     NumberGenState *s = (NumberGenState *)state;
-    s->value = 1.0f;
+    if (initial_state) {
+        const float *init_data = (const float *)initial_state;
+        s->value = init_data[0];
+    } else {
+        s->value = 1.0f; // Default value
+    }
 }
 
-static void dual_output_init(void *state, int sr, int mb) {
+static void dual_output_init(void *state, int sr, int mb, const void *initial_state) {
     (void)sr; (void)mb;
     DualOutputState *s = (DualOutputState *)state;
-    s->value1 = 2.0f;
-    s->value2 = 3.0f;
+    if (initial_state) {
+        const float *init_data = (const float *)initial_state;
+        s->value1 = init_data[0];
+        s->value2 = init_data[1];
+    } else {
+        s->value1 = 2.0f; // Default values
+        s->value2 = 3.0f;
+    }
 }
 
-static void multiplier_init(void *state, int sr, int mb) {
-    (void)sr; (void)mb; (void)state;
+static void multiplier_init(void *state, int sr, int mb, const void *initial_state) {
+    (void)sr; (void)mb; (void)state; (void)initial_state;
     // No initialization needed
 }
 
@@ -107,20 +118,20 @@ int main() {
     printf("\n=== Adding Nodes ===\n");
     
     // Node 1: Simple number generator (generates 1)
-    int node1_id = add_node(lg, NUMBER_GEN_VTABLE, sizeof(NumberGenState), 
-                           "number_gen", 0, 1);
+    int node1_id = add_node(lg, NUMBER_GEN_VTABLE, sizeof(NumberGenState),
+                           "number_gen", 0, 1, NULL, 0);
     printf("Node 1 (number gen=1): id=%d\n", node1_id);
     assert(node1_id >= 0);
-    
-    // Node 2: Dual output number generator (generates 2 and 3)  
+
+    // Node 2: Dual output number generator (generates 2 and 3)
     int node2_id = add_node(lg, DUAL_OUTPUT_VTABLE, sizeof(DualOutputState),
-                           "dual_output", 0, 2);
+                           "dual_output", 0, 2, NULL, 0);
     printf("Node 2 (dual output=2,3): id=%d\n", node2_id);
     assert(node2_id >= 0);
-    
+
     // Node 3: 2-input/1-output multiplier
     int node3_id = add_node(lg, MULTIPLIER_VTABLE, sizeof(MultiplierState),
-                           "multiplier", 2, 1);
+                           "multiplier", 2, 1, NULL, 0);
     printf("Node 3 (2-input multiplier): id=%d\n", node3_id);
     assert(node3_id >= 0);
     

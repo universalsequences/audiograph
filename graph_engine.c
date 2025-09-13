@@ -440,8 +440,19 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   // at 0)
   atomic_init(&lg->next_node_id, 1);
 
+  // Initialize watch list system
+  lg->watch_list_capacity = 16;
+  lg->watch_list = calloc(lg->watch_list_capacity, sizeof(int));
+  lg->watch_list_count = 0;
+  pthread_mutex_init(&lg->watch_list_mutex, NULL);
+
+  // Initialize state store arrays (indexed by node_id)
+  lg->state_snapshots = calloc(lg->node_capacity, sizeof(void *));
+  lg->state_sizes = calloc(lg->node_capacity, sizeof(size_t));
+  pthread_rwlock_init(&lg->state_store_lock, NULL);
+
   // Automatically create the DAC node at index 0
-  int dac_id = apply_add_node(lg, DAC_VTABLE, 0, 0, "DAC", 1, 1);
+  int dac_id = apply_add_node(lg, DAC_VTABLE, 0, 0, "DAC", 1, 1, NULL);
   if (dac_id >= 0) {
     lg->dac_node_id = dac_id; // Remember the DAC node
 
@@ -531,6 +542,24 @@ void destroy_live_graph(LiveGraph *lg) {
   if (lg->failed_ids)
     free(lg->failed_ids);
 
+  // Free watch list system
+  if (lg->watch_list)
+    free(lg->watch_list);
+  pthread_mutex_destroy(&lg->watch_list_mutex);
+
+  // Free state snapshots
+  if (lg->state_snapshots) {
+    for (int i = 0; i < lg->node_capacity; i++) {
+      if (lg->state_snapshots[i]) {
+        free(lg->state_snapshots[i]);
+      }
+    }
+    free(lg->state_snapshots);
+  }
+  if (lg->state_sizes)
+    free(lg->state_sizes);
+  pthread_rwlock_destroy(&lg->state_store_lock);
+
   // Free the graph itself
   free(lg);
 }
@@ -539,13 +568,9 @@ void destroy_live_graph(LiveGraph *lg) {
 
 int apply_add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
                    uint64_t logical_id, const char *name, int nInputs,
-                   int nOutputs) {
+                   int nOutputs, const void *initial_state) {
   // Use logical_id directly as the array index
   int node_id = (int)logical_id;
-
-  printf(
-      "APPLY ADD NODE CALLED WITH LOGICAL_ID=%d ++++++++++++++++++++++++++ \n",
-      node_id);
 
   if (node_id >= lg->node_capacity) {
     // Need to expand capacity
@@ -566,7 +591,8 @@ int apply_add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
 
     // Call NodeVTable init function if provided
     if (vtable.init) {
-      vtable.init(state, 48000, 256); // Use engine sample rate and block size
+      vtable.init(state, 48000, 256,
+                  initial_state); // Use engine sample rate and block size
     }
   }
 
@@ -576,6 +602,7 @@ int apply_add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
   node->logical_id = logical_id;
   node->vtable = vtable;
   node->state = state;
+  node->state_size = state_size;
   node->succCount = 0;
 
   // Set port counts from command
@@ -607,307 +634,51 @@ int apply_add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
 }
 
 // Custom init functions for specific values
-typedef struct {
-  float freq_hz;
-} OscInitContext;
+// ===================== Clean VTable Creation =====================
+// No more ugly static arrays and generated init functions!
 
-typedef struct {
-  float gain_value;
-} GainInitContext;
-
-typedef struct {
-  float number_value;
-} NumberInitContext;
-
-// Storage for unique init values - each gets its own slot and init function
-static float s_number_values[32];
-static int s_number_value_count = 0;
-
-// Create unique init functions for different values
-static void number_init_0(void *state, int sr, int mb) {
-  (void)sr;
-  (void)mb;
-  ((float *)state)[NUMBER_VALUE] = s_number_values[0];
-}
-static void number_init_1(void *state, int sr, int mb) {
-  (void)sr;
-  (void)mb;
-  ((float *)state)[NUMBER_VALUE] = s_number_values[1];
-}
-static void number_init_2(void *state, int sr, int mb) {
-  (void)sr;
-  (void)mb;
-  ((float *)state)[NUMBER_VALUE] = s_number_values[2];
-}
-static void number_init_3(void *state, int sr, int mb) {
-  (void)sr;
-  (void)mb;
-  ((float *)state)[NUMBER_VALUE] = s_number_values[3];
-}
-static void number_init_4(void *state, int sr, int mb) {
-  (void)sr;
-  (void)mb;
-  ((float *)state)[NUMBER_VALUE] = s_number_values[4];
-}
-static void number_init_5(void *state, int sr, int mb) {
-  (void)sr;
-  (void)mb;
-  ((float *)state)[NUMBER_VALUE] = s_number_values[5];
-}
-static void number_init_6(void *state, int sr, int mb) {
-  (void)sr;
-  (void)mb;
-  ((float *)state)[NUMBER_VALUE] = s_number_values[6];
-}
-static void number_init_7(void *state, int sr, int mb) {
-  (void)sr;
-  (void)mb;
-  ((float *)state)[NUMBER_VALUE] = s_number_values[7];
-}
-static void number_init_8(void *state, int sr, int mb) {
-  (void)sr;
-  (void)mb;
-  ((float *)state)[NUMBER_VALUE] = s_number_values[8];
-}
-static void number_init_9(void *state, int sr, int mb) {
-  (void)sr;
-  (void)mb;
-  ((float *)state)[NUMBER_VALUE] = s_number_values[9];
-}
-static void number_init_10(void *state, int sr, int mb) {
-  (void)sr;
-  (void)mb;
-  ((float *)state)[NUMBER_VALUE] = s_number_values[10];
-}
-
-static void (*number_init_functions[])(void *, int, int) = {
-    number_init_0, number_init_1, number_init_2, number_init_3,
-    number_init_4, number_init_5, number_init_6, number_init_7,
-    number_init_8, number_init_9, number_init_10};
-
-// Storage for oscillator frequencies and gain values
-static float s_osc_frequencies[32];
-static int s_osc_freq_count = 0;
-static float s_gain_values[32];
-static int s_gain_value_count = 0;
-
-// Create unique init functions for different OSCILLATOR frequencies
-static void osc_init_freq_0(void *state, int sr, int mb) {
-  (void)mb;
-  float *mem = (float *)state;
-  mem[OSC_PHASE] = 0.0f;
-  mem[OSC_INC] = s_osc_frequencies[0] / (float)sr;
-}
-static void osc_init_freq_1(void *state, int sr, int mb) {
-  (void)mb;
-  float *mem = (float *)state;
-  mem[OSC_PHASE] = 0.0f;
-  mem[OSC_INC] = s_osc_frequencies[1] / (float)sr;
-}
-static void osc_init_freq_2(void *state, int sr, int mb) {
-  (void)mb;
-  float *mem = (float *)state;
-  mem[OSC_PHASE] = 0.0f;
-  mem[OSC_INC] = s_osc_frequencies[2] / (float)sr;
-}
-static void osc_init_freq_3(void *state, int sr, int mb) {
-  (void)mb;
-  float *mem = (float *)state;
-  mem[OSC_PHASE] = 0.0f;
-  mem[OSC_INC] = s_osc_frequencies[3] / (float)sr;
-}
-static void osc_init_freq_4(void *state, int sr, int mb) {
-  (void)mb;
-  float *mem = (float *)state;
-  mem[OSC_PHASE] = 0.0f;
-  mem[OSC_INC] = s_osc_frequencies[4] / (float)sr;
-}
-static void osc_init_freq_5(void *state, int sr, int mb) {
-  (void)mb;
-  float *mem = (float *)state;
-  mem[OSC_PHASE] = 0.0f;
-  mem[OSC_INC] = s_osc_frequencies[5] / (float)sr;
-}
-static void osc_init_freq_6(void *state, int sr, int mb) {
-  (void)mb;
-  float *mem = (float *)state;
-  mem[OSC_PHASE] = 0.0f;
-  mem[OSC_INC] = s_osc_frequencies[6] / (float)sr;
-}
-static void osc_init_freq_7(void *state, int sr, int mb) {
-  (void)mb;
-  float *mem = (float *)state;
-  mem[OSC_PHASE] = 0.0f;
-  mem[OSC_INC] = s_osc_frequencies[7] / (float)sr;
-}
-static void osc_init_freq_8(void *state, int sr, int mb) {
-  (void)mb;
-  float *mem = (float *)state;
-  mem[OSC_PHASE] = 0.0f;
-  mem[OSC_INC] = s_osc_frequencies[8] / (float)sr;
-}
-static void osc_init_freq_9(void *state, int sr, int mb) {
-  (void)mb;
-  float *mem = (float *)state;
-  mem[OSC_PHASE] = 0.0f;
-  mem[OSC_INC] = s_osc_frequencies[9] / (float)sr;
-}
-static void osc_init_freq_10(void *state, int sr, int mb) {
-  (void)mb;
-  float *mem = (float *)state;
-  mem[OSC_PHASE] = 0.0f;
-  mem[OSC_INC] = s_osc_frequencies[10] / (float)sr;
-}
-
-static void (*osc_init_functions[])(void *, int, int) = {
-    osc_init_freq_0, osc_init_freq_1, osc_init_freq_2, osc_init_freq_3,
-    osc_init_freq_4, osc_init_freq_5, osc_init_freq_6, osc_init_freq_7,
-    osc_init_freq_8, osc_init_freq_9, osc_init_freq_10};
-
-// Create unique init functions for different GAIN values
-static void gain_init_value_0(void *state, int sr, int mb) {
-  (void)sr;
-  (void)mb;
-  ((float *)state)[GAIN_VALUE] = s_gain_values[0];
-}
-static void gain_init_value_1(void *state, int sr, int mb) {
-  (void)sr;
-  (void)mb;
-  ((float *)state)[GAIN_VALUE] = s_gain_values[1];
-}
-static void gain_init_value_2(void *state, int sr, int mb) {
-  (void)sr;
-  (void)mb;
-  ((float *)state)[GAIN_VALUE] = s_gain_values[2];
-}
-static void gain_init_value_3(void *state, int sr, int mb) {
-  (void)sr;
-  (void)mb;
-  ((float *)state)[GAIN_VALUE] = s_gain_values[3];
-}
-static void gain_init_value_4(void *state, int sr, int mb) {
-  (void)sr;
-  (void)mb;
-  ((float *)state)[GAIN_VALUE] = s_gain_values[4];
-}
-static void gain_init_value_5(void *state, int sr, int mb) {
-  (void)sr;
-  (void)mb;
-  ((float *)state)[GAIN_VALUE] = s_gain_values[5];
-}
-static void gain_init_value_6(void *state, int sr, int mb) {
-  (void)sr;
-  (void)mb;
-  ((float *)state)[GAIN_VALUE] = s_gain_values[6];
-}
-static void gain_init_value_7(void *state, int sr, int mb) {
-  (void)sr;
-  (void)mb;
-  ((float *)state)[GAIN_VALUE] = s_gain_values[7];
-}
-static void gain_init_value_8(void *state, int sr, int mb) {
-  (void)sr;
-  (void)mb;
-  ((float *)state)[GAIN_VALUE] = s_gain_values[8];
-}
-static void gain_init_value_9(void *state, int sr, int mb) {
-  (void)sr;
-  (void)mb;
-  ((float *)state)[GAIN_VALUE] = s_gain_values[9];
-}
-static void gain_init_value_10(void *state, int sr, int mb) {
-  (void)sr;
-  (void)mb;
-  ((float *)state)[GAIN_VALUE] = s_gain_values[10];
-}
-
-static void (*gain_init_functions[])(void *, int, int) = {
-    gain_init_value_0, gain_init_value_1, gain_init_value_2, gain_init_value_3,
-    gain_init_value_4, gain_init_value_5, gain_init_value_6, gain_init_value_7,
-    gain_init_value_8, gain_init_value_9, gain_init_value_10};
-
-static void osc_init_with_freq(void *state, int sampleRate, int maxBlock) {
-  (void)maxBlock;
-  float *memory = (float *)state;
-  memory[OSC_PHASE] = 0.0f;
-  memory[OSC_INC] = 440.0f / (float)sampleRate; // Default 440 Hz for now
-}
-
-static void gain_init_with_value(void *state, int sampleRate, int maxBlock) {
-  (void)sampleRate;
-  (void)maxBlock;
-  float *memory = (float *)state;
-  memory[GAIN_VALUE] = 1.0f; // Default gain for now
-}
-
-// Create dynamic VTables with specific init functions
+// Clean VTable creation functions - no more ugly static arrays!
 NodeVTable create_osc_vtable(float freq_hz) {
-  NodeVTable vtable = OSC_VTABLE;
-  if (s_osc_freq_count < 11) {
-    s_osc_frequencies[s_osc_freq_count] = freq_hz;
-    vtable.init = osc_init_functions[s_osc_freq_count];
-    s_osc_freq_count++;
-  } else {
-    printf("WARNING: Too many OSCILLATOR nodes, using default init\n");
-  }
+  NodeVTable vtable = OSC_VTABLE; // Use the base vtable with init function
   return vtable;
 }
 
 NodeVTable create_gain_vtable(float gain_value) {
-  NodeVTable vtable = GAIN_VTABLE;
-  if (s_gain_value_count < 11) {
-    s_gain_values[s_gain_value_count] = gain_value;
-    vtable.init = gain_init_functions[s_gain_value_count];
-    s_gain_value_count++;
-  } else {
-    // printf("WARNING: Too many GAIN nodes, using default init (count=%d, "
-    //        "limit=11)\n",
-    //        s_gain_value_count);
-  }
+  NodeVTable vtable = GAIN_VTABLE; // Use the base vtable with init function
   return vtable;
 }
 
 NodeVTable create_number_vtable(float number_value) {
-  NodeVTable vtable = NUMBER_VTABLE;
-  if (s_number_value_count < 11) {
-    s_number_values[s_number_value_count] = number_value;
-    vtable.init = number_init_functions[s_number_value_count];
-    printf("DEBUG: create_number_vtable - value=%.6f, index=%d, init=%p\n",
-           number_value, s_number_value_count, (void *)vtable.init);
-    s_number_value_count++;
-  } else {
-    printf("WARNING: Too many NUMBER nodes, using default init (count=%d, "
-           "limit=11)\n",
-           s_number_value_count);
-  }
+  NodeVTable vtable = NUMBER_VTABLE; // Use the base vtable with init function
   return vtable;
 }
 
 int live_add_oscillator(LiveGraph *lg, float freq_hz, const char *name) {
-  NodeVTable vtable = create_osc_vtable(freq_hz);
-  return add_node(lg, vtable, OSC_MEMORY_SIZE * sizeof(float), name, 0, 1);
+  float init_data = freq_hz / 48000.0f; // Convert frequency to increment
+  return add_node(lg, OSC_VTABLE, OSC_MEMORY_SIZE * sizeof(float), name, 0, 1,
+                  &init_data, sizeof(float));
 }
 
 int live_add_gain(LiveGraph *lg, float gain_value, const char *name) {
-  NodeVTable vtable = create_gain_vtable(gain_value);
-  return add_node(lg, vtable, GAIN_MEMORY_SIZE * sizeof(float), name, 1, 1);
+  return add_node(lg, GAIN_VTABLE, GAIN_MEMORY_SIZE * sizeof(float), name, 1, 1,
+                  &gain_value, sizeof(float));
 }
 
 int live_add_number(LiveGraph *lg, float value, const char *name) {
-  NodeVTable vtable = create_number_vtable(value);
-  return add_node(lg, vtable, NUMBER_MEMORY_SIZE * sizeof(float), name, 0, 1);
+  return add_node(lg, NUMBER_VTABLE, NUMBER_MEMORY_SIZE * sizeof(float), name,
+                  0, 1, &value, sizeof(float));
 }
 
 int live_add_mixer2(LiveGraph *lg, const char *name) {
-  return add_node(lg, MIX2_VTABLE, 0, name, 2, 1);
+  return add_node(lg, MIX2_VTABLE, 0, name, 2, 1, NULL, 0);
 }
 
 int live_add_mixer8(LiveGraph *lg, const char *name) {
-  return add_node(lg, MIX8_VTABLE, 0, name, 8, 1);
+  return add_node(lg, MIX8_VTABLE, 0, name, 8, 1, NULL, 0);
 }
 
 int live_add_sum(LiveGraph *lg, const char *name, int nInputs) {
-  return add_node(lg, SUM_VTABLE, 0, name, nInputs, 1);
+  return add_node(lg, SUM_VTABLE, 0, name, nInputs, 1, NULL, 0);
 }
 
 // DAC function moved after helper function declarations
@@ -988,7 +759,6 @@ static void remove_successor(RTNode *src, int succ_id) {
 }
 
 static void retire_edge(LiveGraph *lg, int eid) {
-  printf("Retiring edge eid=%d\n", eid);
   if (eid < 0 || eid >= lg->edge_capacity)
     return;
   // zero for hygiene (optional)
@@ -1073,7 +843,6 @@ void assert_unique_pred_invariants(LiveGraph *lg) {
 
 // Allocate (or reuse from pool) an edge buffer; returns edge id or -1
 static int alloc_edge(LiveGraph *lg) {
-  printf("alloc edge called\n");
   for (int i = 0; i < lg->edge_capacity; i++) {
     if (!lg->edges[i].in_use) {
       lg->edges[i].in_use = true;
@@ -1086,7 +855,6 @@ static int alloc_edge(LiveGraph *lg) {
       }
       // Zero buffer for safety
       memset(lg->edges[i].buf, 0, sizeof(float) * lg->block_size);
-      printf("ALLOCATED EDGE_ID=%d\n", i);
       return i;
     }
   }
@@ -1148,8 +916,6 @@ void update_orphaned_status(LiveGraph *lg) {
   if (dac->inEdgeId) {
     for (int i = 0; i < dac->nInputs; i++) {
       if (dac->inEdgeId[i] >= 0) {
-        // printf("DEBUG: update_orphaned_status - DAC input[%d] = edge %d\n",
-        // i, dac->inEdgeId[i]);
         dac_has_inputs = true;
         break;
       }
@@ -1158,14 +924,9 @@ void update_orphaned_status(LiveGraph *lg) {
 
   if (!dac_has_inputs) {
     // DAC has no inputs, leave all nodes orphaned
-    // printf("DEBUG: update_orphaned_status - DAC has no inputs, leaving all
-    // nodes orphaned\n");
     return;
-  } else {
-    // printf("DEBUG: update_orphaned_status - DAC has inputs, marking as
-    // connected\n");
   }
-
+  // DAC has inputs, marking as connected
   // Use DFS to mark all nodes reachable from DAC
   bool *visited = calloc(lg->node_count, sizeof(bool));
   mark_reachable_from_dac(lg, lg->dac_node_id, visited);
@@ -1244,7 +1005,7 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       if (free_id == -1) {
         free_id = atomic_fetch_add(&lg->next_node_id, 1);
       }
-      sum_id = apply_add_node(lg, SUM_VTABLE, 0, free_id, "SUM", 2, 1);
+      sum_id = apply_add_node(lg, SUM_VTABLE, 0, free_id, "SUM", 2, 1, NULL);
       printf("created add auto sum node=%d\n", sum_id);
       if (sum_id < 0)
         return false;
@@ -1371,9 +1132,6 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
  */
 bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
                       int dst_port) {
-  printf("DISCONNECTINGING FROM src_node=%d src_port=%d dst_node=%d "
-         "dst_port=%d **************************** \n",
-         src_node, src_port, dst_node, dst_port);
   if (!lg || src_node < 0 || src_node >= lg->node_count || dst_node < 0 ||
       dst_node >= lg->node_count) {
     return false;
@@ -1423,7 +1181,6 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
     if (e->refcount > 0)
       e->refcount--;
     if (e->refcount == 0) {
-      printf("ref count for edge=%d is now 0 so retiring\n", eid_in);
       retire_edge(lg, eid_in);
       S->outEdgeId[src_port] = -1;
     }
@@ -1460,7 +1217,6 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
     if (e->refcount > 0)
       e->refcount--;
     if (e->refcount == 0) {
-      printf("Ref count of src_eid=%d is now 0, so retiring\n", src_eid);
       retire_edge(lg, src_eid);
       S->outEdgeId[src_port] = -1;
     }
@@ -1506,7 +1262,6 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
 
     // Handle SUM collapse cases
     if (SUM->nInputs == 0) {
-      printf("NO INPUTS LEFT should delete\n");
       // No inputs left - remove SUM and clear destination
       D->inEdgeId[dst_port] = -1;
       D->fanin_sum_node_id[dst_port] = -1;
@@ -1515,14 +1270,12 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       // Retire SUM's output edge
       int sum_out = SUM->outEdgeId[0];
       if (sum_out >= 0) {
-        printf("Retiring sum output edge\n");
         retire_edge(lg, sum_out);
       }
 
       // Delete the SUM node
       apply_delete_node(lg, sum_id);
     } else if (SUM->nInputs == 1) {
-      printf("only one input left - collapse sum to direct connection");
       // Only one input left - collapse SUM back to direct connection
       int remaining_eid = SUM->inEdgeId[0];
       int sum_out = SUM->outEdgeId[0];
@@ -1533,7 +1286,6 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
 
       // Create a new edge for the direct connection
       int direct_eid = alloc_edge(lg);
-      printf("Allocated new direct eid=%d for SUM collapse\n", direct_eid);
       if (direct_eid < 0)
         return false;
 
@@ -1544,11 +1296,9 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
 
       // Ensure buffer is allocated and valid
       if (!lg->edges[direct_eid].buf) {
-        printf("direct_eid buf not allocated so allocating buf\n");
         lg->edges[direct_eid].buf =
             alloc_aligned(64, lg->block_size * sizeof(float));
         if (!lg->edges[direct_eid].buf) {
-          printf("allocation didnt work so retiring\n");
           retire_edge(lg, direct_eid);
           return false;
         }
@@ -1561,18 +1311,11 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       // Wire source to new edge and update successor relationships
       bool added = false;
       if (remaining_src >= 0) {
-        // CRITICAL FIX: Check if source already has an outgoing edge
+        // Check if source already has an outgoing edge
         int existing_out_eid =
             lg->nodes[remaining_src].outEdgeId[remaining_src_port];
         if (existing_out_eid >= 0) {
-          // Source already has an outgoing edge - we need to SHARE it, not
-          // replace it
-          printf("Source already has outgoing edge %d - sharing instead of "
-                 "replacing\n",
-                 existing_out_eid);
-
-          // Retire the new edge we just created since we'll reuse the existing
-          // one
+          // Source already has an outgoing edge
           retire_edge(lg, direct_eid);
 
           // Use the existing shared edge
@@ -1594,15 +1337,8 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
         remove_successor(&lg->nodes[remaining_src], sum_id);
       }
 
-      printf("DEBUG: SUM collapse - remaining_src=%d, remaining_src_port=%d, "
-             "dst_node=%d, dst_port=%d\n",
-             remaining_src, remaining_src_port, dst_node, dst_port);
-      printf(
-          "DEBUG: SUM collapse - created direct_eid=%d, replacing sum_out=%d\n",
-          direct_eid, sum_out);
-
-      // CRITICAL FIX: Update all other consumers of the old SUM output edge
-      // to point to the new direct edge before deleting SUM
+      // Update all other consumers of the old SUM output edge to point to
+      // the new direct edge before deleting SUM
       if (sum_out >= 0) {
         for (int consumer_node = 0; consumer_node < lg->node_count;
              consumer_node++) {
@@ -1625,11 +1361,6 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       }
 
       // Let apply_delete_node handle all edge cleanup and retirement
-      printf("DEBUG: About to delete SUM node %d, node %d should remain "
-             "connected\n",
-             sum_id, dst_node);
-      printf("DEBUG: Before delete - node inEdgeId[0]=%d, direct_eid=%d\n",
-             lg->nodes[dst_node].inEdgeId[0], direct_eid);
       apply_delete_node(lg, sum_id);
 
       // SIMPLE FIX: Restore the direct connection that apply_delete_node
@@ -1641,12 +1372,9 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       // nOutputs is correct
       if (remaining_src >= 0 && remaining_src < lg->node_count) {
         RTNode *src_node = &lg->nodes[remaining_src];
-        printf("DEBUG: Source node before fix: nOutputs=%d, outEdgeId=%p\n",
-               src_node->nOutputs, src_node->outEdgeId);
 
         // If apply_delete_node corrupted the output structure, restore it
         if (src_node->nOutputs == 0 || src_node->outEdgeId == NULL) {
-          printf("DEBUG: Restoring corrupted source node structure\n");
           // The source should have at least 1 output (the one we're creating)
           if (src_node->nOutputs == 0) {
             src_node->nOutputs = 1; // Restore to original output count
@@ -1663,28 +1391,13 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
         // Now set the direct edge connection
         if (remaining_src_port >= 0 &&
             remaining_src_port < src_node->nOutputs) {
-          printf("DEBUG: Setting source outEdgeId[%d] = %d\n",
-                 remaining_src_port, direct_eid);
           src_node->outEdgeId[remaining_src_port] = direct_eid;
-        } else {
-          printf("DEBUG: Still invalid after restore: port=%d, nOutputs=%d\n",
-                 remaining_src_port, src_node->nOutputs);
         }
       }
-
-      printf("DEBUG: After delete - node inEdgeId[0]=%d\n",
-             lg->nodes[dst_node].inEdgeId[0]);
-      printf("DEBUG: Node indegree before adjustment: %d\n",
-             lg->indegree[dst_node]);
-      printf("DEBUG: added=%s, will increment indegree\n",
-             added ? "true" : "false");
 
       // No indegree increment needed - apply_delete_node already handled the
       // SUM→dst disconnection and the new direct connection replaces it with
       // the same logical indegree
-
-      printf("DEBUG: Gain indegree final: %d (should remain unchanged)\n",
-             lg->indegree[dst_node]);
     }
     // If SUM->nInputs > 1, SUM continues to exist with fewer inputs
   }
@@ -1733,8 +1446,6 @@ static bool apply_delete_node_internal(LiveGraph *lg, int node_id) {
       if (e->refcount > 0)
         e->refcount--;
       if (e->refcount == 0) {
-        printf("TRULY UNUSED SO RETIRING AND CLEAR THE SOURCE PORT eid=%d\n",
-               eid);
         // now it's truly unused: retire & clear the source port
         retire_edge(lg, eid);
         RTNode *src_node = &lg->nodes[s];
@@ -1851,9 +1562,6 @@ static bool apply_delete_node_internal(LiveGraph *lg, int node_id) {
  * Returns true if successful, false if node_id is invalid.
  */
 bool apply_delete_node(LiveGraph *lg, int node_id) {
-  printf("apply_delete_node called node_id=%d "
-         "------------------------------------------------\n",
-         node_id);
   bool result = apply_delete_node_internal(lg, node_id);
   if (result) {
     update_orphaned_status(lg);
@@ -1955,20 +1663,6 @@ static void init_pending_and_seed(LiveGraph *lg) {
   atomic_store_explicit(&lg->jobsInFlight, totalJobs, memory_order_release);
 }
 
-/*
-static bool detect_cycle(LiveGraph *lg) {
-  int reachable = 0, zero_in = 0;
-  for (int i = 0; i < lg->node_count; ++i) {
-    int p = atomic_load_explicit(&lg->pending[i], memory_order_relaxed);
-    if (p < 0) continue;           // orphan/deleted
-    reachable++;
-    if (lg->indegree[i] == 0)      // no output check here
-      zero_in++;
-  }
-  return (reachable > 0 && zero_in == 0);
-}
-*/
-
 bool detect_cycle(LiveGraph *lg) {
   int reachable = 0, zero_in = 0;
   for (int i = 0; i < lg->node_count; i++) {
@@ -2046,6 +1740,9 @@ int find_live_output(LiveGraph *lg) {
   return lg->dac_node_id; // Simply return the DAC node - no searching needed
 }
 
+// Forward declaration for watch list function
+static void update_watched_node_states(LiveGraph *lg);
+
 // ===================== Live Engine Implementation =====================
 void process_next_block(LiveGraph *lg, float *output_buffer, int nframes) {
   if (!lg || !output_buffer || nframes <= 0) {
@@ -2074,6 +1771,9 @@ void process_next_block(LiveGraph *lg, float *output_buffer, int nframes) {
   } else {
     memcpy(output_buffer, src, nframes * sizeof(float));
   }
+
+  // Update watched node states after processing
+  update_watched_node_states(lg);
 }
 
 // ===================== Failed ID Tracking =====================
@@ -2101,9 +1801,19 @@ bool is_failed_node(LiveGraph *lg, int logical_id) {
 // ===================== Queue-based API =====================
 
 int add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
-             const char *name, int nInputs, int nOutputs) {
+             const char *name, int nInputs, int nOutputs,
+             const void *initial_state, size_t initial_state_size) {
   // Atomically allocate the next node ID (which is also the array index)
   int node_id = atomic_fetch_add(&lg->next_node_id, 1);
+
+  // Create a copy of initial_state if provided
+  void *initial_state_copy = NULL;
+  if (initial_state && initial_state_size > 0) {
+    initial_state_copy = malloc(initial_state_size);
+    if (initial_state_copy) {
+      memcpy(initial_state_copy, initial_state, initial_state_size);
+    }
+  }
 
   // Create the command
   GraphEditCmd cmd = {
@@ -2115,11 +1825,16 @@ int add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
               node_id, // Use node_id as the logical_id (they're the same)
           .name = (char *)name,
           .nInputs = nInputs,
-          .nOutputs = nOutputs}};
+          .nOutputs = nOutputs,
+          .initial_state = initial_state_copy,
+          .initial_state_size = initial_state_size}};
 
   // Queue the command
   if (!geq_push(lg->graphEditQueue, &cmd)) {
     // Queue full - consider this a failure
+    if (initial_state_copy) {
+      free(initial_state_copy);
+    }
     add_failed_id(lg, node_id);
     return -1;
   }
@@ -2164,9 +1879,19 @@ bool graph_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
 
 bool hot_swap_node(LiveGraph *lg, int node_id, NodeVTable vt, size_t state_size,
                    int nin, int nout, bool xfade,
-                   void (*migrate)(void *, void *)) {
+                   void (*migrate)(void *, void *), const void *initial_state,
+                   size_t initial_state_size) {
   if (is_failed_node(lg, node_id)) {
     return false;
+  }
+
+  // Create a copy of initial_state if provided
+  void *initial_state_copy = NULL;
+  if (initial_state && initial_state_size > 0) {
+    initial_state_copy = malloc(initial_state_size);
+    if (initial_state_copy) {
+      memcpy(initial_state_copy, initial_state, initial_state_size);
+    }
   }
 
   GraphEditCmd cmd = {.op = GE_HOT_SWAP_NODE,
@@ -2177,15 +1902,34 @@ bool hot_swap_node(LiveGraph *lg, int node_id, NodeVTable vt, size_t state_size,
                               .node_id = node_id,
                               .new_nInputs = nin,
                               .new_nOutputs = nout,
+                              .initial_state = initial_state_copy,
+                              .initial_state_size = initial_state_size,
                           }
 
   };
-  return geq_push(lg->graphEditQueue, &cmd);
+  if (!geq_push(lg->graphEditQueue, &cmd)) {
+    // Queue push failed - clean up copied memory
+    if (initial_state_copy) {
+      free(initial_state_copy);
+    }
+    return false;
+  }
+  return true;
 }
 
 bool replace_keep_edges(LiveGraph *lg, int node_id, NodeVTable vt,
                         size_t state_size, int nin, int nout, bool xfade,
-                        void (*migrate)(void *, void *)) {
+                        void (*migrate)(void *, void *),
+                        const void *initial_state, size_t initial_state_size) {
+  // Create a copy of initial_state if provided
+  void *initial_state_copy = NULL;
+  if (initial_state && initial_state_size > 0) {
+    initial_state_copy = malloc(initial_state_size);
+    if (initial_state_copy) {
+      memcpy(initial_state_copy, initial_state, initial_state_size);
+    }
+  }
+
   GraphEditCmd cmd = {.op = GE_REPLACE_KEEP_EDGES,
                       .u.replace_keep_edges = {
                           .vt = vt,
@@ -2193,9 +1937,18 @@ bool replace_keep_edges(LiveGraph *lg, int node_id, NodeVTable vt,
                           .node_id = node_id,
                           .new_nInputs = nin,
                           .new_nOutputs = nout,
+                          .initial_state = initial_state_copy,
+                          .initial_state_size = initial_state_size,
 
                       }};
-  return geq_push(lg->graphEditQueue, &cmd);
+  if (!geq_push(lg->graphEditQueue, &cmd)) {
+    // Queue push failed - clean up copied memory
+    if (initial_state_copy) {
+      free(initial_state_copy);
+    }
+    return false;
+  }
+  return true;
 }
 
 void retire_later(LiveGraph *lg, void *ptr, void (*deleter)(void *)) {
@@ -2208,4 +1961,148 @@ void retire_later(LiveGraph *lg, void *ptr, void (*deleter)(void *)) {
   }
   lg->retire_list[lg->retire_count++] =
       (RetireEntry){.ptr = ptr, .deleter = deleter};
+}
+
+// ===================== Watch List Implementation =====================
+
+bool add_node_to_watchlist(LiveGraph *lg, int node_id) {
+  if (!lg || node_id < 0 || node_id >= lg->node_capacity) {
+    return false;
+  }
+
+  pthread_mutex_lock(&lg->watch_list_mutex);
+
+  // Check if node is already in watchlist
+  for (int i = 0; i < lg->watch_list_count; i++) {
+    if (lg->watch_list[i] == node_id) {
+      pthread_mutex_unlock(&lg->watch_list_mutex);
+      return true; // Already watched
+    }
+  }
+
+  // Expand capacity if needed
+  if (lg->watch_list_count >= lg->watch_list_capacity) {
+    lg->watch_list_capacity *= 2;
+    lg->watch_list = realloc(lg->watch_list, lg->watch_list_capacity * sizeof(int));
+    if (!lg->watch_list) {
+      pthread_mutex_unlock(&lg->watch_list_mutex);
+      return false;
+    }
+  }
+
+  // Add node to watchlist
+  lg->watch_list[lg->watch_list_count++] = node_id;
+  pthread_mutex_unlock(&lg->watch_list_mutex);
+  return true;
+}
+
+bool remove_node_from_watchlist(LiveGraph *lg, int node_id) {
+  if (!lg || node_id < 0) {
+    return false;
+  }
+
+  pthread_mutex_lock(&lg->watch_list_mutex);
+
+  // Find and remove node from watchlist
+  for (int i = 0; i < lg->watch_list_count; i++) {
+    if (lg->watch_list[i] == node_id) {
+      // Shift remaining elements
+      for (int j = i; j < lg->watch_list_count - 1; j++) {
+        lg->watch_list[j] = lg->watch_list[j + 1];
+      }
+      lg->watch_list_count--;
+
+      // Clean up state snapshot if it exists
+      pthread_rwlock_wrlock(&lg->state_store_lock);
+      if (node_id < lg->node_capacity && lg->state_snapshots[node_id]) {
+        free(lg->state_snapshots[node_id]);
+        lg->state_snapshots[node_id] = NULL;
+        lg->state_sizes[node_id] = 0;
+      }
+      pthread_rwlock_unlock(&lg->state_store_lock);
+
+      pthread_mutex_unlock(&lg->watch_list_mutex);
+      return true;
+    }
+  }
+
+  pthread_mutex_unlock(&lg->watch_list_mutex);
+  return false; // Node not found in watchlist
+}
+
+void *get_node_state(LiveGraph *lg, int node_id, size_t *state_size) {
+  if (!lg || node_id < 0 || node_id >= lg->node_capacity) {
+    if (state_size) *state_size = 0;
+    return NULL;
+  }
+
+  pthread_rwlock_rdlock(&lg->state_store_lock);
+  
+  void *result = NULL;
+  size_t size = 0;
+  
+  if (lg->state_snapshots[node_id] && lg->state_sizes[node_id] > 0) {
+    size = lg->state_sizes[node_id];
+    result = malloc(size);
+    if (result) {
+      memcpy(result, lg->state_snapshots[node_id], size);
+    }
+  }
+  
+  pthread_rwlock_unlock(&lg->state_store_lock);
+  
+  if (state_size) *state_size = size;
+  return result;
+}
+
+static void update_watched_node_states(LiveGraph *lg) {
+  if (!lg || lg->watch_list_count == 0) {
+    return;
+  }
+
+  // Atomically fetch current watchlist
+  pthread_mutex_lock(&lg->watch_list_mutex);
+  int watch_count = lg->watch_list_count;
+  int *watch_nodes = malloc(watch_count * sizeof(int));
+  if (!watch_nodes) {
+    pthread_mutex_unlock(&lg->watch_list_mutex);
+    return;
+  }
+  memcpy(watch_nodes, lg->watch_list, watch_count * sizeof(int));
+  pthread_mutex_unlock(&lg->watch_list_mutex);
+
+  // Update state snapshots for watched nodes
+  pthread_rwlock_wrlock(&lg->state_store_lock);
+  
+  for (int i = 0; i < watch_count; i++) {
+    int node_id = watch_nodes[i];
+    
+    // Validate node_id and check if node exists
+    if (node_id < 0 || node_id >= lg->node_count) {
+      continue;
+    }
+    
+    RTNode *node = &lg->nodes[node_id];
+    if (!node->state || node->state_size == 0) {
+      continue; // No state to copy
+    }
+    
+    // Free existing snapshot if it exists
+    if (lg->state_snapshots[node_id]) {
+      free(lg->state_snapshots[node_id]);
+      lg->state_snapshots[node_id] = NULL;
+      lg->state_sizes[node_id] = 0;
+    }
+    
+    // Allocate new snapshot
+    void *snapshot = malloc(node->state_size);
+    if (snapshot) {
+      memcpy(snapshot, node->state, node->state_size);
+      lg->state_snapshots[node_id] = snapshot;
+      lg->state_sizes[node_id] = node->state_size;
+    }
+  }
+  
+  pthread_rwlock_unlock(&lg->state_store_lock);
+  free(watch_nodes);
 }

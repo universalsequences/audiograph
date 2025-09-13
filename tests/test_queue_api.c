@@ -19,9 +19,9 @@ int main() {
 
   // Memory is now allocated by the library
   int osc_id = add_node(lg, OSC_VTABLE, OSC_MEMORY_SIZE * sizeof(float),
-                        "test_osc", 0, 1); // Osc: 0 inputs, 1 output
+                        "test_osc", 0, 1, NULL, 0); // Osc: 0 inputs, 1 output
   int gain_id = add_node(lg, GAIN_VTABLE, GAIN_MEMORY_SIZE * sizeof(float),
-                         "test_gain", 1, 1); // Gain: 1 input, 1 output
+                         "test_gain", 1, 1, NULL, 0); // Gain: 1 input, 1 output
 
   assert(osc_id > 0);        // Should get immediate logical ID
   assert(gain_id > 0);       // Should get immediate logical ID

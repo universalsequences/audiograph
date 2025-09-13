@@ -40,7 +40,8 @@ int live_add_state_output(LiveGraph* lg, float initial_value, const char* name) 
     };
 
     // Use the standard add_node function
-    int node_id = add_node(lg, vtable, STATE_OUTPUT_MEMORY_SIZE * sizeof(float), name, 0, 1);
+    int node_id = add_node(lg, vtable, STATE_OUTPUT_MEMORY_SIZE * sizeof(float), name, 0, 1,
+                          NULL, 0); // No initial state needed - will be set via params
 
     // We'll set the initial value after the node is created via parameter update
     return node_id;

@@ -30,7 +30,8 @@ void destroy_live_graph(LiveGraph *lg);
 
 // Generic node creation (returns pre-allocated node ID)
 int add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
-             const char *name, int nInputs, int nOutputs);
+             const char *name, int nInputs, int nOutputs,
+             const void *initial_state, size_t initial_state_size);
 
 // Convenient factory functions for common node types
 int live_add_oscillator(LiveGraph *lg, float freq_hz, const char *name);
@@ -58,11 +59,13 @@ bool graph_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
 
 bool hot_swap_node(LiveGraph *lg, int node_id, NodeVTable vt, size_t state_size,
                    int nin, int nout, bool xfade,
-                   void (*migrate)(void *, void *));
+                   void (*migrate)(void *, void *), const void *initial_state,
+                   size_t initial_state_size);
 
 bool replace_keep_edges(LiveGraph *lg, int node_id, NodeVTable vt,
                         size_t state_size, int nin, int nout, bool xfade,
-                        void (*migrate)(void *, void *));
+                        void (*migrate)(void *, void *), const void *initial_state,
+                        size_t initial_state_size);
 
 // ===================== Real-time Audio Processing =====================
 
@@ -73,6 +76,19 @@ void process_next_block(LiveGraph *lg, float *output_buffer, int nframes);
 
 // Thread-safe parameter updates (non-blocking)
 bool params_push(ParamRing *r, ParamMsg m);
+
+// ===================== Watch List API =====================
+
+// Add a node to the watch list for state monitoring
+bool add_node_to_watchlist(LiveGraph *lg, int node_id);
+
+// Remove a node from the watch list
+bool remove_node_from_watchlist(LiveGraph *lg, int node_id);
+
+// Get a copy of a watched node's current state (caller must free the result)
+// Returns NULL if node is not watched or doesn't exist
+// If state_size is not NULL, it will be set to the size of the returned state
+void *get_node_state(LiveGraph *lg, int node_id, size_t *state_size);
 
 // ===================== Node VTables for Custom Nodes =====================
 

@@ -25,6 +25,7 @@ typedef struct RTNode {
   uint64_t logical_id; // stable ID for migration/params
   NodeVTable vtable;
   void *state; // aligned, preallocated
+  size_t state_size; // size of allocated state for watch list copying
   int nInputs, nOutputs;
 
   // Port-based edge management
@@ -118,6 +119,17 @@ typedef struct LiveGraph {
 
   // Atomic node ID allocation
   _Atomic int next_node_id; // Next node ID to allocate (thread-safe)
+
+  // Watch list system for state monitoring
+  int *watch_list; // Array of node IDs being watched
+  int watch_list_count; // Current number of watched nodes
+  int watch_list_capacity; // Allocated capacity for watch list
+  pthread_mutex_t watch_list_mutex; // Protects watch_list modifications
+
+  // Thread-safe state store for watched nodes
+  void **state_snapshots; // Array of state copies indexed by node_id
+  size_t *state_sizes; // Array of state sizes indexed by node_id
+  pthread_rwlock_t state_store_lock; // Reader-writer lock for state access
 } LiveGraph;
 
 // ===================== Worker Pool / Engine =====================
@@ -156,7 +168,7 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
 void destroy_live_graph(LiveGraph *lg);
 int apply_add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
                    uint64_t logical_id, const char *name, int nInputs,
-                   int nOutputs);
+                   int nOutputs, const void *initial_state);
 int live_add_oscillator(LiveGraph *lg, float freq_hz, const char *name);
 int live_add_gain(LiveGraph *lg, float gain_value, const char *name);
 int live_add_number(LiveGraph *lg, float value, const char *name);
@@ -173,7 +185,8 @@ void process_live_block(LiveGraph *lg, int nframes);
 // ===================== Queue-based API (Pre-allocated IDs)
 // =====================
 int add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
-             const char *name, int nInputs, int nOutputs);
+             const char *name, int nInputs, int nOutputs,
+             const void *initial_state, size_t initial_state_size);
 bool delete_node(LiveGraph *lg, int node_id);
 bool graph_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
                    int dst_port);
@@ -182,11 +195,13 @@ bool graph_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
 
 bool hot_swap_node(LiveGraph *lg, int node_id, NodeVTable vt, size_t state_size,
                    int nin, int nout, bool xfade,
-                   void (*migrate)(void *, void *));
+                   void (*migrate)(void *, void *), const void *initial_state,
+                   size_t initial_state_size);
 
 bool replace_keep_edges(LiveGraph *lg, int node_id, NodeVTable vt,
                         size_t state_size, int nin, int nout, bool xfade,
-                        void (*migrate)(void *, void *));
+                        void (*migrate)(void *, void *), const void *initial_state,
+                        size_t initial_state_size);
 
 bool is_failed_node(LiveGraph *lg, int node_id);
 void add_failed_id(LiveGraph *lg, uint64_t logical_id);
@@ -196,6 +211,12 @@ int find_live_output(LiveGraph *lg);
 
 void process_next_block(LiveGraph *lg, float *output_buffer, int nframes);
 void retire_later(LiveGraph *lg, void *ptr, void (*deleter)(void *));
+
+// ===================== Watch List API =====================
+
+bool add_node_to_watchlist(LiveGraph *lg, int node_id);
+bool remove_node_from_watchlist(LiveGraph *lg, int node_id);
+void *get_node_state(LiveGraph *lg, int node_id, size_t *state_size);
 
 void update_orphaned_status(LiveGraph *lg);
 

@@ -61,20 +61,20 @@ static void multiplier_process(float *const *inputs, float *const *outputs,
 }
 
 // Custom node init functions (identical to fuzz test)
-static void number_gen_init(void *state, int sr, int mb) {
+static void number_gen_init(void *state, int sr, int mb, const void *initial_state) {
     (void)sr; (void)mb;
     NumberGenState *s = (NumberGenState *)state;
     s->value = 1.0f;
 }
 
-static void dual_output_init(void *state, int sr, int mb) {
+static void dual_output_init(void *state, int sr, int mb, const void *initial_state) {
     (void)sr; (void)mb;
     DualOutputState *s = (DualOutputState *)state;
     s->value1 = 2.0f;
     s->value2 = 3.0f;
 }
 
-static void multiplier_init(void *state, int sr, int mb) {
+static void multiplier_init(void *state, int sr, int mb, const void *initial_state) {
     (void)sr; (void)mb; (void)state;
 }
 

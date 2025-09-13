@@ -14,7 +14,7 @@ int main() {
   assert(lg);
 
   // Add DAC manually (normally done by system)
-  lg->dac_node_id = apply_add_node(lg, DAC_VTABLE, NULL, 999, "DAC", 1, 1);
+  lg->dac_node_id = apply_add_node(lg, DAC_VTABLE, 0, 999, "DAC", 1, 1, NULL);
   assert(lg->dac_node_id >= 0);
 
   // Create two number nodes so we can connect both outputs to same input

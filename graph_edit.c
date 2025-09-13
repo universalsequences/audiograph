@@ -21,11 +21,16 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
     case GE_ADD_NODE: {
       int nid = apply_add_node(lg, cmd.u.add_node.vt, cmd.u.add_node.state_size,
                                cmd.u.add_node.logical_id, cmd.u.add_node.name,
-                               cmd.u.add_node.nInputs, cmd.u.add_node.nOutputs);
+                               cmd.u.add_node.nInputs, cmd.u.add_node.nOutputs,
+                               cmd.u.add_node.initial_state);
       ok = nid >= 0;
       if (!ok) {
         // Track the failed logical ID
         add_failed_id(lg, cmd.u.add_node.logical_id);
+      }
+      // Clean up allocated initial_state memory
+      if (cmd.u.add_node.initial_state) {
+        free(cmd.u.add_node.initial_state);
       }
       break;
     }

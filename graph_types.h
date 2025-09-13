@@ -48,7 +48,7 @@ static inline uint64_t nsec_now(void) {
 // ===================== Kernel ABI =====================
 typedef void (*KernelFn)(float *const *in, float *const *out, int nframes,
                          void *state);
-typedef void (*InitFn)(void *state, int sampleRate, int maxBlock);
+typedef void (*InitFn)(void *state, int sampleRate, int maxBlock, const void *initial_state);
 typedef void (*ResetFn)(void *state);
 typedef void (*MigrateFn)(void *newState, const void *oldState);
 
@@ -230,6 +230,8 @@ typedef struct {
   int node_id;       // target slot to swap
   int new_nInputs;
   int new_nOutputs;
+  void *initial_state;       // Optional initial state data
+  size_t initial_state_size; // Size of initial_state data
 } GEHotSwapNode;
 
 typedef struct {
@@ -238,6 +240,8 @@ typedef struct {
   int node_id;       // target slot to replace
   int new_nInputs;
   int new_nOutputs;
+  void *initial_state;       // Optional initial state data
+  size_t initial_state_size; // Size of initial_state data
   // Policy flags:
   // - if shrinking inputs/outputs, auto-disconnect excess ports
   // deterministically
@@ -254,6 +258,8 @@ typedef struct {
       char *name;
       int nInputs;
       int nOutputs;
+      void *initial_state;       // Optional initial state data
+      size_t initial_state_size; // Size of initial_state data
     } add_node;
     struct {
       int node_id;

@@ -2,12 +2,19 @@
 
 // ===================== Oscillator Implementation =====================
 
-void osc_init(void *memory, int sr, int maxBlock) {
+void osc_init(void *memory, int sr, int maxBlock, const void *initial_state) {
   (void)sr;
   (void)maxBlock;
   float *mem = (float *)memory;
   mem[OSC_PHASE] = 0.0f;
-  // OSC_INC should be set during node creation
+
+  // Set OSC_INC from initial_state if provided
+  if (initial_state) {
+    const float *init_data = (const float *)initial_state;
+    mem[OSC_INC] = init_data[0]; // Frequency increment
+  } else {
+    mem[OSC_INC] = 0.0f; // Default to no oscillation
+  }
 }
 
 void osc_process(float *const *in, float *const *out, int n, void *memory) {
@@ -137,17 +144,35 @@ const NodeVTable OSC_VTABLE = {.process = osc_process,
                                .reset = NULL,
                                .migrate = osc_migrate};
 
-static void gain_init(void *state, int sampleRate, int maxBlock) {
+static void gain_init(void *state, int sampleRate, int maxBlock, const void *initial_state) {
+  (void)sampleRate;
+  (void)maxBlock;
   float *memory = (float *)state;
-  memory[GAIN_VALUE] = 1.0f; // Default gain of 1.0 (pass-through)
+
+  // Set gain value from initial_state if provided
+  if (initial_state) {
+    const float *init_data = (const float *)initial_state;
+    memory[GAIN_VALUE] = init_data[0];
+  } else {
+    memory[GAIN_VALUE] = 1.0f; // Default gain of 1.0 (pass-through)
+  }
 }
 
 const NodeVTable GAIN_VTABLE = {
     .process = gain_process, .init = gain_init, .reset = NULL, .migrate = NULL};
 
-static void number_init(void *state, int sampleRate, int maxBlock) {
+static void number_init(void *state, int sampleRate, int maxBlock, const void *initial_state) {
+  (void)sampleRate;
+  (void)maxBlock;
   float *memory = (float *)state;
-  memory[NUMBER_VALUE] = 0.0f; // Default number value of 0.0
+
+  // Set number value from initial_state if provided
+  if (initial_state) {
+    const float *init_data = (const float *)initial_state;
+    memory[NUMBER_VALUE] = init_data[0];
+  } else {
+    memory[NUMBER_VALUE] = 0.0f; // Default number value of 0.0
+  }
 }
 
 const NodeVTable NUMBER_VTABLE = {.process = number_process,

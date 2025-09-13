@@ -30,12 +30,20 @@ static void dual_output_process(float *const *inputs, float *const *outputs,
   }
 }
 
-static void dual_output_init(void *state, int sampleRate, int maxBlock) {
+static void dual_output_init(void *state, int sampleRate, int maxBlock, const void *initial_state) {
   (void)sampleRate;
   (void)maxBlock;
   DualOutputState *s = (DualOutputState *)state;
-  s->port0_value = 10.0f; // Port 0 outputs 10.0
-  s->port1_value = 15.0f; // Port 1 outputs 15.0
+
+  // Set values from initial_state if provided
+  if (initial_state) {
+    const float *init_data = (const float *)initial_state;
+    s->port0_value = init_data[0]; // Port 0 value
+    s->port1_value = init_data[1]; // Port 1 value
+  } else {
+    s->port0_value = 10.0f; // Default: Port 0 outputs 10.0
+    s->port1_value = 15.0f; // Default: Port 1 outputs 15.0
+  }
 }
 
 static const NodeVTable DUAL_OUTPUT_VTABLE = {.process = dual_output_process,
@@ -62,7 +70,7 @@ void test_complex_topology() {
 
   // Node 1: Custom dual-output node (0 inputs, 2 outputs)
   int node1 = add_node(lg, DUAL_OUTPUT_VTABLE, sizeof(DualOutputState),
-                       "dual_node1", 0, 2);
+                       "dual_node1", 0, 2, NULL, 0);
   assert(node1 >= 0);
   printf("✓ Created Node 1 (DUAL_OUTPUT, port0=10.0, port1=15.0): id=%d\n",
          node1);

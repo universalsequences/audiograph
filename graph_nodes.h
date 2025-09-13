@@ -24,7 +24,7 @@
 // ===================== Node Processing Functions =====================
 
 // Oscillator functions
-void osc_init(void* memory, int sr, int maxBlock);
+void osc_init(void* memory, int sr, int maxBlock, const void *initial_state);
 void osc_process(float* const* in, float* const* out, int n, void* memory);
 void osc_migrate(void* newMemory, const void* oldMemory);
 

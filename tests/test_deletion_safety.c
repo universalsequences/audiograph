@@ -70,8 +70,8 @@ int main() {
     snprintf(osc_name, sizeof(osc_name), "osc_%d", i);
     snprintf(gain_name, sizeof(gain_name), "gain_%d", i);
     
-    osc_ids[i] = add_node(g_test_state.lg, OSC_VTABLE, osc_state, osc_name, 0, 1);
-    gain_ids[i] = add_node(g_test_state.lg, GAIN_VTABLE, gain_state, gain_name, 1, 1);
+    osc_ids[i] = add_node(g_test_state.lg, OSC_VTABLE, osc_state, osc_name, 0, 1, NULL, 0);
+    gain_ids[i] = add_node(g_test_state.lg, GAIN_VTABLE, gain_state, gain_name, 1, 1, NULL, 0);
     
     assert(osc_ids[i] > 0);
     assert(gain_ids[i] > 0);
@@ -81,7 +81,7 @@ int main() {
   }
   
   // Create a mixer and connect first two gains to it
-  int mixer_id = add_node(g_test_state.lg, MIX2_VTABLE, NULL, "test_mixer", 2, 1);
+  int mixer_id = add_node(g_test_state.lg, MIX2_VTABLE, NULL, "test_mixer", 2, 1, NULL, 0);
   assert(mixer_id > 0);
   
   assert(connect(g_test_state.lg, gain_ids[0], 0, mixer_id, 0));

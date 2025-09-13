@@ -113,8 +113,7 @@ bool apply_hot_swap(LiveGraph *lg, GEHotSwapNode *p) {
     // Call NodeVTable init function if provided
     if (p->vt.init) {
       printf("DEBUG: apply_hot_swap - calling init function\n");
-      p->vt.init(new_state, 48000,
-                 256); // Use engine sample rate and block size
+      p->vt.init(new_state, 48000, 256, p->initial_state); // Use engine sample rate and block size
       printf("DEBUG: apply_hot_swap - init function completed\n");
     }
   }
@@ -204,8 +203,7 @@ bool apply_replace_keep_edges(LiveGraph *lg, GEReplaceKeepEdges *p) {
     // Call NodeVTable init function if provided
     if (p->vt.init) {
       printf("DEBUG: apply_replace_keep_edges - calling init function\n");
-      p->vt.init(new_state, 48000,
-                 256); // Use engine sample rate and block size
+      p->vt.init(new_state, 48000, 256, p->initial_state); // Use engine sample rate and block size
       printf("DEBUG: apply_replace_keep_edges - init function completed\n");
     }
   }

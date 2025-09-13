@@ -40,13 +40,15 @@ void test_hot_swap_basic() {
   printf("✓ Original node outputs correct value: %.3f\n", output_buffer[0]);
 
   // Now hot swap with a new NUMBER node (library allocates memory)
-  // Initial value will be 0.0 since NUMBER nodes have no init function
+  // Initial value will be 0.0 since we don't pass initial state
   GEHotSwapNode hot_swap = {
       .vt = NUMBER_VTABLE,
       .state_size = NUMBER_MEMORY_SIZE * sizeof(float),
       .node_id = num_id,
       .new_nInputs = 0, // NUMBER nodes have 0 inputs
-      .new_nOutputs = 1 // NUMBER nodes have 1 output
+      .new_nOutputs = 1, // NUMBER nodes have 1 output
+      .initial_state = NULL,
+      .initial_state_size = 0
   };
 
   // Apply the hot swap
@@ -89,7 +91,9 @@ void test_hot_swap_bounds_checking() {
                             .state_size = NUMBER_MEMORY_SIZE * sizeof(float),
                             .node_id = -1,
                             .new_nInputs = 0,
-                            .new_nOutputs = 1};
+                            .new_nOutputs = 1,
+                            .initial_state = NULL,
+                            .initial_state_size = 0};
 
   bool result = apply_hot_swap(lg, &hot_swap);
   assert(!result); // Should fail
@@ -153,13 +157,15 @@ void test_replace_keep_edges_basic() {
   printf("✓ Original chain outputs correct value: %.3f\n", output_buffer[0]);
 
   // Now replace the gain node with a different gain value, keeping edges
-  // Use create_gain_vtable to get proper initialization with gain = 5.0
-  NodeVTable gain_5_vtable = create_gain_vtable(5.0f);
-  GEReplaceKeepEdges replace = {.vt = gain_5_vtable,
+  // Use gain vtable with initial state = 5.0
+  float new_gain_value = 5.0f;
+  GEReplaceKeepEdges replace = {.vt = GAIN_VTABLE,
                                 .state_size = GAIN_MEMORY_SIZE * sizeof(float),
                                 .node_id = gain,
                                 .new_nInputs = 1, // Same port configuration
-                                .new_nOutputs = 1};
+                                .new_nOutputs = 1,
+                                .initial_state = &new_gain_value,
+                                .initial_state_size = sizeof(float)};
 
   bool replace_result = apply_replace_keep_edges(lg, &replace);
   assert(replace_result);
@@ -305,12 +311,14 @@ void test_hot_swap_stress() {
   float new_gains[4] = {5.0f, 1.0f, 2.0f, 10.0f};
 
   for (int i = 1; i < 5; i++) {
-    // Memory will be allocated by library (starts with zero gain)
-    GEHotSwapNode hot_swap = {.vt = create_gain_vtable(new_gains[i-1]),
+    // Memory will be allocated by library with initial gain value
+    GEHotSwapNode hot_swap = {.vt = GAIN_VTABLE,
                               .state_size = GAIN_MEMORY_SIZE * sizeof(float),
                               .node_id = nodes[i],
                               .new_nInputs = 1,
-                              .new_nOutputs = 1};
+                              .new_nOutputs = 1,
+                              .initial_state = &new_gains[i-1],
+                              .initial_state_size = sizeof(float)};
 
     bool swap_result = apply_hot_swap(lg, &hot_swap);
     assert(swap_result);
@@ -376,7 +384,9 @@ void test_retire_drain_system() {
                               .state_size = NUMBER_MEMORY_SIZE * sizeof(float),
                               .node_id = test_node,
                               .new_nInputs = 0,
-                              .new_nOutputs = 1};
+                              .new_nOutputs = 1,
+                              .initial_state = NULL,
+                              .initial_state_size = 0};
 
     bool swap_result = apply_hot_swap(lg, &hot_swap);
     assert(swap_result);

@@ -55,4 +55,10 @@ GraphState *compile_graph(GraphBuilder *gb, int sample_rate, int block_size,
                           const char *label);
 int count_total_edges(GraphBuilder *gb);
 
+// ===================== Watch List API =====================
+
+bool add_node_to_watchlist(LiveGraph *lg, int node_id);
+bool remove_node_from_watchlist(LiveGraph *lg, int node_id);
+void *get_node_state(LiveGraph *lg, int node_id, size_t *state_size);
+
 #endif // GRAPH_API_H
