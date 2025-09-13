@@ -3,6 +3,13 @@
 
 // Audiograph Swift Integration Header
 // Include this header in your Swift bridging header for audiograph integration
+//
+// Features included:
+// - Real-time audio graph processing with worker thread pool
+// - Dynamic node creation, connection, and deletion
+// - Hot-swappable node replacement for seamless audio updates
+// - Thread-safe parameter updates during processing
+// - Watch list system for real-time node state monitoring
 
 #include "graph_api.h"
 #include "graph_edit.h"

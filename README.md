@@ -6,6 +6,7 @@ A small real-time audio graph engine written in C11 with lock-free multi-threade
 - add/delete nodes and edit connections safely while the engine is running
 - auto summing inputs to nodes (inspired by web-audio and Max/MSP)
 - simple API for adding "custom" nodes (using function pointers) to the graph
+- real-time node state monitoring via watch list system
 - easily embeddedable in swift projects (see swift integration guide)
 
 ## Architecture Overview
@@ -655,6 +656,160 @@ params_push(lg->params, msg);
 // Parameters applied automatically before each audio block
 ```
 
+## Watch List System
+
+AudioGraph includes a **real-time node state monitoring system** that allows you to observe the internal state of audio processing nodes without interfering with real-time audio processing.
+
+### Watch List API
+
+The watch list system provides three core functions:
+
+```c
+// Add a node to the watch list for state monitoring
+bool add_node_to_watchlist(LiveGraph *lg, int node_id);
+
+// Remove a node from the watch list  
+bool remove_node_from_watchlist(LiveGraph *lg, int node_id);
+
+// Get a copy of a watched node's current state (caller must free the result)
+void *get_node_state(LiveGraph *lg, int node_id, size_t *state_size);
+```
+
+### Key Features
+
+**Thread-Safe State Monitoring**:
+- State copying happens atomically after each `process_next_block()` call
+- No interference with real-time audio processing
+- Reader-writer locks protect concurrent access to state store
+
+**Memory Management**:
+- Each `get_node_state()` call returns independent malloc'd memory
+- Caller must `free()` the returned pointer
+- Automatic cleanup when nodes are removed from watchlist
+
+**Real-Time Integration**:
+- State snapshots are captured at consistent points (after audio processing)
+- Watch list modifications use mutex protection for thread safety
+- Zero impact on audio processing performance
+
+### Usage Example
+
+```c
+// Create nodes and add to watchlist
+int osc = live_add_oscillator(lg, 440.0f, "test_osc");
+int gain = live_add_gain(lg, 0.5f, "test_gain");
+
+// Add nodes to watch list
+add_node_to_watchlist(lg, osc);
+add_node_to_watchlist(lg, gain);
+
+// Connect and process audio
+graph_connect(lg, osc, 0, gain, 0);
+graph_connect(lg, gain, 0, 0, 0);
+
+float output_buffer[128];
+process_next_block(lg, output_buffer, 128);
+
+// Get current node states
+size_t osc_state_size, gain_state_size;
+void *osc_state = get_node_state(lg, osc, &osc_state_size);
+void *gain_state = get_node_state(lg, gain, &gain_state_size);
+
+if (osc_state) {
+    float *osc_floats = (float *)osc_state;
+    printf("Oscillator phase: %f\n", osc_floats[0]);
+    free(osc_state);  // Important: free the memory
+}
+
+if (gain_state) {
+    float *gain_floats = (float *)gain_state;
+    printf("Gain value: %f\n", gain_floats[0]);
+    free(gain_state);  // Important: free the memory
+}
+
+// Remove from watchlist when done
+remove_node_from_watchlist(lg, osc);
+```
+
+### Custom Node State Monitoring
+
+For custom nodes, the watch list captures whatever data is stored in the node's state memory:
+
+```c
+// Custom node that records its input
+typedef struct {
+    float last_input_sample;
+    float processing_count;
+} RecorderState;
+
+void recorder_process(float *const *in, float *const *out, int n, void *state) {
+    RecorderState *s = (RecorderState *)state;
+    
+    // Record first sample of input
+    if (n > 0 && in[0]) {
+        s->last_input_sample = in[0][0];
+    }
+    s->processing_count += 1.0f;
+    
+    // Pass through audio
+    if (in[0] && out[0]) {
+        memcpy(out[0], in[0], n * sizeof(float));
+    }
+}
+
+// After processing, the watchlist captures the complete RecorderState
+RecorderState *captured_state = (RecorderState *)get_node_state(lg, recorder_id, NULL);
+if (captured_state) {
+    printf("Last input: %f, Processing count: %f\n", 
+           captured_state->last_input_sample, 
+           captured_state->processing_count);
+    free(captured_state);
+}
+```
+
+### Swift Integration
+
+The watch list API is fully exposed for Swift applications through `audiograph_swift.h`:
+
+```swift
+// Add node to watchlist
+let success = add_node_to_watchlist(liveGraph, nodeId)
+
+// Get state (remember to free!)
+var stateSize: Int = 0
+if let state = get_node_state(liveGraph, nodeId, &stateSize) {
+    let floats = state.assumingMemoryBound(to: Float.self)
+    let firstValue = floats[0]
+    // Use the state data...
+    free(state) // Important: free the memory!
+}
+
+// Remove from watchlist
+let removed = remove_node_from_watchlist(liveGraph, nodeId)
+```
+
+### Use Cases
+
+**Audio Development**:
+- Monitor oscillator phases, filter coefficients, envelope states
+- Debug parameter updates and their effects on node state
+- Visualize real-time DSP algorithm behavior
+
+**Visual Patch Editors**:
+- Display live parameter values in node UI elements
+- Show signal flow and processing states
+- Provide real-time feedback for user-created expressions
+
+**Performance Analysis**:
+- Track processing counts, buffer usage, state changes
+- Monitor memory usage patterns in custom nodes
+- Analyze algorithmic behavior over time
+
+**Testing & Validation**:
+- Verify that parameter updates reach target nodes correctly
+- Ensure state persistence across graph modifications
+- Test custom node implementations with known input/output pairs
+
 ## Building
 
 ```bash
@@ -672,6 +827,9 @@ make clean             # Clean build artifacts
 ./tests/test_disconnect                  # Test port-based disconnections
 ./tests/test_deletion_safety             # Test node deletion with workers
 ./tests/test_live_graph_partial_connections  # Test live editing under load
+./tests/test_watchlist                   # Test basic watchlist functionality
+./tests/test_watchlist_advanced          # Test real-time state monitoring
+./tests/test_watchlist_validation        # Test state content accuracy
 ```
 
 ## Performance Characteristics
