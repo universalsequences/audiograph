@@ -1486,6 +1486,24 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       // larger
     }
 
+    // FIX: After shrinking, update remaining source nodes to point to their own edges
+    // instead of the SUM output (restore direct fan-out capability)
+    if (SUM->nInputs >= 2) {
+      for (int i = 0; i < SUM->nInputs; i++) {
+        int eid = SUM->inEdgeId[i];
+        if (eid >= 0 && eid < lg->edge_capacity && lg->edges[eid].in_use) {
+          int src_node = lg->edges[eid].src_node;
+          int src_port = lg->edges[eid].src_port;
+          // SAFETY: Don't update the SUM node itself, only regular source nodes
+          if (src_node >= 0 && src_node < lg->node_capacity &&
+              src_node != sum_id && lg->nodes[src_node].outEdgeId) {
+            // Update source to point to its own edge (not SUM output)
+            lg->nodes[src_node].outEdgeId[src_port] = eid;
+          }
+        }
+      }
+    }
+
     // Handle SUM collapse cases
     if (SUM->nInputs == 0) {
       printf("NO INPUTS LEFT should delete\n");
@@ -1608,6 +1626,43 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       printf("DEBUG: Before delete - node inEdgeId[0]=%d, direct_eid=%d\n",
              lg->nodes[dst_node].inEdgeId[0], direct_eid);
       apply_delete_node(lg, sum_id);
+
+      // SIMPLE FIX: Restore the direct connection that apply_delete_node cleared
+      D->inEdgeId[dst_port] = direct_eid;
+
+      // CRITICAL FIX: apply_delete_node corrupted the source node's output structure
+      // We need to restore both the outEdgeId pointer and ensure nOutputs is correct
+      if (remaining_src >= 0 && remaining_src < lg->node_count) {
+        RTNode *src_node = &lg->nodes[remaining_src];
+        printf("DEBUG: Source node before fix: nOutputs=%d, outEdgeId=%p\n",
+               src_node->nOutputs, src_node->outEdgeId);
+
+        // If apply_delete_node corrupted the output structure, restore it
+        if (src_node->nOutputs == 0 || src_node->outEdgeId == NULL) {
+          printf("DEBUG: Restoring corrupted source node structure\n");
+          // The source should have at least 1 output (the one we're creating)
+          if (src_node->nOutputs == 0) {
+            src_node->nOutputs = 1; // Restore to original output count
+          }
+          if (src_node->outEdgeId == NULL) {
+            // Reallocate the output edge array
+            src_node->outEdgeId = calloc(src_node->nOutputs, sizeof(int32_t));
+            for (int i = 0; i < src_node->nOutputs; i++) {
+              src_node->outEdgeId[i] = -1; // Initialize to -1
+            }
+          }
+        }
+
+        // Now set the direct edge connection
+        if (remaining_src_port >= 0 && remaining_src_port < src_node->nOutputs) {
+          printf("DEBUG: Setting source outEdgeId[%d] = %d\n", remaining_src_port, direct_eid);
+          src_node->outEdgeId[remaining_src_port] = direct_eid;
+        } else {
+          printf("DEBUG: Still invalid after restore: port=%d, nOutputs=%d\n",
+                 remaining_src_port, src_node->nOutputs);
+        }
+      }
+
       printf("DEBUG: After delete - node inEdgeId[0]=%d\n",
              lg->nodes[dst_node].inEdgeId[0]);
       printf("DEBUG: Node indegree before adjustment: %d\n",

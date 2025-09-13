@@ -60,21 +60,102 @@ void test_auto_sum() {
   assert(sum_node->nInputs == 3);
   assert(sum_node->inEdgeId[2] >= 0);
   printf("✓ SUM grown to 3 inputs\n");
+
+  // === CHECK STATE AFTER SUM CREATION (before any disconnects) ===
+  printf("\n--- STATE AFTER SUM CREATION (3 inputs) ---\n");
+  printf("SUM node %d: nInputs=%d, nOutputs=%d\n", sum_id, sum_node->nInputs, sum_node->nOutputs);
+  for (int i = 0; i < sum_node->nInputs; i++) {
+    int eid = sum_node->inEdgeId[i];
+    if (eid >= 0 && eid < lg->edge_capacity && lg->edges[eid].in_use) {
+      printf("  SUM Input[%d] <- Edge[%d] (from Node[%d]:Port[%d], refcount=%d)\n",
+             i, eid, lg->edges[eid].src_node, lg->edges[eid].src_port, lg->edges[eid].refcount);
+    }
+  }
+  int sum_output_eid = sum_node->outEdgeId[0];
+  printf("  SUM Output[0] -> Edge[%d] (refcount=%d)\n", sum_output_eid, lg->edges[sum_output_eid].refcount);
+
+  printf("Source nodes after SUM creation:\n");
+  printf("  osc1[%d]: outEdgeId[0]=%d\n", osc1, lg->nodes[osc1].outEdgeId ? lg->nodes[osc1].outEdgeId[0] : -999);
+  printf("  osc2[%d]: outEdgeId[0]=%d\n", osc2, lg->nodes[osc2].outEdgeId ? lg->nodes[osc2].outEdgeId[0] : -999);
+  printf("  osc3[%d]: outEdgeId[0]=%d\n", osc3, lg->nodes[osc3].outEdgeId ? lg->nodes[osc3].outEdgeId[0] : -999);
+  printf("--------------------------------------------------\n\n");
   
   // Test disconnection: remove osc2
   bool disconnect2 = apply_disconnect(lg, osc2, 0, gain, 0);
   assert(disconnect2);
   printf("✓ Disconnected osc2 from gain\n");
-  
+
   // Verify SUM shrunk to 2 inputs
   assert(sum_node->nInputs == 2);
   printf("✓ SUM shrunk to 2 inputs\n");
+
+  // === SAFE STATE LOGGING AFTER FIRST DISCONNECT ===
+  printf("\n--- STATE AFTER FIRST DISCONNECT (osc2 removed) ---\n");
+  printf("SUM node %d: nInputs=%d, nOutputs=%d\n", sum_id, sum_node->nInputs, sum_node->nOutputs);
+  for (int i = 0; i < sum_node->nInputs; i++) {
+    int eid = sum_node->inEdgeId[i];
+    if (eid >= 0 && eid < lg->edge_capacity && lg->edges[eid].in_use) {
+      printf("  SUM Input[%d] <- Edge[%d] (from Node[%d]:Port[%d], refcount=%d)\n",
+             i, eid, lg->edges[eid].src_node, lg->edges[eid].src_port, lg->edges[eid].refcount);
+    } else {
+      printf("  SUM Input[%d] <- INVALID/RETIRED Edge[%d]\n", i, eid);
+    }
+  }
+  int sum_out_eid = sum_node->outEdgeId[0];
+  if (sum_out_eid >= 0 && sum_out_eid < lg->edge_capacity && lg->edges[sum_out_eid].in_use) {
+    printf("  SUM Output[0] -> Edge[%d] (refcount=%d)\n", sum_out_eid, lg->edges[sum_out_eid].refcount);
+  } else {
+    printf("  SUM Output[0] -> INVALID/RETIRED Edge[%d]\n", sum_out_eid);
+  }
+  printf("Gain node %d: inEdgeId[0]=%d, fanin_sum_node_id[0]=%d\n",
+         gain, lg->nodes[gain].inEdgeId[0], lg->nodes[gain].fanin_sum_node_id[0]);
+
+  // Check source node states safely
+  printf("Source nodes after first disconnect:\n");
+  printf("  osc1[%d]: outEdgeId[0]=%d\n", osc1, lg->nodes[osc1].outEdgeId ? lg->nodes[osc1].outEdgeId[0] : -999);
+  printf("  osc2[%d]: outEdgeId[0]=%d (should be disconnected)\n", osc2, lg->nodes[osc2].outEdgeId ? lg->nodes[osc2].outEdgeId[0] : -999);
+  printf("  osc3[%d]: outEdgeId[0]=%d\n", osc3, lg->nodes[osc3].outEdgeId ? lg->nodes[osc3].outEdgeId[0] : -999);
+  printf("-------------------------------------------------------\n\n");
   
+  // === SAFE STATE BEFORE COLLAPSE ===
+  printf("\n--- STATE BEFORE COLLAPSE (about to remove osc3) ---\n");
+  printf("SUM node %d: nInputs=%d\n", sum_id, sum_node->nInputs);
+  for (int i = 0; i < sum_node->nInputs; i++) {
+    int eid = sum_node->inEdgeId[i];
+    if (eid >= 0 && eid < lg->edge_capacity && lg->edges[eid].in_use) {
+      printf("  SUM Input[%d] <- Edge[%d] (from Node[%d]:Port[%d], refcount=%d)\n",
+             i, eid, lg->edges[eid].src_node, lg->edges[eid].src_port, lg->edges[eid].refcount);
+    } else {
+      printf("  SUM Input[%d] <- INVALID/RETIRED Edge[%d]\n", i, eid);
+    }
+  }
+  printf("Source nodes before collapse:\n");
+  printf("  osc1[%d]: outEdgeId[0]=%d\n", osc1, lg->nodes[osc1].outEdgeId ? lg->nodes[osc1].outEdgeId[0] : -999);
+  printf("  osc3[%d]: outEdgeId[0]=%d\n", osc3, lg->nodes[osc3].outEdgeId ? lg->nodes[osc3].outEdgeId[0] : -999);
+  printf("---------------------------------------------------\n");
+
   // Test disconnection: remove osc3 (should collapse SUM to direct connection)
   bool disconnect3 = apply_disconnect(lg, osc3, 0, gain, 0);
   assert(disconnect3);
   printf("✓ Disconnected osc3 from gain\n");
-  
+
+  // === SAFE STATE AFTER COLLAPSE ===
+  printf("\n--- STATE AFTER COLLAPSE ---\n");
+  printf("Gain node %d: inEdgeId[0]=%d, fanin_sum_node_id[0]=%d\n",
+         gain, lg->nodes[gain].inEdgeId[0], lg->nodes[gain].fanin_sum_node_id[0]);
+  if (lg->nodes[gain].inEdgeId[0] >= 0) {
+    int direct_eid = lg->nodes[gain].inEdgeId[0];
+    if (direct_eid < lg->edge_capacity && lg->edges[direct_eid].in_use) {
+      printf("  Direct Edge[%d]: src_node=%d, src_port=%d, refcount=%d\n",
+             direct_eid, lg->edges[direct_eid].src_node, lg->edges[direct_eid].src_port, lg->edges[direct_eid].refcount);
+    } else {
+      printf("  Direct Edge[%d]: INVALID/RETIRED\n", direct_eid);
+    }
+  }
+  printf("Source node after collapse:\n");
+  printf("  osc1[%d]: outEdgeId[0]=%d\n", osc1, lg->nodes[osc1].outEdgeId ? lg->nodes[osc1].outEdgeId[0] : -999);
+  printf("-------------------------------\n\n");
+
   // Verify SUM collapsed back to direct connection
   assert(lg->nodes[gain].fanin_sum_node_id[0] == -1);
   assert(lg->nodes[gain].inEdgeId[0] >= 0); // Direct connection exists

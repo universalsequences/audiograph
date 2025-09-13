@@ -66,7 +66,7 @@ profile: $(TARGET)
 	instruments -t "Time Profiler" ./$(TARGET)
 
 # Test targets
-test: tests/test_mpmc_queue tests/test_live_graph_partial_connections tests/test_disconnect tests/test_graph_edit_queue tests/test_queue_api tests/test_capacity_growth tests/test_simple_teardown tests/test_orphan_comprehensive tests/test_auto_sum tests/test_sum_behavior tests/test_hot_swap tests/test_multi_port_routing tests/test_complex_topology tests/test_4_node_topology tests/test_4_node_fuzz
+test: tests/test_mpmc_queue tests/test_live_graph_partial_connections tests/test_disconnect tests/test_graph_edit_queue tests/test_queue_api tests/test_capacity_growth tests/test_simple_teardown tests/test_orphan_comprehensive tests/test_auto_sum tests/test_ordered_sum_topology tests/test_sum_behavior tests/test_hot_swap tests/test_multi_port_routing tests/test_complex_topology tests/test_4_node_topology tests/test_4_node_fuzz
 	./tests/test_mpmc_queue
 	./tests/test_live_graph_partial_connections
 	./tests/test_disconnect
@@ -76,6 +76,7 @@ test: tests/test_mpmc_queue tests/test_live_graph_partial_connections tests/test
 	./tests/test_simple_teardown
 	./tests/test_orphan_comprehensive
 	./tests/test_auto_sum
+	./tests/test_ordered_sum_topology
 	./tests/test_sum_behavior
 	./tests/test_hot_swap
 	./tests/test_multi_port_routing

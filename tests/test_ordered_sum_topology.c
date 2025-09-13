@@ -105,11 +105,49 @@ void test_ordered_sum_topology() {
 
   printf("==============================================\n\n");
 
+  // CRITICAL ASSERTIONS: Verify SUM collapse worked correctly
+  printf("--- VERIFYING SUM COLLAPSE CORRECTNESS ---\n");
+
+  // After disconnecting node2→node3, the SUM should have collapsed to direct connection
+  // Verify node3 is properly connected (not corrupted)
+  RTNode *node3_ptr = &lg->nodes[node3];
+  printf("node3 inEdgeId[0] = %d\n", node3_ptr->inEdgeId[0]);
+  assert(node3_ptr->inEdgeId[0] >= 0); // Should have a valid input edge
+  assert(node3_ptr->fanin_sum_node_id[0] == -1); // SUM should be gone
+
+  // Verify the direct edge connects node1 to node3
+  int direct_edge = node3_ptr->inEdgeId[0];
+  assert(lg->edges[direct_edge].src_node == node1);
+  assert(lg->edges[direct_edge].src_port == 0);
+  assert(lg->edges[direct_edge].in_use == true);
+  assert(lg->edges[direct_edge].refcount >= 1); // At least node3 consumes it
+
+  // Verify node1's output structure is intact (not corrupted by apply_delete_node)
+  RTNode *node1_ptr = &lg->nodes[node1];
+  assert(node1_ptr->nOutputs > 0); // Should have outputs
+  assert(node1_ptr->outEdgeId != NULL); // Output array should exist
+  assert(node1_ptr->outEdgeId[0] >= 0); // Should point to valid edge
+
+  // Verify node1 can be disconnected (the original failing case)
+  printf("Testing final disconnect (the originally failing case)...\n");
+  bool disconnect_success = graph_disconnect(lg, node1, 0, node3, 0);
+  apply_graph_edits(lg->graphEditQueue, lg);
+
+  assert(disconnect_success); // This used to fail before the fix
+  printf("✓ SUM collapse disconnect test passed!\n");
+
+  // Verify complete disconnection
+  assert(lg->nodes[node3].inEdgeId[0] == -1); // node3 should be disconnected
+  printf("✓ Complete disconnection verified!\n");
+
   // Process a block
   process_next_block(lg, output_buffer, block_size);
 
   output_value = output_buffer[0];
   printf("Processed block, output value: %.6f\n", output_value);
+
+  destroy_live_graph(lg);
+  printf("\n=== SUM Collapse Test Completed Successfully ===\n");
 }
 
 int main() {
