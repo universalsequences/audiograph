@@ -124,8 +124,8 @@ tests/test_auto_sum: tests/test_auto_sum.c $(HEADERS) graph_engine.o graph_nodes
 	$(CC) $(CFLAGS) -I. -o tests/test_auto_sum tests/test_auto_sum.c graph_engine.o graph_nodes.o graph_edit.o ready_queue.o hot_swap.o
 
 # Build auto-sum test (automatic summing of multiple edges)
-tests/test_ordered_sum_topology: test_ordered_sum_topology.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o ready_queue.o hot_swap.o
-	$(CC) $(CFLAGS) -I. -o test_ordered_sum_topology test_ordered_sum_topology.c graph_engine.o graph_nodes.o graph_edit.o ready_queue.o hot_swap.o
+tests/test_ordered_sum_topology: tests/test_ordered_sum_topology.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o ready_queue.o hot_swap.o
+	$(CC) $(CFLAGS) -I. -o tests/test_ordered_sum_topology tests/test_ordered_sum_topology.c graph_engine.o graph_nodes.o graph_edit.o ready_queue.o hot_swap.o
 
 # Build sum behavior test (verify actual audio summing)
 tests/test_sum_behavior: tests/test_sum_behavior.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o ready_queue.o hot_swap.o

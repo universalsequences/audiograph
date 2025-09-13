@@ -86,16 +86,50 @@ int add_node(LiveGraph *lg, NodeVTable vtable, void *state,
 bool delete_node(LiveGraph *lg, int node_id);
 ```
 
-### Port-based Connections
+### Port-based Connections & Edge Sharing
+
+AudioGraph implements a **shared edge architecture** where audio connections between nodes are represented by reusable edge buffers:
+
 ```c
 // Connect specific ports between nodes
-bool connect(LiveGraph *lg, int src_node, int src_port, 
+bool connect(LiveGraph *lg, int src_node, int src_port,
              int dst_node, int dst_port);
 
 // Disconnect specific port connections
-bool disconnect(LiveGraph *lg, int src_node, int src_port, 
+bool disconnect(LiveGraph *lg, int src_node, int src_port,
                 int dst_node, int dst_port);
 ```
+
+**Edge Sharing for Fan-out**: When one output port feeds multiple destinations, all consumers share the same edge buffer:
+
+```c
+// Example: One oscillator feeding multiple destinations
+int osc = live_add_oscillator(lg, 440.0f, "source");
+int gain1 = live_add_gain(lg, 0.5f, "vol1");
+int gain2 = live_add_gain(lg, 0.3f, "vol2");
+int delay = live_add_delay(lg, 0.25f, "echo");
+
+// These connections all share the same edge from osc:port0
+connect(lg, osc, 0, gain1, 0);  // osc -> gain1 (creates edge X)
+connect(lg, osc, 0, gain2, 0);  // osc -> gain2 (shares edge X, refcount=2)
+connect(lg, osc, 0, delay, 0);  // osc -> delay (shares edge X, refcount=3)
+```
+
+**Internal Representation**:
+```c
+// All three destinations reference the same shared edge
+osc.outEdgeId[0] = edge_X;        // Source points to shared edge
+gain1.inEdgeId[0] = edge_X;       // Consumer 1 shares edge
+gain2.inEdgeId[0] = edge_X;       // Consumer 2 shares edge
+delay.inEdgeId[0] = edge_X;       // Consumer 3 shares edge
+edges[edge_X].refcount = 3;       // Three consumers total
+```
+
+**Key Properties**:
+- **Single Source, Multiple Destinations**: One output port can feed unlimited input ports
+- **Shared Buffer**: All consumers read from the same audio buffer (no copying)
+- **Reference Counting**: Edges are retired only when `refcount` reaches zero
+- **Efficient Fan-out**: No performance penalty for wide signal distribution
 
 ### Auto-Summing (Multi-input Mixing)
 
@@ -121,13 +155,57 @@ connect(lg, osc3, 0, gain, 0);  // Auto-SUM: grows to SUM(osc1, osc2, osc3) -> g
 - **Proper Scheduling**: SUM nodes process before their destination in topological order
 - **Memory Efficient**: SUM nodes are stateless and reuse existing edge buffers
 
-**Implementation Note**: Auto-summing is implemented via the `fanin_sum_node_id` tracking array in `RTNode`. When `apply_connect()` detects multiple sources to the same destination port, it:
+**SUM Node Topology**: Auto-summing creates a hidden intermediate topology that preserves edge sharing semantics:
+
+```c
+// Before auto-summing: Direct connection
+osc1 -> gain_node              // Direct edge sharing
+
+// After adding second source: SUM insertion
+osc1 ----\
+          |-> SUM_node -> gain_node    // SUM manages multiple inputs
+osc2 ----/
+
+// Internal representation:
+osc1.outEdgeId[0] = edge_A;           // osc1 -> SUM input 0
+osc2.outEdgeId[0] = edge_B;           // osc2 -> SUM input 1
+SUM.inEdgeId[0] = edge_A;             // SUM consumes both edges
+SUM.inEdgeId[1] = edge_B;
+SUM.outEdgeId[0] = edge_C;            // SUM -> gain
+gain.inEdgeId[0] = edge_C;            // gain consumes SUM output
+gain.fanin_sum_node_id[0] = SUM_id;   // Tracks SUM for this input port
+```
+
+**SUM Node Collapse**: When sources are disconnected and only one input remains, the SUM automatically collapses back to a direct connection:
+
+```c
+// During disconnect: SUM with 2 inputs -> 1 input -> direct connection
+disconnect(lg, osc2, 0, gain, 0);
+
+// Before collapse: osc1 -> SUM -> gain (unnecessary intermediate)
+// After collapse:  osc1 -> gain (direct connection, reuses existing edge)
+
+// Implementation:
+// 1. Identify surviving input edge (osc1 -> SUM)
+// 2. Check if source already has outgoing edge for fan-out
+// 3. If yes: redirect gain to share existing edge, increment refcount
+// 4. If no: create new direct edge from source to destination
+// 5. Remove SUM node cleanly without affecting existing connections
+```
+
+**Implementation Note**: Auto-summing uses the `fanin_sum_node_id` tracking array in `RTNode`. When `apply_connect()` detects multiple sources to the same destination port:
 1. Creates a SUM node with appropriate input count
-2. Redirects existing and new sources to the SUM inputs  
+2. Redirects existing and new sources to the SUM inputs
 3. Connects SUM output to the original destination
 4. Updates successor lists and indegree tracking for correct scheduling
 
-This ensures that audio mixing happens automatically without requiring users to manually create and manage mixer nodes for common use cases.
+When `apply_disconnect()` reduces a SUM to one input:
+1. Detects existing fan-out from source node via `outEdgeId` check
+2. Reuses existing shared edge if available (increment refcount)
+3. Creates new direct edge only if no existing edge exists
+4. Preserves edge sharing semantics throughout topology changes
+
+This ensures that audio mixing happens automatically while maintaining efficient edge sharing for fan-out scenarios.
 
 ### Key Design Features
 
