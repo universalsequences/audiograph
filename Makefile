@@ -66,7 +66,7 @@ profile: $(TARGET)
 	instruments -t "Time Profiler" ./$(TARGET)
 
 # Test targets
-test: tests/test_mpmc_queue tests/test_live_graph_partial_connections tests/test_disconnect tests/test_graph_edit_queue tests/test_queue_api tests/test_capacity_growth tests/test_simple_teardown tests/test_orphan_comprehensive tests/test_auto_sum tests/test_ordered_sum_topology tests/test_sum_behavior tests/test_hot_swap tests/test_multi_port_routing tests/test_complex_topology tests/test_4_node_topology tests/test_4_node_fuzz
+test: tests/test_mpmc_queue tests/test_live_graph_partial_connections tests/test_disconnect tests/test_graph_edit_queue tests/test_queue_api tests/test_capacity_growth tests/test_simple_teardown tests/test_orphan_comprehensive tests/test_auto_sum tests/test_ordered_sum_topology tests/test_sum_behavior tests/test_hot_swap tests/test_multi_port_routing tests/test_complex_topology tests/test_4_node_topology tests/test_4_node_fuzz tests/test_param_updates
 	./tests/test_mpmc_queue
 	./tests/test_live_graph_partial_connections
 	./tests/test_disconnect
@@ -83,6 +83,7 @@ test: tests/test_mpmc_queue tests/test_live_graph_partial_connections tests/test
 	./tests/test_complex_topology
 	./tests/test_4_node_topology
 	./tests/test_4_node_fuzz
+	./tests/test_param_updates
 
 # Build MPMC queue unit tests
 tests/test_mpmc_queue: tests/test_mpmc_queue.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o ready_queue.o hot_swap.o
@@ -140,6 +141,10 @@ tests/test_hot_swap: tests/test_hot_swap.c $(HEADERS) graph_engine.o graph_nodes
 tests/test_number_node: tests/test_number_node.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o ready_queue.o hot_swap.o
 	$(CC) $(CFLAGS) -I. -o tests/test_number_node tests/test_number_node.c graph_engine.o graph_nodes.o graph_edit.o ready_queue.o hot_swap.o
 
+# Build parameter updates test (verify params_push functionality)
+tests/test_param_updates: tests/test_param_updates.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o ready_queue.o hot_swap.o
+	$(CC) $(CFLAGS) -I. -o tests/test_param_updates tests/test_param_updates.c graph_engine.o graph_nodes.o graph_edit.o ready_queue.o hot_swap.o
+
 # Build multi-port routing test (verify multi-output to multi-input connections)
 tests/test_multi_port_routing: tests/test_multi_port_routing.c $(HEADERS) graph_engine.o graph_nodes.o graph_edit.o ready_queue.o hot_swap.o
 	$(CC) $(CFLAGS) -I. -o tests/test_multi_port_routing tests/test_multi_port_routing.c graph_engine.o graph_nodes.o graph_edit.o ready_queue.o hot_swap.o
@@ -188,7 +193,7 @@ tests/test_new_worker_system: tests/test_new_worker_system.c $(HEADERS) graph_en
 clean: clean_tests
 
 clean_tests:
-	rm -f tests/test_mpmc_queue tests/test_engine_workers tests/test_live_graph_multithreaded tests/test_live_graph_workers tests/test_live_graph_partial_connections tests/test_disconnect tests/test_graph_edit_queue tests/test_queue_api tests/test_deletion_safety tests/test_capacity_growth tests/test_simple_teardown tests/test_orphan_comprehensive tests/test_auto_sum tests/test_sum_behavior tests/test_engine_workers_debug tests/test_number_node tests/test_orphan_edge_cases tests/test_new_worker_system tests/test_hot_swap tests/test_multi_port_routing tests/test_complex_topology tests/test_4_node_topology tests/test_4_node_fuzz
+	rm -f tests/test_mpmc_queue tests/test_engine_workers tests/test_live_graph_multithreaded tests/test_live_graph_workers tests/test_live_graph_partial_connections tests/test_disconnect tests/test_graph_edit_queue tests/test_queue_api tests/test_deletion_safety tests/test_capacity_growth tests/test_simple_teardown tests/test_orphan_comprehensive tests/test_auto_sum tests/test_sum_behavior tests/test_engine_workers_debug tests/test_number_node tests/test_orphan_edge_cases tests/test_new_worker_system tests/test_hot_swap tests/test_multi_port_routing tests/test_complex_topology tests/test_4_node_topology tests/test_4_node_fuzz tests/test_param_updates
 	rm -rf tests/*.dSYM
 
 .PHONY: all debug release lib lib-release run clean valgrind profile test clean_tests

@@ -51,3 +51,7 @@ tests/test_bug_stress.dSYM/Contents/Resources/Relocations/aarch64/test_bug_stres
 tests/test_4_node_fuzz
 BUG_SOLUTION_REPORT_SEP_9_2025.md
 tests/test_add_node_dropout
+tests/test_4_node_topology
+tests/test_ordered_sum_topology
+tests/test_param_updates
+tests/test_4_node_topology

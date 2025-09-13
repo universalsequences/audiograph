@@ -1486,8 +1486,8 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       // larger
     }
 
-    // FIX: After shrinking, update remaining source nodes to point to their own edges
-    // instead of the SUM output (restore direct fan-out capability)
+    // FIX: After shrinking, update remaining source nodes to point to their own
+    // edges instead of the SUM output (restore direct fan-out capability)
     if (SUM->nInputs >= 2) {
       for (int i = 0; i < SUM->nInputs; i++) {
         int eid = SUM->inEdgeId[i];
@@ -1562,12 +1562,17 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       bool added = false;
       if (remaining_src >= 0) {
         // CRITICAL FIX: Check if source already has an outgoing edge
-        int existing_out_eid = lg->nodes[remaining_src].outEdgeId[remaining_src_port];
+        int existing_out_eid =
+            lg->nodes[remaining_src].outEdgeId[remaining_src_port];
         if (existing_out_eid >= 0) {
-          // Source already has an outgoing edge - we need to SHARE it, not replace it
-          printf("Source already has outgoing edge %d - sharing instead of replacing\n", existing_out_eid);
+          // Source already has an outgoing edge - we need to SHARE it, not
+          // replace it
+          printf("Source already has outgoing edge %d - sharing instead of "
+                 "replacing\n",
+                 existing_out_eid);
 
-          // Retire the new edge we just created since we'll reuse the existing one
+          // Retire the new edge we just created since we'll reuse the existing
+          // one
           retire_edge(lg, direct_eid);
 
           // Use the existing shared edge
@@ -1627,11 +1632,13 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
              lg->nodes[dst_node].inEdgeId[0], direct_eid);
       apply_delete_node(lg, sum_id);
 
-      // SIMPLE FIX: Restore the direct connection that apply_delete_node cleared
+      // SIMPLE FIX: Restore the direct connection that apply_delete_node
+      // cleared
       D->inEdgeId[dst_port] = direct_eid;
 
-      // CRITICAL FIX: apply_delete_node corrupted the source node's output structure
-      // We need to restore both the outEdgeId pointer and ensure nOutputs is correct
+      // CRITICAL FIX: apply_delete_node corrupted the source node's output
+      // structure We need to restore both the outEdgeId pointer and ensure
+      // nOutputs is correct
       if (remaining_src >= 0 && remaining_src < lg->node_count) {
         RTNode *src_node = &lg->nodes[remaining_src];
         printf("DEBUG: Source node before fix: nOutputs=%d, outEdgeId=%p\n",
@@ -1654,8 +1661,10 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
         }
 
         // Now set the direct edge connection
-        if (remaining_src_port >= 0 && remaining_src_port < src_node->nOutputs) {
-          printf("DEBUG: Setting source outEdgeId[%d] = %d\n", remaining_src_port, direct_eid);
+        if (remaining_src_port >= 0 &&
+            remaining_src_port < src_node->nOutputs) {
+          printf("DEBUG: Setting source outEdgeId[%d] = %d\n",
+                 remaining_src_port, direct_eid);
           src_node->outEdgeId[remaining_src_port] = direct_eid;
         } else {
           printf("DEBUG: Still invalid after restore: port=%d, nOutputs=%d\n",
