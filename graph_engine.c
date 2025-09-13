@@ -988,6 +988,7 @@ static void remove_successor(RTNode *src, int succ_id) {
 }
 
 static void retire_edge(LiveGraph *lg, int eid) {
+  printf("Retiring edge eid=%d\n", eid);
   if (eid < 0 || eid >= lg->edge_capacity)
     return;
   // zero for hygiene (optional)
@@ -1072,6 +1073,7 @@ void assert_unique_pred_invariants(LiveGraph *lg) {
 
 // Allocate (or reuse from pool) an edge buffer; returns edge id or -1
 static int alloc_edge(LiveGraph *lg) {
+  printf("alloc edge called\n");
   for (int i = 0; i < lg->edge_capacity; i++) {
     if (!lg->edges[i].in_use) {
       lg->edges[i].in_use = true;
@@ -1084,6 +1086,7 @@ static int alloc_edge(LiveGraph *lg) {
       }
       // Zero buffer for safety
       memset(lg->edges[i].buf, 0, sizeof(float) * lg->block_size);
+      printf("ALLOCATED EDGE_ID=%d\n", i);
       return i;
     }
   }
@@ -1228,7 +1231,8 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
     // Case 2 or 3: Already has a producer → use/create SUM(D, dst_port)
     int sum_id = D->fanin_sum_node_id[dst_port];
     if (sum_id == -1) {
-      // Case 2: Create SUM with 2 inputs - find a free node slot (only in used range)
+      // Case 2: Create SUM with 2 inputs - find a free node slot (only in used
+      // range)
       int free_id = -1;
       for (int i = 0; i < lg->node_count; i++) {
         if (lg->nodes[i].vtable.process == NULL && lg->nodes[i].nInputs == 0 &&
@@ -1241,6 +1245,7 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
         free_id = atomic_fetch_add(&lg->next_node_id, 1);
       }
       sum_id = apply_add_node(lg, SUM_VTABLE, 0, free_id, "SUM", 2, 1);
+      printf("created add auto sum node=%d\n", sum_id);
       if (sum_id < 0)
         return false;
       RTNode *SUM = &lg->nodes[sum_id];
@@ -1273,6 +1278,7 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       }
 
       // Hook old_src → SUM.in0 (reuse existing edge)
+      printf("Reusing existing edge in sum.in0 eid=%d\n", existing_eid);
       SUM->inEdgeId[0] = existing_eid;
       lg->edges[existing_eid].refcount++; // SUM consumes it now
       indegree_inc_on_first_pred(lg, old_src, sum_id);
@@ -1281,6 +1287,7 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       int sum_out = SUM->outEdgeId[0];
       if (sum_out == -1) {
         sum_out = alloc_edge(lg);
+        printf("allocating output edge for sum=%d\n", sum_out);
         if (sum_out < 0)
           return false;
         SUM->outEdgeId[0] = sum_out;
@@ -1290,8 +1297,10 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
 
       // New source S → SUM.in1
       int new_eid = S->outEdgeId[src_port];
+      printf("outEdgeId[src_port=%d] = %d", src_port, new_eid);
       if (new_eid == -1) {
         new_eid = alloc_edge(lg);
+        printf("had to allocate=%d\n", new_eid);
         if (new_eid < 0)
           return false;
         S->outEdgeId[src_port] = new_eid;
@@ -1414,6 +1423,7 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
     if (e->refcount > 0)
       e->refcount--;
     if (e->refcount == 0) {
+      printf("ref count for edge=%d is now 0 so retiring\n", eid_in);
       retire_edge(lg, eid_in);
       S->outEdgeId[src_port] = -1;
     }
@@ -1450,6 +1460,7 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
     if (e->refcount > 0)
       e->refcount--;
     if (e->refcount == 0) {
+      printf("Ref count of src_eid=%d is now 0, so retiring\n", src_eid);
       retire_edge(lg, src_eid);
       S->outEdgeId[src_port] = -1;
     }
@@ -1486,12 +1497,14 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       // Retire SUM's output edge
       int sum_out = SUM->outEdgeId[0];
       if (sum_out >= 0) {
+        printf("Retiring sum output edge\n");
         retire_edge(lg, sum_out);
       }
 
       // Delete the SUM node
       apply_delete_node(lg, sum_id);
     } else if (SUM->nInputs == 1) {
+      printf("only one input left - collapse sum to direct connection");
       // Only one input left - collapse SUM back to direct connection
       int remaining_eid = SUM->inEdgeId[0];
       int sum_out = SUM->outEdgeId[0];
@@ -1502,6 +1515,7 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
 
       // Create a new edge for the direct connection
       int direct_eid = alloc_edge(lg);
+      printf("Allocated direct eid=%d\n", direct_eid);
       if (direct_eid < 0)
         return false;
 
@@ -1512,9 +1526,11 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
 
       // Ensure buffer is allocated and valid
       if (!lg->edges[direct_eid].buf) {
+        printf("direct_eid buf not allocated so allocating buf\n");
         lg->edges[direct_eid].buf =
             alloc_aligned(64, lg->block_size * sizeof(float));
         if (!lg->edges[direct_eid].buf) {
+          printf("allocation didnt work so retiring\n");
           retire_edge(lg, direct_eid);
           return false;
         }
@@ -1568,21 +1584,22 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       }
 
       // Let apply_delete_node handle all edge cleanup and retirement
-      printf("DEBUG: About to delete SUM node %d, gain node %d should remain "
+      printf("DEBUG: About to delete SUM node %d, node %d should remain "
              "connected\n",
              sum_id, dst_node);
-      printf("DEBUG: Before delete - gain inEdgeId[0]=%d, direct_eid=%d\n",
+      printf("DEBUG: Before delete - node inEdgeId[0]=%d, direct_eid=%d\n",
              lg->nodes[dst_node].inEdgeId[0], direct_eid);
       apply_delete_node(lg, sum_id);
-      printf("DEBUG: After delete - gain inEdgeId[0]=%d\n",
+      printf("DEBUG: After delete - node inEdgeId[0]=%d\n",
              lg->nodes[dst_node].inEdgeId[0]);
-      printf("DEBUG: Gain indegree before adjustment: %d\n",
+      printf("DEBUG: Node indegree before adjustment: %d\n",
              lg->indegree[dst_node]);
       printf("DEBUG: added=%s, will increment indegree\n",
              added ? "true" : "false");
 
-      // No indegree increment needed - apply_delete_node already handled the SUM→dst disconnection
-      // and the new direct connection replaces it with the same logical indegree
+      // No indegree increment needed - apply_delete_node already handled the
+      // SUM→dst disconnection and the new direct connection replaces it with
+      // the same logical indegree
 
       printf("DEBUG: Gain indegree final: %d (should remain unchanged)\n",
              lg->indegree[dst_node]);
@@ -1634,6 +1651,8 @@ static bool apply_delete_node_internal(LiveGraph *lg, int node_id) {
       if (e->refcount > 0)
         e->refcount--;
       if (e->refcount == 0) {
+        printf("TRULY UNUSED SO RETIRING AND CLEAR THE SOURCE PORT eid=%d\n",
+               eid);
         // now it's truly unused: retire & clear the source port
         retire_edge(lg, eid);
         RTNode *src_node = &lg->nodes[s];
