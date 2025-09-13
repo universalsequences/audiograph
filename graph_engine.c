@@ -1513,28 +1513,13 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       int remaining_src = lg->edges[remaining_eid].src_node;
       int remaining_src_port = lg->edges[remaining_eid].src_port;
 
-      // Create a new edge for the direct connection
-      int direct_eid = alloc_edge(lg);
-      printf("Allocated direct eid=%d\n", direct_eid);
-      if (direct_eid < 0)
-        return false;
+      // Reuse the surviving input edge for the direct connection
+      int direct_eid = remaining_eid;
+      printf("Reusing surviving edge eid=%d for direct connection\n", direct_eid);
 
-      // Set up the new direct edge
-      lg->edges[direct_eid].src_node = remaining_src;
-      lg->edges[direct_eid].src_port = remaining_src_port;
-      lg->edges[direct_eid].refcount = 1; // consumed by destination
-
-      // Ensure buffer is allocated and valid
-      if (!lg->edges[direct_eid].buf) {
-        printf("direct_eid buf not allocated so allocating buf\n");
-        lg->edges[direct_eid].buf =
-            alloc_aligned(64, lg->block_size * sizeof(float));
-        if (!lg->edges[direct_eid].buf) {
-          printf("allocation didnt work so retiring\n");
-          retire_edge(lg, direct_eid);
-          return false;
-        }
-      }
+      // Edge already has correct src_node, src_port, and buffer from original connection
+      // Just update refcount: transfers from SUM consumption to destination consumption
+      lg->edges[direct_eid].refcount = 1;
 
       // Wire source to new edge and destination to new edge
       bool added = false;
@@ -1551,8 +1536,11 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       D->inEdgeId[dst_port] = direct_eid;
       D->fanin_sum_node_id[dst_port] = -1;
 
-      // Let apply_delete_node handle all SUM cleanup - no manual
-      // refcount/indegree changes
+      // CRITICAL: Clear the SUM's reference to the reused edge before deletion
+      // This prevents apply_delete_node from retiring the edge we just repurposed
+      SUM->inEdgeId[0] = -1;  // Clear the surviving input reference
+      SUM->nInputs = 0;       // Mark SUM as having no inputs
+
       printf("DEBUG: SUM collapse - remaining_src=%d, remaining_src_port=%d, "
              "dst_node=%d, dst_port=%d\n",
              remaining_src, remaining_src_port, dst_node, dst_port);
