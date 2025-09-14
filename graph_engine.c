@@ -900,17 +900,28 @@ static void mark_reachable_from_dac(LiveGraph *lg, int node_id, bool *visited) {
 
 // Update orphaned status for all nodes based on DAC reachability
 void update_orphaned_status(LiveGraph *lg) {
-  // First, mark all nodes as orphaned
+  // First, mark all nodes as orphaned (except watched nodes)
   for (int i = 0; i < lg->node_count; i++) {
-    lg->is_orphaned[i] = true;
+    // Check if this node is in the watchlist
+    bool is_watched = false;
+    pthread_mutex_lock(&lg->watch_list_mutex);
+    for (int w = 0; w < lg->watch_list_count; w++) {
+      if (lg->watch_list[w] == i) {
+        is_watched = true;
+        break;
+      }
+    }
+    pthread_mutex_unlock(&lg->watch_list_mutex);
+    // Watched nodes are never orphaned - they always stay active
+    lg->is_orphaned[i] = !is_watched;
   }
 
-  // If no DAC node exists, all nodes remain orphaned
+  // If no DAC node exists, non-watched nodes remain orphaned
   if (lg->dac_node_id < 0) {
     return;
   }
 
-  // Check if DAC has any inputs first - if not, leave it orphaned
+  // Check if DAC has any inputs first - if not, leave it orphaned (unless watched)
   RTNode *dac = &lg->nodes[lg->dac_node_id];
   bool dac_has_inputs = false;
   if (dac->inEdgeId) {
@@ -923,7 +934,7 @@ void update_orphaned_status(LiveGraph *lg) {
   }
 
   if (!dac_has_inputs) {
-    // DAC has no inputs, leave all nodes orphaned
+    // DAC has no inputs, non-watched nodes remain orphaned
     return;
   }
   // DAC has inputs, marking as connected
@@ -1993,6 +2004,10 @@ bool add_node_to_watchlist(LiveGraph *lg, int node_id) {
   // Add node to watchlist
   lg->watch_list[lg->watch_list_count++] = node_id;
   pthread_mutex_unlock(&lg->watch_list_mutex);
+
+  // Update orphan status so the watched node becomes active immediately
+  update_orphaned_status(lg);
+
   return true;
 }
 
@@ -2022,6 +2037,10 @@ bool remove_node_from_watchlist(LiveGraph *lg, int node_id) {
       pthread_rwlock_unlock(&lg->state_store_lock);
 
       pthread_mutex_unlock(&lg->watch_list_mutex);
+
+      // Update orphan status since the node may become orphaned again
+      update_orphaned_status(lg);
+
       return true;
     }
   }
