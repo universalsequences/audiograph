@@ -9,7 +9,7 @@ int main() {
   printf("Testing pre-allocated ID API with failure tracking\n\n");
 
   // Create a test graph
-  LiveGraph *lg = create_live_graph(10, 128, "queue_api_test");
+  LiveGraph *lg = create_live_graph(10, 128, "queue_api_test", 1);
   assert(lg != NULL);
 
   printf("✓ LiveGraph created with auto-DAC (ID: %d)\n", lg->dac_node_id);

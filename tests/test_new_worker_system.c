@@ -30,7 +30,7 @@ int main(void) {
   printf("✓ Engine initialized (blockSize=128, sampleRate=48000)\n");
 
   // Create live graph with moderate complexity
-  LiveGraph *lg = create_live_graph(64, 128, "WorkerTest");
+  LiveGraph *lg = create_live_graph(64, 128, "WorkerTest", 1);
   if (!lg) {
     printf("❌ Failed to create live graph\n");
     return 1;

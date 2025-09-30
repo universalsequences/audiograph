@@ -9,7 +9,7 @@ void test_number_node() {
   printf("=== Testing NUMBER Node Output ===\n");
   
   const int block_size = 64;
-  LiveGraph *lg = create_live_graph(16, block_size, "number_test");
+  LiveGraph *lg = create_live_graph(16, block_size, "number_test", 1);
   assert(lg != NULL);
   
   // Create a NUMBER node that outputs 42.0

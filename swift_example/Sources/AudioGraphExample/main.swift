@@ -118,7 +118,7 @@ class AudioGraphManager {
         // Initialize engine with matching sample rate
         initialize_engine(blockSize, 44100)
 
-        guard let lg = create_live_graph(32, blockSize, "swift_kernel_test") else {
+        guard let lg = create_live_graph(32, blockSize, "swift_kernel_test", 1) else {
             print("✗ Failed to create live graph")
             return
         }

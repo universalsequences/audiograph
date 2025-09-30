@@ -45,6 +45,11 @@ void dac_process(float* const* in, float* const* out, int n, void* memory);
 // SUM function (Auto-summing for multiple edges into same input)
 void sum_process(float* const* in, float* const* out, int n, void* memory);
 
+// ===================== Helper Functions =====================
+
+// Get the number of inputs for the currently processing node
+int ap_current_node_ninputs(void);
+
 // ===================== Node VTables =====================
 
 extern const NodeVTable OSC_VTABLE;

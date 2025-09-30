@@ -361,7 +361,7 @@ static void test_disconnection_permutation(Edge *edges, int edge_count,
 // Initialize the test topology
 static bool setup_test_topology() {
   const int block_size = 256;
-  lg = create_live_graph(32, block_size, "fuzz_test_graph");
+  lg = create_live_graph(32, block_size, "fuzz_test_graph", 1);
   if (!lg)
     return false;
 

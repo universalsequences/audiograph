@@ -7,7 +7,7 @@
 
 void test_ordered_sum_topology() {
   const int block_size = 256;
-  LiveGraph *lg = create_live_graph(32, block_size, "complex_topology_test");
+  LiveGraph *lg = create_live_graph(32, block_size, "complex_topology_test", 1);
   assert(lg != NULL);
 
   int node1 = live_add_number(lg, 10.0f, "num1");

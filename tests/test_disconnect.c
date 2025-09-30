@@ -8,7 +8,7 @@ int main() {
   printf("=== Port-based Disconnect Test ===\n");
 
   // Create a simple test graph
-  LiveGraph *lg = create_live_graph(10, 128, "disconnect_test");
+  LiveGraph *lg = create_live_graph(10, 128, "disconnect_test", 1);
 
   // Create nodes: osc -> gain -> mixer (2 inputs) -> dac
   int osc1 = live_add_oscillator(lg, 10.0f, "osc1");

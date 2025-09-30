@@ -10,7 +10,7 @@ int main() {
   engine_start_workers(2);
 
   // Create a graph
-  LiveGraph *lg = create_live_graph(16, 128, "watchlist_advanced_test");
+  LiveGraph *lg = create_live_graph(16, 128, "watchlist_advanced_test", 1);
   assert(lg != NULL);
 
   // Add nodes with state

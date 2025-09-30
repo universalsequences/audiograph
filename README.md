@@ -361,8 +361,11 @@ int create_custom_delay_node(LiveGraph* lg, float delay_seconds, float feedback_
 ### Using Custom Nodes in Your Graph
 
 ```c
-// Create live graph
-LiveGraph* lg = create_live_graph(16, 128, "custom_graph");
+// Create live graph (mono by default)
+LiveGraph* lg = create_live_graph(16, 128, "custom_graph", 1);
+
+// For stereo output, pass 2 channels:
+// LiveGraph* lg_stereo = create_live_graph(16, 128, "stereo_graph", 2);
 
 // Add built-in nodes
 int osc = live_add_oscillator(lg, 440.0f, "source");
@@ -571,6 +574,113 @@ void process_next_block(LiveGraph *lg, float *output_buffer, int nframes) {
 
 This design ensures that graph modifications never interfere with ongoing audio processing while maintaining deterministic real-time performance.
 
+## Multi-Channel Audio Support
+
+AudioGraph supports flexible multi-channel audio output (mono, stereo, or more channels) with an **interleaved output format** compatible with real-world audio APIs.
+
+### Creating Multi-Channel Graphs
+
+```c
+// Mono (1 channel)
+LiveGraph *lg_mono = create_live_graph(16, 128, "mono_graph", 1);
+
+// Stereo (2 channels)
+LiveGraph *lg_stereo = create_live_graph(16, 128, "stereo_graph", 2);
+
+// Quad (4 channels)
+LiveGraph *lg_quad = create_live_graph(16, 128, "quad_graph", 4);
+```
+
+### DAC Node Behavior
+
+The DAC (Digital-to-Analog Converter) node automatically adapts to the graph's channel count:
+- **Mono**: DAC has 1 input and 1 output
+- **Stereo**: DAC has 2 inputs and 2 outputs
+- **N-Channel**: DAC has N inputs and N outputs
+
+Each channel is an independent signal path through the DAC.
+
+### Stereo Example
+
+```c
+// Create stereo graph
+LiveGraph *lg = create_live_graph(16, 128, "stereo_demo", 2);
+
+// Create separate signal sources for left and right channels
+int left_osc = live_add_oscillator(lg, 440.0f, "left_channel");   // A4
+int right_osc = live_add_oscillator(lg, 554.37f, "right_channel"); // C#5
+
+// Connect to separate DAC channels
+connect(lg, left_osc, 0, lg->dac_node_id, 0);   // Left channel
+connect(lg, right_osc, 0, lg->dac_node_id, 1);  // Right channel
+
+// Output buffer: interleaved stereo format
+int nframes = 128;
+float output[nframes * 2];  // nframes * num_channels
+process_next_block(lg, output, nframes);
+
+// Output format: [L₀, R₀, L₁, R₁, L₂, R₂, ...]
+```
+
+### Output Buffer Format
+
+`process_next_block()` fills the output buffer with **interleaved** channel data:
+
+**Mono** (1 channel):
+```
+[S₀, S₁, S₂, S₃, ...]
+```
+
+**Stereo** (2 channels):
+```
+[L₀, R₀, L₁, R₁, L₂, R₂, ...]
+```
+
+**Quad** (4 channels):
+```
+[C₀₀, C₀₁, C₀₂, C₀₃, C₁₀, C₁₁, C₁₂, C₁₃, ...]
+```
+
+**Buffer Size Calculation**:
+```c
+int buffer_size = nframes * num_channels;
+float *output_buffer = malloc(buffer_size * sizeof(float));
+```
+
+### Unconnected Channels
+
+Channels without connected inputs automatically output silence (0.0f), making it safe to use partial channel configurations.
+
+```c
+// Only connect left channel
+connect(lg, osc, 0, lg->dac_node_id, 0);
+
+// Process: left will have signal, right will be silence
+process_next_block(lg, output, nframes);
+```
+
+### Integration with Audio APIs
+
+The interleaved format is compatible with most audio APIs:
+
+**Core Audio** (macOS/iOS):
+```c
+// AudioBufferList expects interleaved float data for stereo
+process_next_block(lg, ioData->mBuffers[0].mData, inNumberFrames);
+```
+
+**Web Audio API** (via WebAssembly):
+```javascript
+// AudioWorkletProcessor expects separate channel arrays
+// You'll need to de-interleave in JavaScript
+```
+
+**ALSA** (Linux):
+```c
+// ALSA supports interleaved format natively
+snd_pcm_writei(handle, output_buffer, nframes);
+```
+
 ## Usage Example
 
 ### Complete System Example
@@ -584,10 +694,11 @@ This design ensures that graph modifications never interfere with ongoing audio 
 int main() {
     // 1. Initialize the engine
     initialize_engine(128, 48000);  // 128-sample blocks, 48kHz
-    
+
     // 2. Create live graph with initial capacity (grows automatically)
-    LiveGraph *lg = create_live_graph(16, 128, "my_audio_graph");
-    
+    //    Last parameter is channel count: 1=mono, 2=stereo, etc.
+    LiveGraph *lg = create_live_graph(16, 128, "my_audio_graph", 1);
+
     // 3. Start worker threads for parallel processing
     engine_start_workers(4);  // Use 4 worker threads
     

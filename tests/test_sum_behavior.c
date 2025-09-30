@@ -9,7 +9,7 @@ void test_sum_behavior() {
   printf("=== Testing Auto-SUM Audio Behavior ===\n");
   
   const int block_size = 64;
-  LiveGraph *lg = create_live_graph(32, block_size, "sum_behavior_test");
+  LiveGraph *lg = create_live_graph(32, block_size, "sum_behavior_test", 1);
   assert(lg != NULL);
   
   // Create NUMBER nodes that output constant values

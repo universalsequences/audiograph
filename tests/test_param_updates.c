@@ -51,7 +51,7 @@ void test_param_updates() {
     printf("=== Testing Parameter Updates ===\n");
 
     const int block_size = 64;
-    LiveGraph *lg = create_live_graph(16, block_size, "param_update_test");
+    LiveGraph *lg = create_live_graph(16, block_size, "param_update_test", 1);
     assert(lg != NULL);
 
     // 1. Create custom operator that outputs state[0] (initially 0.0)

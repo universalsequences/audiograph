@@ -103,7 +103,7 @@ int main() {
     printf("Expected issue: DAC indegree=0 but N2→DAC edge still active\n\n");
     
     const int block_size = 256;
-    LiveGraph *lg = create_live_graph(32, block_size, "dac_indegree_bug_test");
+    LiveGraph *lg = create_live_graph(32, block_size, "dac_indegree_bug_test", 1);
     if (!lg) {
         printf("❌ Failed to create live graph\n");
         return 1;

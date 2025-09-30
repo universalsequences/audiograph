@@ -368,7 +368,7 @@ static bool ensure_port_arrays(RTNode *n) {
 }
 
 LiveGraph *create_live_graph(int initial_capacity, int block_size,
-                             const char *label) {
+                             const char *label, int num_channels) {
   LiveGraph *lg = calloc(1, sizeof(LiveGraph));
 
   // Node storage
@@ -381,6 +381,7 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   // Edge pool (start with generous capacity)
   lg->edge_capacity = initial_capacity * 4;
   lg->block_size = block_size;
+  lg->num_channels = (num_channels > 0) ? num_channels : 1; // Default to mono
 
   // Initialize Retire List
   lg->retire_capacity = 32;
@@ -452,22 +453,25 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   pthread_rwlock_init(&lg->state_store_lock, NULL);
 
   // Automatically create the DAC node at index 0
-  int dac_id = apply_add_node(lg, DAC_VTABLE, 0, 0, "DAC", 1, 1, NULL);
+  // DAC has one input and one output per channel
+  int dac_id = apply_add_node(lg, DAC_VTABLE, 0, 0, "DAC", lg->num_channels, lg->num_channels, NULL);
   if (dac_id >= 0) {
     lg->dac_node_id = dac_id; // Remember the DAC node
 
     RTNode *dac = &lg->nodes[dac_id];
-    dac->nInputs = 1;  // DAC has 1 input (audio in)
-    dac->nOutputs = 1; // DAC has 1 output (for reading final audio)
+    dac->nInputs = lg->num_channels;  // DAC has N inputs (one per channel)
+    dac->nOutputs = lg->num_channels; // DAC has N outputs (for reading final audio)
     if (!ensure_port_arrays(dac)) {
       // DAC node allocation failed - this is critical
       return NULL;
     }
 
-    // Allocate an output edge for the DAC so we can read the final audio
-    int output_edge = alloc_edge(lg);
-    if (output_edge >= 0) {
-      dac->outEdgeId[0] = output_edge; // Use port-based system
+    // Allocate output edges for each channel of the DAC
+    for (int ch = 0; ch < lg->num_channels; ch++) {
+      int output_edge = alloc_edge(lg);
+      if (output_edge >= 0) {
+        dac->outEdgeId[ch] = output_edge; // Use port-based system
+      }
     }
   }
 
@@ -942,6 +946,133 @@ void update_orphaned_status(LiveGraph *lg) {
   bool *visited = calloc(lg->node_count, sizeof(bool));
   mark_reachable_from_dac(lg, lg->dac_node_id, visited);
   free(visited);
+  
+  // After connectivity changes, recompute indegree from actual inputs to avoid
+  // drift when editing many ports. This ensures scheduling can't deadlock due
+  // to stale indegree values.
+  for (int d = 0; d < lg->node_count; d++) {
+    int uniq = 0;
+    if (lg->nodes[d].inEdgeId && lg->nodes[d].nInputs > 0) {
+      // Track seen predecessors for this destination
+      // Use a simple linear scan (node_count is small in tests)
+      for (int s = 0; s < lg->node_count; s++) {
+        bool uses = false;
+        for (int di = 0; di < lg->nodes[d].nInputs; di++) {
+          int eid = lg->nodes[d].inEdgeId[di];
+          if (eid < 0 || eid >= lg->edge_capacity || !lg->edges[eid].in_use)
+            continue;
+          if (lg->edges[eid].src_node == s) {
+            uses = true;
+            break;
+          }
+        }
+        if (uses)
+          uniq++;
+      }
+    }
+    lg->indegree[d] = uniq;
+  }
+}
+
+// Debugging: print a full health check for the live graph
+static void print_health_check(LiveGraph *lg, const char *phase,
+                               int src_node, int src_port, int dst_node,
+                               int dst_port) {
+  if (!lg)
+    return;
+  printf("\n=== AudioGraph Health Check: %s %d:%d -> %d:%d ===\n", phase,
+         src_node, src_port, dst_node, dst_port);
+  printf("Nodes: %d, Edges(capacity): %d, Block: %d, Channels: %d, DAC: %d\n",
+         lg->node_count, lg->edge_capacity, lg->block_size, lg->num_channels,
+         lg->dac_node_id);
+
+  // DAC summary
+  if (lg->dac_node_id >= 0 && lg->dac_node_id < lg->node_count) {
+    RTNode *dac = &lg->nodes[lg->dac_node_id];
+    printf("DAC inputs: ");
+    for (int ch = 0; ch < dac->nInputs; ch++) {
+      int eid = dac->inEdgeId ? dac->inEdgeId[ch] : -1;
+      if (eid >= 0 && eid < lg->edge_capacity && lg->edges &&
+          lg->edges[eid].in_use) {
+        printf("[%d]=E%d(src=%d:%d,ref=%d) ", ch, eid, lg->edges[eid].src_node,
+               lg->edges[eid].src_port, lg->edges[eid].refcount);
+      } else {
+        printf("[%d]=-1 ", ch);
+      }
+    }
+    printf("\n");
+  }
+
+  // Per-node details
+  for (int i = 0; i < lg->node_count; i++) {
+    RTNode *n = &lg->nodes[i];
+    const char *state = lg->is_orphaned[i] ? "ORPHANED" : "CONNECTED";
+    int indeg = (lg->indegree && i < lg->node_count) ? lg->indegree[i] : -1;
+    printf("Node %d: %s indegree=%d nIn=%d nOut=%d succ=%d\n", i, state, indeg,
+           n->nInputs, n->nOutputs, n->succCount);
+
+    // Inputs
+    if (n->nInputs > 0 && n->inEdgeId) {
+      for (int ip = 0; ip < n->nInputs; ip++) {
+        int eid = n->inEdgeId[ip];
+        if (eid >= 0 && eid < lg->edge_capacity && lg->edges &&
+            lg->edges[eid].in_use) {
+          printf("  in[%d]=E%d(src=%d:%d,ref=%d)\n", ip, eid,
+                 lg->edges[eid].src_node, lg->edges[eid].src_port,
+                 lg->edges[eid].refcount);
+        } else {
+          printf("  in[%d]=-1\n", ip);
+        }
+      }
+    }
+
+    // Outputs and consumers
+    if (n->nOutputs > 0 && n->outEdgeId) {
+      for (int op = 0; op < n->nOutputs; op++) {
+        int eid = n->outEdgeId[op];
+        if (eid >= 0 && eid < lg->edge_capacity && lg->edges &&
+            lg->edges[eid].in_use) {
+          printf("  out[%d]=E%d(ref=%d) -> ", op, eid, lg->edges[eid].refcount);
+          // Find consumers of this edge
+          int printed = 0;
+          for (int dn = 0; dn < lg->node_count; dn++) {
+            RTNode *dst = &lg->nodes[dn];
+            if (!dst->inEdgeId || dst->nInputs <= 0)
+              continue;
+            for (int dp = 0; dp < dst->nInputs; dp++) {
+              if (dst->inEdgeId[dp] == eid) {
+                printf("%s%d:%d", printed ? "," : "", dn, dp);
+                printed++;
+              }
+            }
+          }
+          if (printed == 0)
+            printf("(no consumers)");
+          printf("\n");
+        } else {
+          printf("  out[%d]=-1\n", op);
+        }
+      }
+    }
+  }
+
+  // Edge pool summary
+  if (lg->edges && lg->edge_capacity > 0) {
+    printf("Edges in use: ");
+    int any = 0;
+    for (int e = 0; e < lg->edge_capacity; e++) {
+      if (lg->edges[e].in_use) {
+        printf("E%d(src=%d:%d,ref=%d) ", e, lg->edges[e].src_node,
+               lg->edges[e].src_port, lg->edges[e].refcount);
+        any = 1;
+      }
+    }
+    if (!any)
+      printf("(none)");
+    printf("\n");
+  }
+
+  printf("=== End Health Check ===\n\n");
 }
 
 /**
@@ -1155,6 +1286,10 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       dst_port >= D->nInputs) {
     return false;
   }
+
+  // Health check before we mutate any connections
+  print_health_check(lg, "before disconnect", src_node, src_port, dst_node,
+                     dst_port);
 
   if (!D->inEdgeId || !S->outEdgeId)
     return false;
@@ -1415,6 +1550,101 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
 
   // Update orphaned status based on DAC reachability
   update_orphaned_status(lg);
+
+  // ========== HEALTH CHECK LOGGING (after successful disconnect) ==========
+    printf("\n=== AudioGraph Health Check: after disconnect %d:%d -> %d:%d ===\n",
+           src_node, src_port, dst_node, dst_port);
+    printf("Nodes: %d, Edges(capacity): %d, Block: %d, Channels: %d, DAC: %d\n",
+           lg->node_count, lg->edge_capacity, lg->block_size, lg->num_channels,
+           lg->dac_node_id);
+
+    // DAC summary
+    if (lg->dac_node_id >= 0 && lg->dac_node_id < lg->node_count) {
+      RTNode *dac = &lg->nodes[lg->dac_node_id];
+      printf("DAC inputs: ");
+      for (int ch = 0; ch < dac->nInputs; ch++) {
+        int eid = dac->inEdgeId ? dac->inEdgeId[ch] : -1;
+        if (eid >= 0 && eid < lg->edge_capacity && lg->edges &&
+            lg->edges[eid].in_use) {
+          printf("[%d]=E%d(src=%d:%d,ref=%d) ", ch, eid, lg->edges[eid].src_node,
+                 lg->edges[eid].src_port, lg->edges[eid].refcount);
+        } else {
+          printf("[%d]=-1 ", ch);
+        }
+      }
+      printf("\n");
+    }
+
+    // Per-node details
+    for (int i = 0; i < lg->node_count; i++) {
+      RTNode *n = &lg->nodes[i];
+      const char *state = lg->is_orphaned[i] ? "ORPHANED" : "CONNECTED";
+      int indeg = (lg->indegree && i < lg->node_count) ? lg->indegree[i] : -1;
+      printf("Node %d: %s indegree=%d nIn=%d nOut=%d succ=%d\n", i, state,
+             indeg, n->nInputs, n->nOutputs, n->succCount);
+
+      // Inputs
+      if (n->nInputs > 0 && n->inEdgeId) {
+        for (int ip = 0; ip < n->nInputs; ip++) {
+          int eid = n->inEdgeId[ip];
+          if (eid >= 0 && eid < lg->edge_capacity && lg->edges &&
+              lg->edges[eid].in_use) {
+            printf("  in[%d]=E%d(src=%d:%d,ref=%d)\n", ip, eid,
+                   lg->edges[eid].src_node, lg->edges[eid].src_port,
+                   lg->edges[eid].refcount);
+          } else {
+            printf("  in[%d]=-1\n", ip);
+          }
+        }
+      }
+
+      // Outputs and consumers
+      if (n->nOutputs > 0 && n->outEdgeId) {
+        for (int op = 0; op < n->nOutputs; op++) {
+          int eid = n->outEdgeId[op];
+          if (eid >= 0 && eid < lg->edge_capacity && lg->edges &&
+              lg->edges[eid].in_use) {
+            printf("  out[%d]=E%d(ref=%d) -> ", op, eid, lg->edges[eid].refcount);
+            // Find consumers of this edge
+            int printed = 0;
+            for (int dn = 0; dn < lg->node_count; dn++) {
+              RTNode *dst = &lg->nodes[dn];
+              if (!dst->inEdgeId || dst->nInputs <= 0)
+                continue;
+              for (int dp = 0; dp < dst->nInputs; dp++) {
+                if (dst->inEdgeId[dp] == eid) {
+                  printf("%s%d:%d", printed ? "," : "", dn, dp);
+                  printed++;
+                }
+              }
+            }
+            if (printed == 0)
+              printf("(no consumers)");
+            printf("\n");
+          } else {
+            printf("  out[%d]=-1\n", op);
+          }
+        }
+      }
+    }
+
+    // Edge pool summary
+    if (lg->edges && lg->edge_capacity > 0) {
+      printf("Edges in use: ");
+      int any = 0;
+      for (int e = 0; e < lg->edge_capacity; e++) {
+        if (lg->edges[e].in_use) {
+          printf("E%d(src=%d:%d,ref=%d) ", e, lg->edges[e].src_node,
+                 lg->edges[e].src_port, lg->edges[e].refcount);
+          any = 1;
+        }
+      }
+      if (!any)
+        printf("(none)");
+      printf("\n");
+    }
+
+    printf("=== End Health Check ===\n\n");
 
   return true;
 }
@@ -1759,7 +1989,7 @@ void process_next_block(LiveGraph *lg, float *output_buffer, int nframes) {
   if (!lg || !output_buffer || nframes <= 0) {
     // Clear output buffer if invalid input
     if (output_buffer && nframes > 0) {
-      memset(output_buffer, 0, nframes * sizeof(float));
+      memset(output_buffer, 0, nframes * lg->num_channels * sizeof(float));
     }
     return;
   }
@@ -1768,19 +1998,39 @@ void process_next_block(LiveGraph *lg, float *output_buffer, int nframes) {
   apply_params(lg);
   process_live_block(lg, nframes);
 
+  // Get the DAC node (final output)
   int output_node = find_live_output(lg);
-  float *src = NULL;
+
   if (output_node >= 0 && lg->nodes[output_node].nInputs > 0) {
-    int master_edge_id = lg->nodes[output_node].inEdgeId[0];
-    if (master_edge_id >= 0 && master_edge_id < lg->edge_capacity) {
-      src = lg->edges[master_edge_id].buf;
+    RTNode *dac = &lg->nodes[output_node];
+
+    // Copy each channel from DAC inputs to interleaved output buffer
+    for (int ch = 0; ch < lg->num_channels; ch++) {
+      float *src = NULL;
+
+      // Get the input edge for this channel
+      if (ch < dac->nInputs) {
+        int edge_id = dac->inEdgeId[ch];
+        if (edge_id >= 0 && edge_id < lg->edge_capacity) {
+          src = lg->edges[edge_id].buf;
+        }
+      }
+
+      // Interleave this channel into the output buffer
+      if (src) {
+        for (int i = 0; i < nframes; i++) {
+          output_buffer[i * lg->num_channels + ch] = src[i];
+        }
+      } else {
+        // If no source, output silence for this channel
+        for (int i = 0; i < nframes; i++) {
+          output_buffer[i * lg->num_channels + ch] = 0.0f;
+        }
+      }
     }
-  }
-  if (!src) {
-    // handle case where theres no output node (silence)
-    memset(output_buffer, 0, nframes * sizeof(float));
   } else {
-    memcpy(output_buffer, src, nframes * sizeof(float));
+    // No output node - silence
+    memset(output_buffer, 0, nframes * lg->num_channels * sizeof(float));
   }
 
   // Update watched node states after processing

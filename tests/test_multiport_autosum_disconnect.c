@@ -10,7 +10,7 @@ int main() {
   printf("=== Testing Multi-Port Auto-Sum Disconnection ===\n");
   
   // Create a live graph
-  LiveGraph *lg = create_live_graph(16, 128, "test_multiport_autosum");
+  LiveGraph *lg = create_live_graph(16, 128, "test_multiport_autosum", 1);
   assert(lg);
 
   // Add DAC manually (normally done by system)

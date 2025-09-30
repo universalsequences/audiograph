@@ -20,7 +20,7 @@ int main() {
     printf("Expected DAC: 3.000, Fuzz test got: 0.000\n\n");
     
     const int block_size = 256;
-    LiveGraph *lg = create_live_graph(32, block_size, "bug_reproduction");
+    LiveGraph *lg = create_live_graph(32, block_size, "bug_reproduction", 1);
     assert(lg != NULL);
     
     // Create the same 4-node topology

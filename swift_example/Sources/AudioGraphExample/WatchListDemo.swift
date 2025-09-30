@@ -14,7 +14,7 @@ class WatchListDemo {
         engine_start_workers(2)
         
         // Create a live graph for real-time audio processing
-        liveGraph = create_live_graph(16, 128, "SwiftWatchListDemo")
+        liveGraph = create_live_graph(16, 128, "SwiftWatchListDemo", 1)
     }
     
     deinit {

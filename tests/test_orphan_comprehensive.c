@@ -52,7 +52,7 @@ static void print_all_nodes(LiveGraph *lg, const char *scenario) {
 static bool test_basic_connectivity(void) {
   printf("\n=== Test 1: Basic Connectivity ===\n");
 
-  LiveGraph *lg = create_live_graph(10, 128, "basic_test");
+  LiveGraph *lg = create_live_graph(10, 128, "basic_test", 1);
 
   // Create: osc1 -> gain -> DAC, osc2 (orphaned)
   int osc1 = live_add_oscillator(lg, 440.0, "osc1");
@@ -83,7 +83,7 @@ static bool test_basic_connectivity(void) {
 static bool test_no_dac(void) {
   printf("\n=== Test 2: No DAC ===\n");
 
-  LiveGraph *lg = create_live_graph(10, 128, "no_dac_test");
+  LiveGraph *lg = create_live_graph(10, 128, "no_dac_test", 1);
 
   int osc = live_add_oscillator(lg, 440.0, "osc");
   int gain = live_add_gain(lg, 0.5, "gain");
@@ -124,7 +124,7 @@ static bool test_no_dac(void) {
 static bool test_diamond_topology(void) {
   printf("\n=== Test 3: Diamond Topology ===\n");
 
-  LiveGraph *lg = create_live_graph(10, 128, "diamond_test");
+  LiveGraph *lg = create_live_graph(10, 128, "diamond_test", 1);
 
   // osc -> splits to gain1 & gain2 -> both feed mixer -> DAC
   int osc = live_add_oscillator(lg, 440.0, "osc");
@@ -158,7 +158,7 @@ static bool test_diamond_topology(void) {
 static bool test_disconnection(void) {
   printf("\n=== Test 4: Disconnection ===\n");
 
-  LiveGraph *lg = create_live_graph(10, 128, "disconnect_test");
+  LiveGraph *lg = create_live_graph(10, 128, "disconnect_test", 1);
 
   int osc = live_add_oscillator(lg, 440.0, "osc");
   int gain = live_add_gain(lg, 0.5, "gain");
@@ -216,7 +216,7 @@ static bool test_disconnection(void) {
 static bool test_fan_out(void) {
   printf("\n=== Test 5: Fan-out ===\n");
 
-  LiveGraph *lg = create_live_graph(10, 128, "fanout_test");
+  LiveGraph *lg = create_live_graph(10, 128, "fanout_test", 1);
 
   // osc feeds 3 gains, but only 2 gains connect to mixer
   int osc = live_add_oscillator(lg, 440.0, "osc");
@@ -256,7 +256,7 @@ static bool test_fan_out(void) {
 static bool test_performance(void) {
   printf("\n=== Performance Test ===\n");
 
-  LiveGraph *lg = create_live_graph(20, 128, "perf_test");
+  LiveGraph *lg = create_live_graph(20, 128, "perf_test", 1);
 
   // Create larger graph
   int nodes[10];

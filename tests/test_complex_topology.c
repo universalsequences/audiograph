@@ -63,7 +63,7 @@ void test_complex_topology() {
 
   // Initialize graph
   const int block_size = 256;
-  LiveGraph *lg = create_live_graph(32, block_size, "complex_topology_test");
+  LiveGraph *lg = create_live_graph(32, block_size, "complex_topology_test", 1);
   assert(lg != NULL);
 
   printf("=== Phase 1: Creating Nodes (No Connections) ===\n");

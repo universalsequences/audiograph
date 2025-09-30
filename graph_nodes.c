@@ -101,10 +101,18 @@ void mix8_process(float *const *in, float *const *out, int n, void *memory) {
 void dac_process(float *const *in, float *const *out, int n, void *memory) {
   (void)memory; // DAC has no state
 
-  // DAC is a pass-through - copy input to output so we can read the final audio
-  if (in && out && in[0] && out[0]) {
-    for (int i = 0; i < n; i++) {
-      out[0][i] = in[0][i]; // Pass input directly to output
+  // DAC is a pass-through - copy all input channels to output channels
+  // Number of channels is determined by the node's port configuration
+  if (in && out) {
+    // Get the number of inputs from the current processing context
+    int num_channels = ap_current_node_ninputs();
+
+    for (int ch = 0; ch < num_channels; ch++) {
+      if (in[ch] && out[ch]) {
+        for (int i = 0; i < n; i++) {
+          out[ch][i] = in[ch][i]; // Pass each channel through
+        }
+      }
     }
   }
 }

@@ -7,7 +7,7 @@ int main() {
   printf("=== Capacity Growth Test ===\n");
   
   // Create a small graph that will need to grow
-  LiveGraph *lg = create_live_graph(4, 128, "growth_test");
+  LiveGraph *lg = create_live_graph(4, 128, "growth_test", 1);
   printf("Initial capacity: %d nodes\n", lg->node_capacity);
   
   // Add 3 nodes within capacity first (DAC is at index 0, so we have room for indexes 1,2,3)

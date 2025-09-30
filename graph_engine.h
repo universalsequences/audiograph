@@ -101,6 +101,7 @@ typedef struct LiveGraph {
 
   // DAC output sink - the final destination for all audio
   int dac_node_id; // -1 if no DAC connected
+  int num_channels; // Number of output channels (1=mono, 2=stereo, etc.)
 
   const char *label;
 
@@ -164,7 +165,7 @@ void apply_params(LiveGraph *g);
 // ===================== Live Graph Operations =====================
 
 LiveGraph *create_live_graph(int initial_capacity, int block_size,
-                             const char *label);
+                             const char *label, int num_channels);
 void destroy_live_graph(LiveGraph *lg);
 int apply_add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
                    uint64_t logical_id, const char *name, int nInputs,

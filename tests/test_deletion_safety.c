@@ -44,7 +44,7 @@ int main() {
   memset(&g_test_state, 0, sizeof(g_test_state));
   
   // Create a test graph
-  g_test_state.lg = create_live_graph(20, 128, "deletion_safety_test");
+  g_test_state.lg = create_live_graph(20, 128, "deletion_safety_test", 1);
   assert(g_test_state.lg != NULL);
   
   printf("✓ LiveGraph created with auto-DAC (ID: %d)\n", g_test_state.lg->dac_node_id);

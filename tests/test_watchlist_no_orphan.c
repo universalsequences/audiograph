@@ -8,7 +8,7 @@ int main() {
   printf("Testing that watched nodes are never orphaned...\n\n");
 
   // Create a graph
-  LiveGraph *lg = create_live_graph(16, 128, "watchlist_no_orphan_test");
+  LiveGraph *lg = create_live_graph(16, 128, "watchlist_no_orphan_test", 1);
   assert(lg != NULL);
 
   // Create nodes: oscillator -> gain (not connected to DAC)

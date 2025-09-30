@@ -177,7 +177,7 @@ int main() {
     
     // Setup identical to fuzz test
     const int block_size = 256;
-    lg = create_live_graph(32, block_size, "exact_bug_reproduction");
+    lg = create_live_graph(32, block_size, "exact_bug_reproduction", 1);
     assert(lg != NULL);
     
     printf("🏗️  Creating exact 4-node topology from fuzz test...\n");

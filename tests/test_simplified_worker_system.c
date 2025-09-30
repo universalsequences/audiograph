@@ -32,7 +32,7 @@ static LiveGraph* create_test_graph(void) {
     initialize_engine(TEST_BLOCK_SIZE, TEST_SAMPLE_RATE);
     
     // Create live graph with moderate complexity
-    LiveGraph *lg = create_live_graph(64, TEST_BLOCK_SIZE, "SimplifiedWorkerTest");
+    LiveGraph *lg = create_live_graph(64, TEST_BLOCK_SIZE, "SimplifiedWorkerTest", 1);
     if (!lg) {
         printf("Failed to create live graph\n");
         return NULL;

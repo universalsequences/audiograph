@@ -9,7 +9,7 @@ int main() {
   printf("Testing dynamic graph editing via queue-based commands\n\n");
 
   // Create a live graph
-  LiveGraph *lg = create_live_graph(10, 128, "edit_queue_test");
+  LiveGraph *lg = create_live_graph(10, 128, "edit_queue_test", 1);
   assert(lg != NULL);
   assert(lg->graphEditQueue != NULL);
 

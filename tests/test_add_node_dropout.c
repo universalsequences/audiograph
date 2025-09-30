@@ -12,7 +12,7 @@ int main() {
     printf("==============================================================================\n");
 
     // Create live graph
-    LiveGraph *lg = create_live_graph(16, 256, "test_graph");
+    LiveGraph *lg = create_live_graph(16, 256, "test_graph", 1);
     if (!lg) {
         printf("❌ Failed to create live graph\n");
         return 1;

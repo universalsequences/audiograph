@@ -7,7 +7,7 @@ int main() {
   printf("Testing watchlist functionality...\n");
 
   // Create a graph
-  LiveGraph *lg = create_live_graph(32, 128, "watchlist_test");
+  LiveGraph *lg = create_live_graph(32, 128, "watchlist_test", 1);
   assert(lg != NULL);
 
   // Create multiple nodes with different characteristics

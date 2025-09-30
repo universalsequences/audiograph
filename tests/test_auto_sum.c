@@ -6,7 +6,7 @@
 void test_auto_sum() {
   printf("=== Testing Auto-SUM Feature ===\n");
   
-  LiveGraph *lg = create_live_graph(32, 64, "auto_sum_test");
+  LiveGraph *lg = create_live_graph(32, 64, "auto_sum_test", 1);
   assert(lg != NULL);
   
   // Create test nodes: 3 oscillators and 1 gain

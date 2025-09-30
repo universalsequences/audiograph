@@ -112,7 +112,7 @@ int main() {
     
     // Initialize graph
     const int block_size = 256;
-    LiveGraph *lg = create_live_graph(32, block_size, "4_node_topology_test");
+    LiveGraph *lg = create_live_graph(32, block_size, "4_node_topology_test", 1);
     assert(lg != NULL);
     
     printf("\n=== Adding Nodes ===\n");

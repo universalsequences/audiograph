@@ -53,7 +53,7 @@ int main() {
     printf("Testing watchlist with custom recorder node...\n");
 
     // Create a graph
-    LiveGraph *lg = create_live_graph(16, 128, "validation_test");
+    LiveGraph *lg = create_live_graph(16, 128, "validation_test", 1);
     assert(lg != NULL);
 
     // Add a number node that outputs a constant value

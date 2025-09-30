@@ -10,6 +10,7 @@
 // - Hot-swappable node replacement for seamless audio updates
 // - Thread-safe parameter updates during processing
 // - Watch list system for real-time node state monitoring
+// - Multi-channel audio support (mono, stereo, or more channels)
 
 #include "graph_api.h"
 #include "graph_edit.h"
@@ -29,8 +30,23 @@ void engine_stop_workers(void);
 // ===================== Live Graph Management =====================
 
 // Create and destroy live graphs
+//
+// Parameters:
+//   initial_capacity: Initial node capacity (grows automatically)
+//   block_size: Audio block size in frames
+//   label: Debug label for the graph
+//   num_channels: Number of output channels (1=mono, 2=stereo, etc.)
+//
+// The output buffer for process_next_block() should be sized:
+//   buffer_size = nframes * num_channels (interleaved format)
+//
+// Example for stereo:
+//   LiveGraph *lg = create_live_graph(16, 128, "stereo_graph", 2);
+//   float output[128 * 2];  // 128 frames * 2 channels
+//   process_next_block(lg, output, 128);
+//   // Output format: [L₀, R₀, L₁, R₁, L₂, R₂, ...]
 LiveGraph *create_live_graph(int initial_capacity, int block_size,
-                             const char *label);
+                             const char *label, int num_channels);
 void destroy_live_graph(LiveGraph *lg);
 
 // ===================== Node Management =====================
@@ -77,6 +93,19 @@ bool replace_keep_edges(LiveGraph *lg, int node_id, NodeVTable vt,
 // ===================== Real-time Audio Processing =====================
 
 // Process one audio block (thread-safe, real-time safe)
+//
+// Parameters:
+//   lg: LiveGraph instance
+//   output_buffer: Output buffer for interleaved multi-channel audio
+//                  Size must be: nframes * num_channels
+//   nframes: Number of frames to process
+//
+// Output format is interleaved:
+//   Mono:   [S₀, S₁, S₂, ...]
+//   Stereo: [L₀, R₀, L₁, R₁, L₂, R₂, ...]
+//   Quad:   [C₀₀, C₀₁, C₀₂, C₀₃, C₁₀, C₁₁, ...]
+//
+// Unconnected channels output silence (0.0f)
 void process_next_block(LiveGraph *lg, float *output_buffer, int nframes);
 
 // ===================== Parameter Updates =====================

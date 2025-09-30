@@ -11,7 +11,7 @@ void test_hot_swap_basic() {
   printf("=== Testing Basic Hot Swap ===\n");
 
   const int block_size = 64;
-  LiveGraph *lg = create_live_graph(32, block_size, "hot_swap_test");
+  LiveGraph *lg = create_live_graph(32, block_size, "hot_swap_test", 1);
   assert(lg != NULL);
 
   // Create a number node that outputs 10.0
@@ -75,7 +75,7 @@ void test_hot_swap_bounds_checking() {
   printf("=== Testing Hot Swap Bounds Checking ===\n");
 
   const int block_size = 64;
-  LiveGraph *lg = create_live_graph(8, block_size, "bounds_test");
+  LiveGraph *lg = create_live_graph(8, block_size, "bounds_test", 1);
   assert(lg != NULL);
 
   // Create some valid nodes first
@@ -128,7 +128,7 @@ void test_replace_keep_edges_basic() {
   printf("=== Testing Replace Keep Edges Basic ===\n");
 
   const int block_size = 64;
-  LiveGraph *lg = create_live_graph(32, block_size, "replace_edges_test");
+  LiveGraph *lg = create_live_graph(32, block_size, "replace_edges_test", 1);
   assert(lg != NULL);
 
   // Create nodes: num1 -> gain -> output
@@ -191,7 +191,7 @@ void test_replace_keep_edges_port_shrinking() {
   printf("=== Testing Replace Keep Edges with Port Shrinking ===\n");
 
   const int block_size = 64;
-  LiveGraph *lg = create_live_graph(32, block_size, "port_shrink_test");
+  LiveGraph *lg = create_live_graph(32, block_size, "port_shrink_test", 1);
   assert(lg != NULL);
 
   // Create multiple number nodes and a gain node
@@ -270,7 +270,7 @@ void test_hot_swap_stress() {
   printf("=== Testing Hot Swap Stress Test ===\n");
 
   const int block_size = 64;
-  LiveGraph *lg = create_live_graph(32, block_size, "stress_test");
+  LiveGraph *lg = create_live_graph(32, block_size, "stress_test", 1);
   assert(lg != NULL);
 
   // Create a chain of gain nodes
@@ -347,7 +347,7 @@ void test_retire_drain_system() {
   printf("=== Testing Retire/Drain System for Memory Safety ===\n");
 
   const int block_size = 64;
-  LiveGraph *lg = create_live_graph(32, block_size, "retire_test");
+  LiveGraph *lg = create_live_graph(32, block_size, "retire_test", 1);
   assert(lg != NULL);
 
   // Create a NUMBER node that we'll hot swap multiple times

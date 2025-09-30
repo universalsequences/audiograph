@@ -336,8 +336,9 @@ class AudioGraphManager {
     private func setupAudioGraph() {
         // Initialize engine with matching sample rate
         initialize_engine(blockSize, 44100)
-        
-        guard let lg = create_live_graph(32, blockSize, "swift_av_graph") else {
+
+        // Create mono graph (use 2 for native stereo support)
+        guard let lg = create_live_graph(32, blockSize, "swift_av_graph", 1) else {
             print("✗ Failed to create live graph")
             return
         }
@@ -554,9 +555,9 @@ class AudioGraphManager {
     init() {
         // Initialize the engine once
         initialize_engine(blockSize, sampleRate)
-        
-        // Create live graph
-        liveGraph = create_live_graph(16, blockSize, "swift_graph")
+
+        // Create live graph (mono = 1 channel, stereo = 2 channels)
+        liveGraph = create_live_graph(16, blockSize, "swift_graph", 1)
         
         // Start worker threads
         engine_start_workers(4)
@@ -621,6 +622,109 @@ class AudioGraphManager {
         // This might require a helper function in C
         _ = params_push(graph.pointee.params, paramMsg)
     }
+}
+```
+
+## Multi-Channel Audio Support
+
+AudioGraph supports flexible channel configurations (mono, stereo, or more channels) with interleaved output format.
+
+### Stereo Example
+
+```swift
+import AudioGraph
+
+class StereoAudioGraphManager {
+    private var liveGraph: OpaquePointer?
+    private let blockSize: Int32 = 128
+
+    init() {
+        initialize_engine(blockSize, 48000)
+
+        // Create stereo graph (2 channels)
+        liveGraph = create_live_graph(16, blockSize, "stereo_graph", 2)
+
+        guard let lg = liveGraph else { return }
+
+        // Create separate oscillators for left and right channels
+        let leftOsc = live_add_oscillator(lg, 440.0, "left_osc")   // A4
+        let rightOsc = live_add_oscillator(lg, 554.37, "right_osc") // C#5
+
+        // Connect to separate DAC channels
+        _ = connect(lg, leftOsc, 0, lg.pointee.dac_node_id, 0)  // Left
+        _ = connect(lg, rightOsc, 0, lg.pointee.dac_node_id, 1) // Right
+    }
+
+    func processAudioBlock() -> [Float] {
+        guard let lg = liveGraph else { return [] }
+
+        // Buffer size = nframes * num_channels for interleaved stereo
+        var outputBuffer = [Float](repeating: 0.0, count: Int(blockSize) * 2)
+
+        outputBuffer.withUnsafeMutableBufferPointer { bufferPtr in
+            process_next_block(lg, bufferPtr.baseAddress!, blockSize)
+        }
+
+        // Output is interleaved: [L₀, R₀, L₁, R₁, L₂, R₂, ...]
+        return outputBuffer
+    }
+
+    deinit {
+        if let lg = liveGraph {
+            destroy_live_graph(lg)
+        }
+    }
+}
+```
+
+### Channel Configuration
+
+```swift
+// Mono (1 channel) - output buffer size = nframes
+let monoGraph = create_live_graph(16, 128, "mono", 1)
+
+// Stereo (2 channels) - output buffer size = nframes * 2
+let stereoGraph = create_live_graph(16, 128, "stereo", 2)
+
+// Quad (4 channels) - output buffer size = nframes * 4
+let quadGraph = create_live_graph(16, 128, "quad", 4)
+```
+
+### Using Stereo Output with AVAudioEngine
+
+```swift
+func setupStereoAudio() {
+    let audioEngine = AVAudioEngine()
+    let outputNode = audioEngine.outputNode
+    let format = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 2)!
+
+    let sourceNode = AVAudioSourceNode(format: format) { _, _, frameCount, audioBufferList -> OSStatus in
+        guard let lg = self.liveGraph else { return noErr }
+
+        // Get interleaved stereo data from audiograph
+        var interleavedBuffer = [Float](repeating: 0.0, count: Int(frameCount) * 2)
+        interleavedBuffer.withUnsafeMutableBufferPointer { bufferPtr in
+            process_next_block(lg, bufferPtr.baseAddress!, Int32(frameCount))
+        }
+
+        // De-interleave into separate L/R channel buffers for AVAudioEngine
+        let ablPointer = UnsafeMutableAudioBufferListPointer(audioBufferList)
+        guard let leftBuffer = ablPointer[0].mData?.assumingMemoryBound(to: Float.self),
+              let rightBuffer = ablPointer[1].mData?.assumingMemoryBound(to: Float.self) else {
+            return noErr
+        }
+
+        for i in 0..<Int(frameCount) {
+            leftBuffer[i] = interleavedBuffer[i * 2 + 0]     // Left channel
+            rightBuffer[i] = interleavedBuffer[i * 2 + 1]    // Right channel
+        }
+
+        return noErr
+    }
+
+    audioEngine.attach(sourceNode)
+    audioEngine.connect(sourceNode, to: outputNode, format: format)
+    try? audioEngine.start()
 }
 ```
 

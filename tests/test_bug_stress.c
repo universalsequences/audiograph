@@ -108,7 +108,7 @@ static int g_node1_id, g_node2_id, g_node3_id, g_node4_id;
 static void initialize_reusable_graph() {
     if (g_reused_graph) return; // Already initialized
     
-    g_reused_graph = create_live_graph(32, 256, "reused_stress_test");
+    g_reused_graph = create_live_graph(32, 256, "reused_stress_test", 1);
     assert(g_reused_graph != NULL);
     
     // Create nodes once and reuse them
@@ -235,7 +235,7 @@ static bool run_different_sequences(int iteration) {
     
     int seq_index = iteration % 4;
     
-    LiveGraph *lg = create_live_graph(32, 256, "different_sequences");
+    LiveGraph *lg = create_live_graph(32, 256, "different_sequences", 1);
     assert(lg != NULL);
     
     // Create nodes

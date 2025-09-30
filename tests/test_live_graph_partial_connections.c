@@ -70,7 +70,7 @@ bool create_partial_connections_graph() {
          NUM_OSCILLATORS, NUM_CONNECTED);
 
   g_partial_test.live_graph =
-      create_live_graph(32, BLOCK_SIZE, "partial_test_graph");
+      create_live_graph(32, BLOCK_SIZE, "partial_test_graph", 1);
   if (!g_partial_test.live_graph) {
     printf("ERROR: Failed to create live graph\n");
     return false;

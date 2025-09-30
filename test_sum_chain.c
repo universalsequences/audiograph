@@ -10,7 +10,7 @@ int main() {
   printf("=== Testing SUM→SUM Chain Scenario ===\n");
 
   initialize_engine(64, 48000);
-  LiveGraph *lg = create_live_graph(16, 128, "sum_chain_test");
+  LiveGraph *lg = create_live_graph(16, 128, "sum_chain_test", 1);
   assert(lg);
 
   // Create multiple NUMBER nodes

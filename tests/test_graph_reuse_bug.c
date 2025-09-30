@@ -187,7 +187,7 @@ int main() {
     printf("to reproduce the cumulative state corruption that causes the bug.\n\n");
     
     const int block_size = 256;
-    lg = create_live_graph(32, block_size, "graph_reuse_bug_test");
+    lg = create_live_graph(32, block_size, "graph_reuse_bug_test", 1);
     if (!lg) {
         printf("❌ Failed to create live graph\n");
         return 1;

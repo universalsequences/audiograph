@@ -77,7 +77,7 @@ void test_multi_port_routing() {
     printf("=== Testing Multi-Port Routing (2-out -> 2-in) ===\n");
     
     const int block_size = 64;
-    LiveGraph *lg = create_live_graph(16, block_size, "multi_port_test");
+    LiveGraph *lg = create_live_graph(16, block_size, "multi_port_test", 1);
     assert(lg != NULL);
     
     // Step 1: Create the dual-output node (Node 1)
@@ -229,7 +229,7 @@ void test_workaround_with_intermediate_nodes() {
     printf("=== Testing Workaround: Intermediate Nodes ===\n");
     
     const int block_size = 64;
-    LiveGraph *lg = create_live_graph(16, block_size, "workaround_test");
+    LiveGraph *lg = create_live_graph(16, block_size, "workaround_test", 1);
     assert(lg != NULL);
     
     // Create the same dual-output source node
