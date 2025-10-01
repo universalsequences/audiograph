@@ -141,7 +141,11 @@ static void *worker_main(void *arg) {
         continue;
       }
 
-      execute_and_fanout(lg, nid, g_engine.blockSize);
+      int nf = atomic_load_explicit(&g_engine.sessionFrames, memory_order_acquire);
+      if (nf <= 0) {
+        nf = g_engine.blockSize; // Fallback to engine default
+      }
+      execute_and_fanout(lg, nid, nf);
     }
 
     // Loop back: will go to sleep on sess_cv until next block
@@ -1946,7 +1950,8 @@ void process_live_block(LiveGraph *lg, int nframes) {
     return;
 
   if (g_engine.workerCount > 0) {
-    // Publish session & wake workers
+    // Publish session frames and graph, then wake workers
+    atomic_store_explicit(&g_engine.sessionFrames, nframes, memory_order_release);
     atomic_store_explicit(&g_engine.workSession, lg, memory_order_release);
 
     pthread_mutex_lock(&g_engine.sess_mtx);

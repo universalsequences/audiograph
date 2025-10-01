@@ -141,6 +141,7 @@ typedef struct Engine {
   _Atomic int runFlag; // 1 = running, 0 = shutdown
 
   _Atomic(LiveGraph *) workSession; // published at block start, NULL after
+  _Atomic int sessionFrames;        // number of frames for current block
 
   // Block-start wake mechanism
   pthread_mutex_t sess_mtx; // protects sess_cv wait/signal
