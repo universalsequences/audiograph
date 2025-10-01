@@ -292,16 +292,18 @@ typedef struct GraphEditQueue {
 // macOS doesn't support POSIX unnamed semaphores, use dispatch_semaphore
 // instead
 typedef struct {
-  MPMCQueue *ring;  // Existing MPMC queue for thread-safe node storage
-  _Atomic int qlen; // Logical queue length for counting
-  dispatch_semaphore_t items; // dispatch_semaphore for 0→1 wake optimization
+  MPMCQueue *ring;                // Thread-safe node storage
+  _Atomic int qlen;               // Logical queue length
+  _Atomic int waiters;            // Number of threads waiting on items
+  dispatch_semaphore_t items;     // Semaphore used for wakeups
 } ReadyQ;
 #else
 #include <semaphore.h>
 typedef struct {
-  MPMCQueue *ring;  // Existing MPMC queue for thread-safe node storage
-  _Atomic int qlen; // Logical queue length for counting
-  sem_t items;      // Semaphore for 0→1 wake optimization
+  MPMCQueue *ring;   // Thread-safe node storage
+  _Atomic int qlen;  // Logical queue length
+  _Atomic int waiters; // Number of threads waiting on items
+  sem_t items;       // Semaphore used for wakeups
 } ReadyQ;
 #endif
 

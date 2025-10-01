@@ -2356,19 +2356,22 @@ static void update_watched_node_states(LiveGraph *lg) {
       continue; // No state to copy
     }
     
-    // Free existing snapshot if it exists
-    if (lg->state_snapshots[node_id]) {
-      free(lg->state_snapshots[node_id]);
-      lg->state_snapshots[node_id] = NULL;
-      lg->state_sizes[node_id] = 0;
-    }
-    
-    // Allocate new snapshot
-    void *snapshot = malloc(node->state_size);
-    if (snapshot) {
-      memcpy(snapshot, node->state, node->state_size);
-      lg->state_snapshots[node_id] = snapshot;
-      lg->state_sizes[node_id] = node->state_size;
+    // Reuse existing snapshot buffer if size matches; avoid per-block malloc/free
+    if (lg->state_snapshots[node_id] && lg->state_sizes[node_id] == node->state_size) {
+      memcpy(lg->state_snapshots[node_id], node->state, node->state_size);
+    } else {
+      // Size changed or no buffer yet; (re)allocate
+      if (lg->state_snapshots[node_id]) {
+        free(lg->state_snapshots[node_id]);
+        lg->state_snapshots[node_id] = NULL;
+        lg->state_sizes[node_id] = 0;
+      }
+      void *snapshot = malloc(node->state_size);
+      if (snapshot) {
+        memcpy(snapshot, node->state, node->state_size);
+        lg->state_snapshots[node_id] = snapshot;
+        lg->state_sizes[node_id] = node->state_size;
+      }
     }
   }
   

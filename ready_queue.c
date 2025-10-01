@@ -19,6 +19,8 @@ ReadyQ *rq_create(int capacity) {
 
   // Initialize logical length counter
   atomic_store_explicit(&q->qlen, 0, memory_order_relaxed);
+  // Initialize waiter count
+  atomic_store_explicit(&q->waiters, 0, memory_order_relaxed);
 
   // Initialize semaphore (starts at 0 - no items)
 #ifdef __APPLE__
@@ -68,8 +70,10 @@ bool rq_push(ReadyQ *q, int32_t nid) {
   // Use acq_rel to ensure the enqueue is visible before length increment
   int old_len = atomic_fetch_add_explicit(&q->qlen, 1, memory_order_acq_rel);
 
-  // If queue was empty (0→1 transition), wake one waiting worker
-  if (old_len == 0) {
+  // Wake strategy:
+  // - Always signal on 0→1 transition (classic behavior)
+  // - Additionally, if there are waiters, signal to wake more workers
+  if (old_len == 0 || atomic_load_explicit(&q->waiters, memory_order_acquire) > 0) {
 #ifdef __APPLE__
     dispatch_semaphore_signal(q->items);
 #else
@@ -107,10 +111,14 @@ bool rq_wait_nonempty(ReadyQ *q, int timeout_us) {
 
 #ifdef __APPLE__
   // macOS: Use dispatch_semaphore with timeout
+  // Track waiters to enable push-side aggressive wakeups when needed
+  atomic_fetch_add_explicit(&q->waiters, 1, memory_order_acq_rel);
   dispatch_time_t timeout =
       dispatch_time(DISPATCH_TIME_NOW,
                     (int64_t)timeout_us * 1000L); // Convert us to ns
-  return dispatch_semaphore_wait(q->items, timeout) == 0;
+  int rc = dispatch_semaphore_wait(q->items, timeout) == 0;
+  atomic_fetch_sub_explicit(&q->waiters, 1, memory_order_acq_rel);
+  return rc;
 #else
   // Linux: Use sem_timedwait
   struct timespec ts;
@@ -121,7 +129,9 @@ bool rq_wait_nonempty(ReadyQ *q, int timeout_us) {
   ts.tv_sec += nsec / 1000000000L;
   ts.tv_nsec = nsec % 1000000000L;
 
+  atomic_fetch_add_explicit(&q->waiters, 1, memory_order_acq_rel);
   int result = sem_timedwait(&q->items, &ts);
+  atomic_fetch_sub_explicit(&q->waiters, 1, memory_order_acq_rel);
   return (result == 0);
 #endif
 }
