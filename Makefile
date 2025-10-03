@@ -3,6 +3,14 @@
 
 CC = gcc
 CFLAGS = -std=c11 -O2 -Wall -Wextra -pthread
+UNAME_S := $(shell uname -s)
+
+# Link Apple frameworks when building on macOS (for Audio Workgroups support)
+ifeq ($(UNAME_S),Darwin)
+APPLE_FRAMEWORKS = -framework AudioToolbox -framework CoreFoundation
+else
+APPLE_FRAMEWORKS =
+endif
 TARGET = audiograph
 DYLIB_TARGET = libaudiograph.dylib
 
@@ -28,7 +36,7 @@ $(TARGET): $(OBJECTS)
 $(DYLIB_TARGET): $(LIB_OBJECTS)
 	$(CC) $(CFLAGS) -dynamiclib -install_name @rpath/libaudiograph.dylib \
 		-compatibility_version 1.0 -current_version 1.0 \
-		-o $(DYLIB_TARGET) $(LIB_OBJECTS)
+		-o $(DYLIB_TARGET) $(LIB_OBJECTS) $(APPLE_FRAMEWORKS)
 
 # Build object files
 %.o: %.c $(HEADERS)

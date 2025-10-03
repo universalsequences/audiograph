@@ -2,7 +2,30 @@
 #include "graph_edit.h"
 #include "graph_nodes.h"
 #include <assert.h>
+#include <stdio.h>
 #include <unistd.h>
+
+// On Apple platforms, enable QoS hints for worker threads to reduce jitter.
+#ifdef __APPLE__
+#if __has_include(<pthread/qos.h>)
+#include <pthread/qos.h>
+#endif
+#if __has_include(<AudioToolbox/AudioWorkGroup.h>)
+#include <AudioToolbox/AudioWorkGroup.h>
+#include <CoreFoundation/CoreFoundation.h>
+#define HAVE_AUDIO_WORKGROUP 1
+#endif
+#if __has_include(<os/workgroup.h>)
+#include <os/workgroup.h>
+#define HAVE_OS_WORKGROUP 1
+#endif
+#if __has_include(<mach/mach.h>)
+#include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <mach/thread_policy.h>
+#define HAVE_MACH_RT 1
+#endif
+#endif
 
 // Include ReadyQ implementation
 extern ReadyQ *rq_create(int capacity);
@@ -63,6 +86,9 @@ int ap_current_node_ninputs(void) {
 void initialize_engine(int block_Size, int sample_rate) {
   g_engine.blockSize = block_Size;
   g_engine.sampleRate = sample_rate;
+  atomic_store_explicit(&g_engine.awg_token, NULL, memory_order_relaxed);
+  atomic_store_explicit(&g_engine.oswg, NULL, memory_order_relaxed);
+  atomic_store_explicit(&g_engine.rt_time_constraint, 0, memory_order_relaxed);
 }
 
 // ===================== Graph Management =====================
@@ -106,6 +132,61 @@ static void wait_for_block_start_or_shutdown(void) {
 
 static void *worker_main(void *arg) {
   (void)arg;
+  // Elevate worker thread QoS on Apple platforms for better scheduling.
+#ifdef __APPLE__
+#ifdef QOS_CLASS_USER_INTERACTIVE
+  (void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+#endif
+
+#ifdef HAVE_MACH_RT
+  // Optionally promote to Mach time-constraint scheduling
+  if (atomic_load_explicit(&g_engine.rt_time_constraint, memory_order_acquire)) {
+    // Compute period from engine config
+    double sr = (g_engine.sampleRate > 0) ? (double)g_engine.sampleRate : 48000.0;
+    double bs = (g_engine.blockSize > 0) ? (double)g_engine.blockSize : 512.0;
+    double period_ns_d = (bs / sr) * 1e9; // block duration in ns
+    uint64_t period_ns = (uint64_t)(period_ns_d + 0.5);
+    // Budget ~75% of period, constraint = period
+    uint64_t comp_ns = (period_ns * 3) / 4;
+    uint64_t cons_ns = period_ns;
+
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    uint64_t period_abs = (period_ns * tb.denom) / tb.numer;
+    uint64_t comp_abs = (comp_ns * tb.denom) / tb.numer;
+    uint64_t cons_abs = (cons_ns * tb.denom) / tb.numer;
+
+    thread_time_constraint_policy_data_t pol;
+    pol.period = (uint32_t)period_abs;
+    pol.computation = (uint32_t)comp_abs;
+    pol.constraint = (uint32_t)cons_abs;
+    pol.preemptible = TRUE;
+
+    kern_return_t kr = thread_policy_set(mach_thread_self(),
+                                         THREAD_TIME_CONSTRAINT_POLICY,
+                                         (thread_policy_t)&pol,
+                                         THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    if (kr != KERN_SUCCESS) {
+      fprintf(stderr, "[audiograph] WARN: thread_policy_set RT failed (kr=%d)\n", kr);
+    } else {
+      fprintf(stderr, "[audiograph] worker %p set Mach RT TC (period=%.2f ms)\n",
+              (void*)pthread_self(), period_ns_d / 1e6);
+    }
+  }
+#endif
+
+#ifdef HAVE_OS_WORKGROUP
+  os_workgroup_t oswg = NULL;
+  os_workgroup_join_token_t oswg_token = {0};
+  bool oswg_joined = false;
+  bool oswg_logged = false;
+  bool oswg_warned = false;
+#endif
+#ifdef HAVE_AUDIO_WORKGROUP
+  AudioWorkGroupRef awg_group = NULL;
+  bool awg_joined = false;
+#endif
   for (;;) {
     if (!atomic_load_explicit(&g_engine.runFlag, memory_order_acquire))
       break;
@@ -120,36 +201,109 @@ static void *worker_main(void *arg) {
     if (!lg)
       continue; // spurious wake or block already ended
 
+#ifdef HAVE_OS_WORKGROUP
+    if (!oswg_joined) {
+      void *w = atomic_load_explicit(&g_engine.oswg, memory_order_acquire);
+      if (w) {
+        oswg = (os_workgroup_t)w;
+        bool ok = os_workgroup_join(oswg, &oswg_token);
+        oswg_joined = ok;
+        if (!oswg_logged) {
+          fprintf(
+              stderr,
+              ok ? "[audiograph] worker %p joined os_workgroup %p\n"
+                 : "[audiograph] worker %p FAILED to join os_workgroup %p\n",
+              (void *)pthread_self(), (void *)oswg);
+          oswg_logged = true;
+        }
+      } else if (!oswg_warned) {
+        fprintf(
+            stderr,
+            "[audiograph] os_workgroup pointer not set; workers not joined\n");
+        oswg_warned = true;
+      }
+    }
+#elif defined(HAVE_AUDIO_WORKGROUP)
+    // Lazy-join the AudioWorkGroup once a token is provided.
+    if (!awg_joined) {
+      void *tok =
+          atomic_load_explicit(&g_engine.awg_token, memory_order_acquire);
+      if (tok) {
+        OSStatus s = AudioWorkGroupJoinWithToken(&awg_group,
+                                                 (AudioWorkGroupTokenRef)tok);
+        if (s == noErr && awg_group != NULL) {
+          awg_joined = true;
+          fprintf(stderr, "[audiograph] worker %p joined AudioWorkGroup\n",
+                  (void *)pthread_self());
+        } else {
+          fprintf(stderr,
+                  "[audiograph] worker %p FAILED to join AudioWorkGroup "
+                  "(status=%d)\n",
+                  (void *)pthread_self(), (int)s);
+        }
+      }
+    }
+#endif
+
     // Hot loop: run until this block is complete
     for (;;) {
+      // If the session ended or graph pointer changed, exit the hot loop.
+      LiveGraph *cur =
+          atomic_load_explicit(&g_engine.workSession, memory_order_acquire);
+      if (cur != lg)
+        break;
       if (atomic_load_explicit(&lg->jobsInFlight, memory_order_acquire) == 0)
         break;
 
       int32_t nid;
 
-      // Tiny spin to catch bursts without kernel call
+      // Tiny spin to catch bursts without kernel call, then short timed wait
       bool got = false;
       for (int s = 0; s < 64; s++) {
         if ((got = rq_try_pop(lg->readyQueue, &nid)))
           break;
-        cpu_relax(); // _mm_pause / __yield
+        cpu_relax(); // brief pause
       }
       if (!got) {
-        // Queue appears empty; wait a short time for 0→1 signal
-        // LATENCY FIX: Reduced from 100us to 10us to minimize block delays
+        // Queue appears empty; wait a very short time for a wake signal
         (void)rq_wait_nonempty(lg->readyQueue, /*timeout_us=*/10);
         continue;
       }
 
-      int nf = atomic_load_explicit(&g_engine.sessionFrames, memory_order_acquire);
-      if (nf <= 0) {
-        nf = g_engine.blockSize; // Fallback to engine default
+      // Validate job ID to avoid crashes if queue is corrupted under load
+      if (nid < 0 || nid >= lg->node_count) {
+        fprintf(stderr,
+                "[audiograph] WARN: invalid job id %d (node_count=%d)\n", nid,
+                lg->node_count);
+        continue;
+      }
+
+      int nf =
+          atomic_load_explicit(&g_engine.sessionFrames, memory_order_acquire);
+      if (nf <= 0 || nf > lg->block_size) {
+        nf = lg->block_size; // Clamp to graph's internal block size for safety
       }
       execute_and_fanout(lg, nid, nf);
     }
 
     // Loop back: will go to sleep on sess_cv until next block
   }
+
+  // Thread exiting: leave workgroup if still joined
+#ifdef HAVE_OS_WORKGROUP
+  if (oswg_joined && oswg) {
+    os_workgroup_leave(oswg, oswg_token);
+    oswg_joined = false;
+  }
+#elif defined(HAVE_AUDIO_WORKGROUP)
+  if (awg_joined && awg_group) {
+    AudioWorkGroupLeave(awg_group);
+    CFRelease(awg_group);
+    awg_group = NULL;
+    awg_joined = false;
+  }
+#endif
+
   return NULL;
 }
 
@@ -167,9 +321,59 @@ void engine_start_workers(int workers) {
   for (int i = 0; i < workers; i++) {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
+    // Hint a high QoS class on Apple platforms; no-ops elsewhere.
+#ifdef __APPLE__
+#ifdef QOS_CLASS_USER_INTERACTIVE
+    (void)pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+#endif
     pthread_create(&g_engine.threads[i], &attr, worker_main, NULL);
     pthread_attr_destroy(&attr);
   }
+}
+
+void engine_set_audio_workgroup_token(void *token) {
+  // Store/update token atomically. On Apple with AudioWorkGroup available,
+  // retain/release to manage lifetime. Workers join lazily on next block.
+#ifdef HAVE_AUDIO_WORKGROUP
+  void *old = atomic_exchange_explicit(&g_engine.awg_token, token,
+                                       memory_order_acq_rel);
+  if (token) {
+    CFRetain((CFTypeRef)token);
+  }
+  if (old) {
+    CFRelease((CFTypeRef)old);
+  }
+#else
+  atomic_store_explicit(&g_engine.awg_token, token, memory_order_release);
+  (void)token;
+#endif
+}
+
+void engine_clear_audio_workgroup_token(void) {
+  engine_set_audio_workgroup_token(NULL);
+}
+
+void engine_set_os_workgroup(void *oswg_ptr) {
+#ifdef HAVE_OS_WORKGROUP
+  // Store opaque pointer; Swift side retains it.
+  atomic_store_explicit(&g_engine.oswg, oswg_ptr, memory_order_release);
+  fprintf(stderr,
+          "[audiograph] set os_workgroup=%p (will join on next block)\n",
+          oswg_ptr);
+#else
+  (void)oswg_ptr;
+  fprintf(
+      stderr,
+      "[audiograph] os_workgroup unsupported at compile time; ignoring set\n");
+#endif
+}
+
+void engine_clear_os_workgroup(void) { engine_set_os_workgroup(NULL); }
+
+void engine_enable_rt_time_constraint(int enable) {
+  atomic_store_explicit(&g_engine.rt_time_constraint, enable ? 1 : 0,
+                        memory_order_release);
 }
 
 void engine_stop_workers(void) {
@@ -458,13 +662,15 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
 
   // Automatically create the DAC node at index 0
   // DAC has one input and one output per channel
-  int dac_id = apply_add_node(lg, DAC_VTABLE, 0, 0, "DAC", lg->num_channels, lg->num_channels, NULL);
+  int dac_id = apply_add_node(lg, DAC_VTABLE, 0, 0, "DAC", lg->num_channels,
+                              lg->num_channels, NULL);
   if (dac_id >= 0) {
     lg->dac_node_id = dac_id; // Remember the DAC node
 
     RTNode *dac = &lg->nodes[dac_id];
-    dac->nInputs = lg->num_channels;  // DAC has N inputs (one per channel)
-    dac->nOutputs = lg->num_channels; // DAC has N outputs (for reading final audio)
+    dac->nInputs = lg->num_channels; // DAC has N inputs (one per channel)
+    dac->nOutputs =
+        lg->num_channels; // DAC has N outputs (for reading final audio)
     if (!ensure_port_arrays(dac)) {
       // DAC node allocation failed - this is critical
       return NULL;
@@ -929,7 +1135,8 @@ void update_orphaned_status(LiveGraph *lg) {
     return;
   }
 
-  // Check if DAC has any inputs first - if not, leave it orphaned (unless watched)
+  // Check if DAC has any inputs first - if not, leave it orphaned (unless
+  // watched)
   RTNode *dac = &lg->nodes[lg->dac_node_id];
   bool dac_has_inputs = false;
   if (dac->inEdgeId) {
@@ -950,7 +1157,7 @@ void update_orphaned_status(LiveGraph *lg) {
   bool *visited = calloc(lg->node_count, sizeof(bool));
   mark_reachable_from_dac(lg, lg->dac_node_id, visited);
   free(visited);
-  
+
   // After connectivity changes, recompute indegree from actual inputs to avoid
   // drift when editing many ports. This ensures scheduling can't deadlock due
   // to stale indegree values.
@@ -979,9 +1186,8 @@ void update_orphaned_status(LiveGraph *lg) {
 }
 
 // Debugging: print a full health check for the live graph
-static void print_health_check(LiveGraph *lg, const char *phase,
-                               int src_node, int src_port, int dst_node,
-                               int dst_port) {
+static void print_health_check(LiveGraph *lg, const char *phase, int src_node,
+                               int src_port, int dst_node, int dst_port) {
   if (!lg)
     return;
   printf("\n=== AudioGraph Health Check: %s %d:%d -> %d:%d ===\n", phase,
@@ -1556,99 +1762,99 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
   update_orphaned_status(lg);
 
   // ========== HEALTH CHECK LOGGING (after successful disconnect) ==========
-    printf("\n=== AudioGraph Health Check: after disconnect %d:%d -> %d:%d ===\n",
-           src_node, src_port, dst_node, dst_port);
-    printf("Nodes: %d, Edges(capacity): %d, Block: %d, Channels: %d, DAC: %d\n",
-           lg->node_count, lg->edge_capacity, lg->block_size, lg->num_channels,
-           lg->dac_node_id);
+  printf("\n=== AudioGraph Health Check: after disconnect %d:%d -> %d:%d ===\n",
+         src_node, src_port, dst_node, dst_port);
+  printf("Nodes: %d, Edges(capacity): %d, Block: %d, Channels: %d, DAC: %d\n",
+         lg->node_count, lg->edge_capacity, lg->block_size, lg->num_channels,
+         lg->dac_node_id);
 
-    // DAC summary
-    if (lg->dac_node_id >= 0 && lg->dac_node_id < lg->node_count) {
-      RTNode *dac = &lg->nodes[lg->dac_node_id];
-      printf("DAC inputs: ");
-      for (int ch = 0; ch < dac->nInputs; ch++) {
-        int eid = dac->inEdgeId ? dac->inEdgeId[ch] : -1;
+  // DAC summary
+  if (lg->dac_node_id >= 0 && lg->dac_node_id < lg->node_count) {
+    RTNode *dac = &lg->nodes[lg->dac_node_id];
+    printf("DAC inputs: ");
+    for (int ch = 0; ch < dac->nInputs; ch++) {
+      int eid = dac->inEdgeId ? dac->inEdgeId[ch] : -1;
+      if (eid >= 0 && eid < lg->edge_capacity && lg->edges &&
+          lg->edges[eid].in_use) {
+        printf("[%d]=E%d(src=%d:%d,ref=%d) ", ch, eid, lg->edges[eid].src_node,
+               lg->edges[eid].src_port, lg->edges[eid].refcount);
+      } else {
+        printf("[%d]=-1 ", ch);
+      }
+    }
+    printf("\n");
+  }
+
+  // Per-node details
+  for (int i = 0; i < lg->node_count; i++) {
+    RTNode *n = &lg->nodes[i];
+    const char *state = lg->is_orphaned[i] ? "ORPHANED" : "CONNECTED";
+    int indeg = (lg->indegree && i < lg->node_count) ? lg->indegree[i] : -1;
+    printf("Node %d: %s indegree=%d nIn=%d nOut=%d succ=%d\n", i, state, indeg,
+           n->nInputs, n->nOutputs, n->succCount);
+
+    // Inputs
+    if (n->nInputs > 0 && n->inEdgeId) {
+      for (int ip = 0; ip < n->nInputs; ip++) {
+        int eid = n->inEdgeId[ip];
         if (eid >= 0 && eid < lg->edge_capacity && lg->edges &&
             lg->edges[eid].in_use) {
-          printf("[%d]=E%d(src=%d:%d,ref=%d) ", ch, eid, lg->edges[eid].src_node,
-                 lg->edges[eid].src_port, lg->edges[eid].refcount);
+          printf("  in[%d]=E%d(src=%d:%d,ref=%d)\n", ip, eid,
+                 lg->edges[eid].src_node, lg->edges[eid].src_port,
+                 lg->edges[eid].refcount);
         } else {
-          printf("[%d]=-1 ", ch);
+          printf("  in[%d]=-1\n", ip);
         }
       }
-      printf("\n");
     }
 
-    // Per-node details
-    for (int i = 0; i < lg->node_count; i++) {
-      RTNode *n = &lg->nodes[i];
-      const char *state = lg->is_orphaned[i] ? "ORPHANED" : "CONNECTED";
-      int indeg = (lg->indegree && i < lg->node_count) ? lg->indegree[i] : -1;
-      printf("Node %d: %s indegree=%d nIn=%d nOut=%d succ=%d\n", i, state,
-             indeg, n->nInputs, n->nOutputs, n->succCount);
-
-      // Inputs
-      if (n->nInputs > 0 && n->inEdgeId) {
-        for (int ip = 0; ip < n->nInputs; ip++) {
-          int eid = n->inEdgeId[ip];
-          if (eid >= 0 && eid < lg->edge_capacity && lg->edges &&
-              lg->edges[eid].in_use) {
-            printf("  in[%d]=E%d(src=%d:%d,ref=%d)\n", ip, eid,
-                   lg->edges[eid].src_node, lg->edges[eid].src_port,
-                   lg->edges[eid].refcount);
-          } else {
-            printf("  in[%d]=-1\n", ip);
-          }
-        }
-      }
-
-      // Outputs and consumers
-      if (n->nOutputs > 0 && n->outEdgeId) {
-        for (int op = 0; op < n->nOutputs; op++) {
-          int eid = n->outEdgeId[op];
-          if (eid >= 0 && eid < lg->edge_capacity && lg->edges &&
-              lg->edges[eid].in_use) {
-            printf("  out[%d]=E%d(ref=%d) -> ", op, eid, lg->edges[eid].refcount);
-            // Find consumers of this edge
-            int printed = 0;
-            for (int dn = 0; dn < lg->node_count; dn++) {
-              RTNode *dst = &lg->nodes[dn];
-              if (!dst->inEdgeId || dst->nInputs <= 0)
-                continue;
-              for (int dp = 0; dp < dst->nInputs; dp++) {
-                if (dst->inEdgeId[dp] == eid) {
-                  printf("%s%d:%d", printed ? "," : "", dn, dp);
-                  printed++;
-                }
+    // Outputs and consumers
+    if (n->nOutputs > 0 && n->outEdgeId) {
+      for (int op = 0; op < n->nOutputs; op++) {
+        int eid = n->outEdgeId[op];
+        if (eid >= 0 && eid < lg->edge_capacity && lg->edges &&
+            lg->edges[eid].in_use) {
+          printf("  out[%d]=E%d(ref=%d) -> ", op, eid, lg->edges[eid].refcount);
+          // Find consumers of this edge
+          int printed = 0;
+          for (int dn = 0; dn < lg->node_count; dn++) {
+            RTNode *dst = &lg->nodes[dn];
+            if (!dst->inEdgeId || dst->nInputs <= 0)
+              continue;
+            for (int dp = 0; dp < dst->nInputs; dp++) {
+              if (dst->inEdgeId[dp] == eid) {
+                printf("%s%d:%d", printed ? "," : "", dn, dp);
+                printed++;
               }
             }
-            if (printed == 0)
-              printf("(no consumers)");
-            printf("\n");
-          } else {
-            printf("  out[%d]=-1\n", op);
           }
+          if (printed == 0)
+            printf("(no consumers)");
+          printf("\n");
+        } else {
+          printf("  out[%d]=-1\n", op);
         }
       }
     }
+  }
 
-    // Edge pool summary
-    if (lg->edges && lg->edge_capacity > 0) {
-      printf("Edges in use: ");
-      int any = 0;
-      for (int e = 0; e < lg->edge_capacity; e++) {
-        if (lg->edges[e].in_use) {
-          printf("E%d(src=%d:%d,ref=%d) ", e, lg->edges[e].src_node,
-                 lg->edges[e].src_port, lg->edges[e].refcount);
-          any = 1;
-        }
+  // Edge pool summary
+  if (lg->edges && lg->edge_capacity > 0) {
+    printf("Edges in use: ");
+    int any = 0;
+    for (int e = 0; e < lg->edge_capacity; e++) {
+      if (lg->edges[e].in_use) {
+        printf("E%d(src=%d:%d,ref=%d) ", e, lg->edges[e].src_node,
+               lg->edges[e].src_port, lg->edges[e].refcount);
+        any = 1;
       }
-      if (!any)
-        printf("(none)");
-      printf("\n");
     }
+    if (!any)
+      printf("(none)");
+    printf("\n");
+  }
 
-    printf("=== End Health Check ===\n\n");
+  printf("=== End Health Check ===\n\n");
 
   return true;
 }
@@ -1834,15 +2040,22 @@ void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
   // Inputs: each port has 0/1 producer (edge id or -1)
   for (int i = 0; i < node->nInputs && i < MAX_IO; i++) {
     int eid = node->inEdgeId ? node->inEdgeId[i] : -1;
-    inPtrs[i] = (eid >= 0) ? lg->edges[eid].buf : lg->silence_buf;
+    if (eid >= 0 && eid < lg->edge_capacity && lg->edges[eid].buf) {
+      inPtrs[i] = lg->edges[eid].buf;
+    } else {
+      inPtrs[i] = lg->silence_buf;
+    }
   }
 
   // Outputs: one buffer per output port (edge id or -1)
   // CRITICAL FIX: Use thread-local scratch to prevent write-write races
   for (int i = 0; i < node->nOutputs && i < MAX_IO; i++) {
     int eid = node->outEdgeId ? node->outEdgeId[i] : -1;
-    outPtrs[i] =
-        (eid >= 0) ? lg->edges[eid].buf : get_tls_out_scratch(i, nframes);
+    if (eid >= 0 && eid < lg->edge_capacity && lg->edges[eid].buf) {
+      outPtrs[i] = lg->edges[eid].buf;
+    } else {
+      outPtrs[i] = get_tls_out_scratch(i, nframes);
+    }
   }
 
   if (node->vtable.process) {
@@ -1855,6 +2068,13 @@ void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
 }
 
 static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes) {
+  if (nid < 0 || nid >= lg->node_count) {
+    fprintf(stderr,
+            "[audiograph] WARN: execute_and_fanout skipping invalid nid=%d "
+            "(count=%d)\n",
+            nid, lg->node_count);
+    return;
+  }
   bind_and_run_live(lg, nid, nframes); // uses silence/scratch for missing ports
 
   RTNode *node = &lg->nodes[nid];
@@ -1951,7 +2171,8 @@ void process_live_block(LiveGraph *lg, int nframes) {
 
   if (g_engine.workerCount > 0) {
     // Publish session frames and graph, then wake workers
-    atomic_store_explicit(&g_engine.sessionFrames, nframes, memory_order_release);
+    atomic_store_explicit(&g_engine.sessionFrames, nframes,
+                          memory_order_release);
     atomic_store_explicit(&g_engine.workSession, lg, memory_order_release);
 
     pthread_mutex_lock(&g_engine.sess_mtx);
@@ -1994,48 +2215,68 @@ void process_next_block(LiveGraph *lg, float *output_buffer, int nframes) {
   if (!lg || !output_buffer || nframes <= 0) {
     // Clear output buffer if invalid input
     if (output_buffer && nframes > 0) {
-      memset(output_buffer, 0, nframes * lg->num_channels * sizeof(float));
+      memset(output_buffer, 0,
+             (size_t)nframes * (size_t)lg->num_channels * sizeof(float));
     }
     return;
   }
 
   apply_graph_edits(lg->graphEditQueue, lg);
   apply_params(lg);
-  process_live_block(lg, nframes);
 
-  // Get the DAC node (final output)
-  int output_node = find_live_output(lg);
+  // Process in slices if callback frames exceed internal block size.
+  int remaining = nframes;
+  int out_offset = 0; // in frames
+  while (remaining > 0) {
+    int slice = remaining;
+    if (slice > lg->block_size)
+      slice = lg->block_size;
 
-  if (output_node >= 0 && lg->nodes[output_node].nInputs > 0) {
-    RTNode *dac = &lg->nodes[output_node];
+    process_live_block(lg, slice);
 
-    // Copy each channel from DAC inputs to interleaved output buffer
-    for (int ch = 0; ch < lg->num_channels; ch++) {
-      float *src = NULL;
+    // Get the DAC node (final output)
+    int output_node = find_live_output(lg);
 
-      // Get the input edge for this channel
-      if (ch < dac->nInputs) {
-        int edge_id = dac->inEdgeId[ch];
-        if (edge_id >= 0 && edge_id < lg->edge_capacity) {
-          src = lg->edges[edge_id].buf;
+    if (output_node >= 0 && lg->nodes[output_node].nInputs > 0) {
+      RTNode *dac = &lg->nodes[output_node];
+
+      // Copy each channel from DAC inputs to interleaved output buffer
+      for (int ch = 0; ch < lg->num_channels; ch++) {
+        float *src = NULL;
+
+        // Get the input edge for this channel
+        if (ch < dac->nInputs) {
+          int edge_id = dac->inEdgeId[ch];
+          if (edge_id >= 0 && edge_id < lg->edge_capacity) {
+            src = lg->edges[edge_id].buf;
+          }
+        }
+
+        // Interleave this channel into the output buffer with offset
+        float *dst = output_buffer +
+                     ((size_t)out_offset * (size_t)lg->num_channels) + ch;
+        if (src) {
+          for (int i = 0; i < slice; i++) {
+            dst[i * lg->num_channels] = src[i];
+          }
+        } else {
+          for (int i = 0; i < slice; i++) {
+            dst[i * lg->num_channels] = 0.0f;
+          }
         }
       }
-
-      // Interleave this channel into the output buffer
-      if (src) {
-        for (int i = 0; i < nframes; i++) {
-          output_buffer[i * lg->num_channels + ch] = src[i];
-        }
-      } else {
-        // If no source, output silence for this channel
-        for (int i = 0; i < nframes; i++) {
-          output_buffer[i * lg->num_channels + ch] = 0.0f;
+    } else {
+      // No output node - silence for this slice
+      for (int i = 0; i < slice; i++) {
+        for (int ch = 0; ch < lg->num_channels; ch++) {
+          output_buffer[((size_t)out_offset + i) * (size_t)lg->num_channels +
+                        ch] = 0.0f;
         }
       }
     }
-  } else {
-    // No output node - silence
-    memset(output_buffer, 0, nframes * lg->num_channels * sizeof(float));
+
+    remaining -= slice;
+    out_offset += slice;
   }
 
   // Update watched node states after processing
@@ -2249,7 +2490,8 @@ bool add_node_to_watchlist(LiveGraph *lg, int node_id) {
   // Expand capacity if needed
   if (lg->watch_list_count >= lg->watch_list_capacity) {
     lg->watch_list_capacity *= 2;
-    lg->watch_list = realloc(lg->watch_list, lg->watch_list_capacity * sizeof(int));
+    lg->watch_list =
+        realloc(lg->watch_list, lg->watch_list_capacity * sizeof(int));
     if (!lg->watch_list) {
       pthread_mutex_unlock(&lg->watch_list_mutex);
       return false;
@@ -2306,15 +2548,16 @@ bool remove_node_from_watchlist(LiveGraph *lg, int node_id) {
 
 void *get_node_state(LiveGraph *lg, int node_id, size_t *state_size) {
   if (!lg || node_id < 0 || node_id >= lg->node_capacity) {
-    if (state_size) *state_size = 0;
+    if (state_size)
+      *state_size = 0;
     return NULL;
   }
 
   pthread_rwlock_rdlock(&lg->state_store_lock);
-  
+
   void *result = NULL;
   size_t size = 0;
-  
+
   if (lg->state_snapshots[node_id] && lg->state_sizes[node_id] > 0) {
     size = lg->state_sizes[node_id];
     result = malloc(size);
@@ -2322,10 +2565,11 @@ void *get_node_state(LiveGraph *lg, int node_id, size_t *state_size) {
       memcpy(result, lg->state_snapshots[node_id], size);
     }
   }
-  
+
   pthread_rwlock_unlock(&lg->state_store_lock);
-  
-  if (state_size) *state_size = size;
+
+  if (state_size)
+    *state_size = size;
   return result;
 }
 
@@ -2347,22 +2591,24 @@ static void update_watched_node_states(LiveGraph *lg) {
 
   // Update state snapshots for watched nodes
   pthread_rwlock_wrlock(&lg->state_store_lock);
-  
+
   for (int i = 0; i < watch_count; i++) {
     int node_id = watch_nodes[i];
-    
+
     // Validate node_id and check if node exists
     if (node_id < 0 || node_id >= lg->node_count) {
       continue;
     }
-    
+
     RTNode *node = &lg->nodes[node_id];
     if (!node->state || node->state_size == 0) {
       continue; // No state to copy
     }
-    
-    // Reuse existing snapshot buffer if size matches; avoid per-block malloc/free
-    if (lg->state_snapshots[node_id] && lg->state_sizes[node_id] == node->state_size) {
+
+    // Reuse existing snapshot buffer if size matches; avoid per-block
+    // malloc/free
+    if (lg->state_snapshots[node_id] &&
+        lg->state_sizes[node_id] == node->state_size) {
       memcpy(lg->state_snapshots[node_id], node->state, node->state_size);
     } else {
       // Size changed or no buffer yet; (re)allocate
@@ -2379,7 +2625,7 @@ static void update_watched_node_states(LiveGraph *lg) {
       }
     }
   }
-  
+
   pthread_rwlock_unlock(&lg->state_store_lock);
   free(watch_nodes);
 }

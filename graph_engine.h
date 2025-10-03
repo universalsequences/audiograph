@@ -149,6 +149,13 @@ typedef struct Engine {
 
   int sampleRate;
   int blockSize;
+
+  // Optional: Audio Workgroup token for co-scheduling (Apple-only usage)
+  // Stored as opaque pointer to avoid hard dependency in public header.
+  _Atomic(void *) awg_token; // AudioWorkGroupTokenRef when available
+  _Atomic(void *) oswg;      // os_workgroup_t when available
+  _Atomic int rt_log;        // enable lightweight debug prints from workers
+  _Atomic int rt_time_constraint; // apply Mach RT time-constraint policy
 } Engine;
 
 // ===================== Ready Queue Operations =====================
@@ -162,6 +169,27 @@ typedef struct Engine {
 void engine_start_workers(int workers);
 void engine_stop_workers(void);
 void apply_params(LiveGraph *g);
+
+// Optional: supply an Audio Workgroup token (Apple platforms iOS 15+/macOS 12+)
+// Pass the token captured from the render callback via
+// AudioWorkGroupGetCurrent/AudioWorkGroupCopyToken. It is safe to call this
+// before or after starting workers. Workers will attempt to join lazily once a
+// token is available. On non-Apple platforms (or when unavailable), these are
+// no-ops.
+void engine_set_audio_workgroup_token(void *token);
+void engine_clear_audio_workgroup_token(void);
+
+// Optional: supply an OS Workgroup object (kAudioOutputUnitProperty_OSWorkgroup)
+// Pass the os_workgroup_t you obtained from the audio unit. No-ops on platforms
+// without OS Workgroup support.
+void engine_set_os_workgroup(void *oswg);
+void engine_clear_os_workgroup(void);
+
+// Enable or disable minimal worker join logging (off by default).
+void engine_enable_rt_logging(int enable);
+
+// Enable/disable Mach time-constraint scheduling for workers (Apple only).
+void engine_enable_rt_time_constraint(int enable);
 
 // ===================== Live Graph Operations =====================
 

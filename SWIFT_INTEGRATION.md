@@ -882,3 +882,50 @@ For troubleshooting build issues:
 ```bash
 swift build --verbose
 ```
+
+## Audio Workgroups (Apple)
+On iOS 15+/macOS 12+, you can co-schedule helper threads with the CoreAudio render thread using Audio Workgroups. This keeps multi-threaded processing aligned to the audio deadline and reduces jitter.
+
+1) Capture the token on the render thread once and hand it to the engine:
+
+```swift
+import AudioToolbox
+
+final class AudioGraphSourceNode: AVAudioSourceNode {
+    private var awgToken: AudioWorkGroupToken?
+
+    init(lg: UnsafeMutablePointer<LiveGraph>) {
+        let format = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 2)!
+        super.init(format: format) { [weak self] _, _, frameCount, audioBufferList -> OSStatus in
+            if self?.awgToken == nil {
+                var group: AudioWorkGroup?
+                if AudioWorkGroupGetCurrent(&group) == noErr, let group {
+                    var token: AudioWorkGroupToken?
+                    if AudioWorkGroupCopyToken(group, &token) == noErr, let token {
+                        self?.awgToken = token
+                        // Provide the token to the C engine; it will retain it
+                        engine_set_audio_workgroup_token(Unmanaged.passUnretained(token as CFTypeRef).toOpaque())
+                    }
+                }
+            }
+
+            guard let abl = audioBufferList else { return noErr }
+            let frames = Int32(frameCount)
+            let outPtr = abl.pointee.mBuffers.mData!.assumingMemoryBound(to: Float.self)
+            process_next_block(lg, outPtr, frames)
+            return noErr
+        }
+    }
+}
+```
+
+2) On teardown, clear the token and stop workers:
+
+```swift
+engine_clear_audio_workgroup_token()
+engine_stop_workers()
+```
+
+Notes:
+- The engine lazily joins workers to the workgroup once the token is set; you can set it after starting workers.
+- On non-Apple platforms or older OS versions where the header is unavailable, these calls are no-ops.
