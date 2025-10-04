@@ -27,11 +27,6 @@ void initialize_engine(int block_size, int sample_rate);
 void engine_start_workers(int workers);
 void engine_stop_workers(void);
 
-// Optional: Join Apple Audio Workgroup (iOS 15+/macOS 12+)
-// Pass the token captured on the audio render thread; no-ops on other platforms.
-void engine_set_audio_workgroup_token(void *token);
-void engine_clear_audio_workgroup_token(void);
-
 // Optional: Join using OS Workgroup (kAudioOutputUnitProperty_OSWorkgroup)
 void engine_set_os_workgroup(void *oswg);
 void engine_clear_os_workgroup(void);

@@ -10,11 +10,6 @@
 #if __has_include(<pthread/qos.h>)
 #include <pthread/qos.h>
 #endif
-#if __has_include(<AudioToolbox/AudioWorkGroup.h>)
-#include <AudioToolbox/AudioWorkGroup.h>
-#include <CoreFoundation/CoreFoundation.h>
-#define HAVE_AUDIO_WORKGROUP 1
-#endif
 #if __has_include(<os/workgroup.h>)
 #include <os/workgroup.h>
 #define HAVE_OS_WORKGROUP 1
@@ -86,7 +81,6 @@ int ap_current_node_ninputs(void) {
 void initialize_engine(int block_Size, int sample_rate) {
   g_engine.blockSize = block_Size;
   g_engine.sampleRate = sample_rate;
-  atomic_store_explicit(&g_engine.awg_token, NULL, memory_order_relaxed);
   atomic_store_explicit(&g_engine.oswg, NULL, memory_order_relaxed);
   atomic_store_explicit(&g_engine.rt_time_constraint, 0, memory_order_relaxed);
 }
@@ -183,10 +177,6 @@ static void *worker_main(void *arg) {
   bool oswg_logged = false;
   bool oswg_warned = false;
 #endif
-#ifdef HAVE_AUDIO_WORKGROUP
-  AudioWorkGroupRef awg_group = NULL;
-  bool awg_joined = false;
-#endif
   for (;;) {
     if (!atomic_load_explicit(&g_engine.runFlag, memory_order_acquire))
       break;
@@ -221,26 +211,6 @@ static void *worker_main(void *arg) {
             stderr,
             "[audiograph] os_workgroup pointer not set; workers not joined\n");
         oswg_warned = true;
-      }
-    }
-#elif defined(HAVE_AUDIO_WORKGROUP)
-    // Lazy-join the AudioWorkGroup once a token is provided.
-    if (!awg_joined) {
-      void *tok =
-          atomic_load_explicit(&g_engine.awg_token, memory_order_acquire);
-      if (tok) {
-        OSStatus s = AudioWorkGroupJoinWithToken(&awg_group,
-                                                 (AudioWorkGroupTokenRef)tok);
-        if (s == noErr && awg_group != NULL) {
-          awg_joined = true;
-          fprintf(stderr, "[audiograph] worker %p joined AudioWorkGroup\n",
-                  (void *)pthread_self());
-        } else {
-          fprintf(stderr,
-                  "[audiograph] worker %p FAILED to join AudioWorkGroup "
-                  "(status=%d)\n",
-                  (void *)pthread_self(), (int)s);
-        }
       }
     }
 #endif
@@ -295,15 +265,8 @@ static void *worker_main(void *arg) {
     os_workgroup_leave(oswg, oswg_token);
     oswg_joined = false;
   }
-#elif defined(HAVE_AUDIO_WORKGROUP)
-  if (awg_joined && awg_group) {
-    AudioWorkGroupLeave(awg_group);
-    CFRelease(awg_group);
-    awg_group = NULL;
-    awg_joined = false;
-  }
 #endif
-
+  
   return NULL;
 }
 
@@ -330,28 +293,6 @@ void engine_start_workers(int workers) {
     pthread_create(&g_engine.threads[i], &attr, worker_main, NULL);
     pthread_attr_destroy(&attr);
   }
-}
-
-void engine_set_audio_workgroup_token(void *token) {
-  // Store/update token atomically. On Apple with AudioWorkGroup available,
-  // retain/release to manage lifetime. Workers join lazily on next block.
-#ifdef HAVE_AUDIO_WORKGROUP
-  void *old = atomic_exchange_explicit(&g_engine.awg_token, token,
-                                       memory_order_acq_rel);
-  if (token) {
-    CFRetain((CFTypeRef)token);
-  }
-  if (old) {
-    CFRelease((CFTypeRef)old);
-  }
-#else
-  atomic_store_explicit(&g_engine.awg_token, token, memory_order_release);
-  (void)token;
-#endif
-}
-
-void engine_clear_audio_workgroup_token(void) {
-  engine_set_audio_workgroup_token(NULL);
 }
 
 void engine_set_os_workgroup(void *oswg_ptr) {

@@ -883,49 +883,34 @@ For troubleshooting build issues:
 swift build --verbose
 ```
 
-## Audio Workgroups (Apple)
-On iOS 15+/macOS 12+, you can co-schedule helper threads with the CoreAudio render thread using Audio Workgroups. This keeps multi-threaded processing aligned to the audio deadline and reduces jitter.
+## OS Workgroup (Apple)
+On iOS 15+/macOS 12+, co-schedule helper threads with the I/O thread by joining the Audio Unit's `os_workgroup_t`. This keeps multi-threaded processing aligned to the audio deadline.
 
-1) Capture the token on the render thread once and hand it to the engine:
+1) Fetch the OS workgroup from the output AudioUnit and pass it to the engine:
 
 ```swift
-import AudioToolbox
+import AVFAudio
+import os
 
-final class AudioGraphSourceNode: AVAudioSourceNode {
-    private var awgToken: AudioWorkGroupToken?
-
-    init(lg: UnsafeMutablePointer<LiveGraph>) {
-        let format = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 2)!
-        super.init(format: format) { [weak self] _, _, frameCount, audioBufferList -> OSStatus in
-            if self?.awgToken == nil {
-                var group: AudioWorkGroup?
-                if AudioWorkGroupGetCurrent(&group) == noErr, let group {
-                    var token: AudioWorkGroupToken?
-                    if AudioWorkGroupCopyToken(group, &token) == noErr, let token {
-                        self?.awgToken = token
-                        // Provide the token to the C engine; it will retain it
-                        engine_set_audio_workgroup_token(Unmanaged.passUnretained(token as CFTypeRef).toOpaque())
-                    }
-                }
-            }
-
-            guard let abl = audioBufferList else { return noErr }
-            let frames = Int32(frameCount)
-            let outPtr = abl.pointee.mBuffers.mData!.assumingMemoryBound(to: Float.self)
-            process_next_block(lg, outPtr, frames)
-            return noErr
-        }
+func bindOSWorkgroupFromAudioUnit(engine: AVAudioEngine) {
+    guard let au: AudioUnit = engine.outputNode.audioUnit else { return }
+    var wg: os_workgroup_t? = nil
+    var size: UInt32 = UInt32(MemoryLayout<os_workgroup_t?>.size)
+    let kAudioOutputUnitProperty_OSWorkgroup: AudioUnitPropertyID = 2015
+    let status = AudioUnitGetProperty(
+        au, kAudioOutputUnitProperty_OSWorkgroup,
+        kAudioUnitScope_Global, 0,
+        &wg, &size
+    )
+    if status == noErr, let wg {
+        engine_set_os_workgroup(Unmanaged.passUnretained(wg).toOpaque())
     }
 }
 ```
 
-2) On teardown, clear the token and stop workers:
+2) Optional (recommended): enable real-time time-constraint scheduling before starting workers:
 
 ```swift
-engine_clear_audio_workgroup_token()
-engine_stop_workers()
+engine_enable_rt_time_constraint(1)
+engine_start_workers(2) // tune 2–3 based on graph width
 ```
-
-Notes:
-- The engine lazily joins workers to the workgroup once the token is set; you can set it after starting workers.
-- On non-Apple platforms or older OS versions where the header is unavailable, these calls are no-ops.
