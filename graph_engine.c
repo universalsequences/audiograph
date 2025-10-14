@@ -1071,7 +1071,41 @@ void update_orphaned_status(LiveGraph *lg) {
     lg->is_orphaned[i] = !is_watched;
   }
 
-  // If no DAC node exists, non-watched nodes remain orphaned
+  // NEW: Also treat all upstream dependencies of watched nodes as non-orphaned
+  // This allows analyzer/scope-like nodes (and their inputs) to stay active
+  // even when not connected to the DAC.
+  int watch_count = 0;
+  int *watch_nodes = NULL;
+  pthread_mutex_lock(&lg->watch_list_mutex);
+  if (lg->watch_list_count > 0) {
+    watch_count = lg->watch_list_count;
+    watch_nodes = (int *)malloc(sizeof(int) * watch_count);
+    if (watch_nodes) {
+      memcpy(watch_nodes, lg->watch_list, sizeof(int) * watch_count);
+    } else {
+      // Allocation failed; fall back to using 0 count
+      watch_count = 0;
+    }
+  }
+  pthread_mutex_unlock(&lg->watch_list_mutex);
+
+  if (watch_count > 0 && watch_nodes) {
+    bool *wvisited = calloc(lg->node_count, sizeof(bool));
+    if (wvisited) {
+      for (int wi = 0; wi < watch_count; wi++) {
+        int nid = watch_nodes[wi];
+        if (nid >= 0 && nid < lg->node_count) {
+          // DFS upstream from each watched node
+          mark_reachable_from_dac(lg, nid, wvisited);
+        }
+      }
+      free(wvisited);
+    }
+    free(watch_nodes);
+  }
+
+  // If no DAC node exists, non-watched nodes remain orphaned. Upstream of
+  // watched nodes has already been handled above.
   if (lg->dac_node_id < 0) {
     return;
   }
@@ -1090,7 +1124,8 @@ void update_orphaned_status(LiveGraph *lg) {
   }
 
   if (!dac_has_inputs) {
-    // DAC has no inputs, non-watched nodes remain orphaned
+    // DAC has no inputs, non-watched nodes remain orphaned (upstream of
+    // watched nodes already marked above)
     return;
   }
   // DAC has inputs, marking as connected
