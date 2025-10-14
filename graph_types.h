@@ -48,7 +48,8 @@ static inline uint64_t nsec_now(void) {
 // ===================== Kernel ABI =====================
 typedef void (*KernelFn)(float *const *in, float *const *out, int nframes,
                          void *state);
-typedef void (*InitFn)(void *state, int sampleRate, int maxBlock, const void *initial_state);
+typedef void (*InitFn)(void *state, int sampleRate, int maxBlock,
+                       const void *initial_state);
 typedef void (*ResetFn)(void *state);
 typedef void (*MigrateFn)(void *newState, const void *oldState);
 
@@ -68,7 +69,7 @@ typedef struct {
   float fvalue;        // e.g., new gain
 } ParamMsg;
 
-#define PARAM_RING_CAP 256
+#define PARAM_RING_CAP 2048
 
 typedef struct ParamRing {
   ParamMsg buf[PARAM_RING_CAP];
@@ -292,18 +293,18 @@ typedef struct GraphEditQueue {
 // macOS doesn't support POSIX unnamed semaphores, use dispatch_semaphore
 // instead
 typedef struct {
-  MPMCQueue *ring;                // Thread-safe node storage
-  _Atomic int qlen;               // Logical queue length
-  _Atomic int waiters;            // Number of threads waiting on items
-  dispatch_semaphore_t items;     // Semaphore used for wakeups
+  MPMCQueue *ring;            // Thread-safe node storage
+  _Atomic int qlen;           // Logical queue length
+  _Atomic int waiters;        // Number of threads waiting on items
+  dispatch_semaphore_t items; // Semaphore used for wakeups
 } ReadyQ;
 #else
 #include <semaphore.h>
 typedef struct {
-  MPMCQueue *ring;   // Thread-safe node storage
-  _Atomic int qlen;  // Logical queue length
+  MPMCQueue *ring;     // Thread-safe node storage
+  _Atomic int qlen;    // Logical queue length
   _Atomic int waiters; // Number of threads waiting on items
-  sem_t items;       // Semaphore used for wakeups
+  sem_t items;         // Semaphore used for wakeups
 } ReadyQ;
 #endif
 
