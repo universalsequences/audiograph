@@ -24,7 +24,7 @@ typedef struct {
 typedef struct RTNode {
   uint64_t logical_id; // stable ID for migration/params
   NodeVTable vtable;
-  void *state; // aligned, preallocated
+  void *state;       // aligned, preallocated
   size_t state_size; // size of allocated state for watch list copying
   int nInputs, nOutputs;
 
@@ -100,7 +100,7 @@ typedef struct LiveGraph {
   ParamRing *params;
 
   // DAC output sink - the final destination for all audio
-  int dac_node_id; // -1 if no DAC connected
+  int dac_node_id;  // -1 if no DAC connected
   int num_channels; // Number of output channels (1=mono, 2=stereo, etc.)
 
   const char *label;
@@ -122,14 +122,14 @@ typedef struct LiveGraph {
   _Atomic int next_node_id; // Next node ID to allocate (thread-safe)
 
   // Watch list system for state monitoring
-  int *watch_list; // Array of node IDs being watched
-  int watch_list_count; // Current number of watched nodes
-  int watch_list_capacity; // Allocated capacity for watch list
+  int *watch_list;                  // Array of node IDs being watched
+  int watch_list_count;             // Current number of watched nodes
+  int watch_list_capacity;          // Allocated capacity for watch list
   pthread_mutex_t watch_list_mutex; // Protects watch_list modifications
 
   // Thread-safe state store for watched nodes
-  void **state_snapshots; // Array of state copies indexed by node_id
-  size_t *state_sizes; // Array of state sizes indexed by node_id
+  void **state_snapshots;            // Array of state copies indexed by node_id
+  size_t *state_sizes;               // Array of state sizes indexed by node_id
   pthread_rwlock_t state_store_lock; // Reader-writer lock for state access
 } LiveGraph;
 
@@ -152,8 +152,8 @@ typedef struct Engine {
 
   // Optional: Audio Workgroup token for co-scheduling (Apple-only usage)
   // Stored as opaque pointer to avoid hard dependency in public header.
-  _Atomic(void *) oswg;      // os_workgroup_t when available
-  _Atomic int rt_log;        // enable lightweight debug prints from workers
+  _Atomic(void *) oswg; // os_workgroup_t when available
+  _Atomic int rt_log;   // enable lightweight debug prints from workers
   _Atomic int rt_time_constraint; // apply Mach RT time-constraint policy
 } Engine;
 
@@ -169,9 +169,9 @@ void engine_start_workers(int workers);
 void engine_stop_workers(void);
 void apply_params(LiveGraph *g);
 
-// Optional: supply an OS Workgroup object (kAudioOutputUnitProperty_OSWorkgroup)
-// Pass the os_workgroup_t you obtained from the audio unit. No-ops on platforms
-// without OS Workgroup support.
+// Optional: supply an OS Workgroup object
+// (kAudioOutputUnitProperty_OSWorkgroup) Pass the os_workgroup_t you obtained
+// from the audio unit. No-ops on platforms without OS Workgroup support.
 void engine_set_os_workgroup(void *oswg);
 void engine_clear_os_workgroup(void);
 
@@ -189,12 +189,6 @@ void destroy_live_graph(LiveGraph *lg);
 int apply_add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
                    uint64_t logical_id, const char *name, int nInputs,
                    int nOutputs, const void *initial_state);
-int live_add_oscillator(LiveGraph *lg, float freq_hz, const char *name);
-int live_add_gain(LiveGraph *lg, float gain_value, const char *name);
-int live_add_number(LiveGraph *lg, float value, const char *name);
-int live_add_mixer2(LiveGraph *lg, const char *name);
-int live_add_mixer8(LiveGraph *lg, const char *name);
-int live_add_sum(LiveGraph *lg, const char *name, int nInputs);
 bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
                    int dst_port);
 bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
@@ -220,8 +214,8 @@ bool hot_swap_node(LiveGraph *lg, int node_id, NodeVTable vt, size_t state_size,
 
 bool replace_keep_edges(LiveGraph *lg, int node_id, NodeVTable vt,
                         size_t state_size, int nin, int nout, bool xfade,
-                        void (*migrate)(void *, void *), const void *initial_state,
-                        size_t initial_state_size);
+                        void (*migrate)(void *, void *),
+                        const void *initial_state, size_t initial_state_size);
 
 bool is_failed_node(LiveGraph *lg, int node_id);
 void add_failed_id(LiveGraph *lg, uint64_t logical_id);
@@ -242,13 +236,75 @@ void update_orphaned_status(LiveGraph *lg);
 
 // ===================== VTable Creation Functions =====================
 
-NodeVTable create_osc_vtable(float freq_hz);
-NodeVTable create_gain_vtable(float gain_value);  
-NodeVTable create_number_vtable(float number_value);
-
 // ===================== Global Engine Instance =====================
 
 extern Engine g_engine;
 void initialize_engine(int block_size, int sample_rate);
+
+static bool ensure_port_arrays(RTNode *n) {
+  // Validate node before attempting memory allocation
+  if (!n || n->nInputs < 0 || n->nOutputs < 0) {
+    // Invalid node state - return failure
+    return false;
+  }
+
+  // Check for reasonable limits to prevent corruption-induced huge allocations
+  if (n->nInputs > 1000 || n->nOutputs > 1000) {
+    // Likely corrupted node - return failure
+    return false;
+  }
+
+  if (!n->inEdgeId && n->nInputs > 0) {
+    n->inEdgeId = (int32_t *)malloc(sizeof(int32_t) * n->nInputs);
+    if (!n->inEdgeId) {
+      // Malloc failed - this indicates deeper problems
+      return false;
+    }
+    for (int i = 0; i < n->nInputs; i++)
+      n->inEdgeId[i] = -1;
+  }
+
+  if (!n->outEdgeId && n->nOutputs > 0) {
+    n->outEdgeId = (int32_t *)malloc(sizeof(int32_t) * n->nOutputs);
+    if (!n->outEdgeId) {
+      // Malloc failed - this indicates deeper problems
+      return false;
+    }
+    for (int i = 0; i < n->nOutputs; i++)
+      n->outEdgeId[i] = -1;
+  }
+
+  if (!n->fanin_sum_node_id && n->nInputs > 0) {
+    n->fanin_sum_node_id = (int32_t *)malloc(sizeof(int32_t) * n->nInputs);
+    if (!n->fanin_sum_node_id) {
+      // Malloc failed - this is less critical but still indicates problems
+      return false;
+    }
+    for (int i = 0; i < n->nInputs; i++)
+      n->fanin_sum_node_id[i] = -1;
+  }
+
+  return true;
+}
+
+// Allocate (or reuse from pool) an edge buffer; returns edge id or -1
+static int alloc_edge(LiveGraph *lg) {
+  for (int i = 0; i < lg->edge_capacity; i++) {
+    if (!lg->edges[i].in_use) {
+      lg->edges[i].in_use = true;
+      lg->edges[i].refcount = 0;
+      lg->edges[i].src_node = -1;
+      lg->edges[i].src_port = -1;
+      // Allocate buffer if it was freed during retire_edge
+      if (!lg->edges[i].buf) {
+        lg->edges[i].buf = alloc_aligned(64, lg->block_size * sizeof(float));
+      }
+      // Zero buffer for safety
+      memset(lg->edges[i].buf, 0, sizeof(float) * lg->block_size);
+      return i;
+    }
+  }
+  return -1; // pool exhausted; grow in apply_graph_edits if you want
+}
 
 #endif // GRAPH_ENGINE_H

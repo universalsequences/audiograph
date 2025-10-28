@@ -1,149 +1,484 @@
 #include "graph_api.h"
+#include "graph_edit.h"
 #include "graph_nodes.h"
 
-// ===================== Global State =====================
+LiveGraph *create_live_graph(int initial_capacity, int block_size,
+                             const char *label, int num_channels) {
+  LiveGraph *lg = calloc(1, sizeof(LiveGraph));
 
-static uint64_t g_next_node_id = 0x1000;
+  // Node storage
+  lg->node_capacity = initial_capacity;
+  lg->nodes = calloc(lg->node_capacity, sizeof(RTNode));
+  lg->pending = calloc(lg->node_capacity, sizeof(atomic_int));
+  lg->indegree = calloc(lg->node_capacity, sizeof(int));
+  lg->is_orphaned = calloc(lg->node_capacity, sizeof(bool));
 
-// ===================== Graph Builder Operations =====================
+  // Edge pool (start with generous capacity)
+  lg->edge_capacity = initial_capacity * 4;
+  lg->block_size = block_size;
+  lg->num_channels = (num_channels > 0) ? num_channels : 1; // Default to mono
 
-GraphBuilder *create_graph_builder(void) {
-  GraphBuilder *gb = calloc(1, sizeof(GraphBuilder));
-  gb->node_capacity = 16;
-  gb->nodes = calloc(gb->node_capacity, sizeof(AudioNode *));
-  return gb;
-}
+  // Initialize Retire List
+  lg->retire_capacity = 32;
+  lg->retire_count = 0;
+  lg->retire_list = calloc(lg->retire_capacity, sizeof(RetireEntry));
 
-void add_node_to_builder(GraphBuilder *gb, AudioNode *node) {
-  if (gb->node_count >= gb->node_capacity) {
-    gb->node_capacity *= 2;
-    gb->nodes = realloc(gb->nodes, gb->node_capacity * sizeof(AudioNode *));
-  }
-  gb->nodes[gb->node_count++] = node;
-}
-
-int find_node_index(GraphBuilder *gb, AudioNode *target) {
-  for (int i = 0; i < gb->node_count; i++) {
-    if (gb->nodes[i] == target)
-      return i;
-  }
-  return -1; // not found
-}
-
-void free_graph_builder(GraphBuilder *gb) {
-  for (int i = 0; i < gb->node_count; i++) {
-    AudioNode *node = gb->nodes[i];
-    free(node->inputs);
-    free(node->outputs);
-    // Note: don't free node->state - it's transferred to the compiled graph
-    free(node);
-  }
-  free(gb->nodes);
-  free(gb);
-}
-
-// ===================== Web Audio-Style Node Creation =====================
-
-AudioNode *create_oscillator(GraphBuilder *gb, float freq_hz,
-                             const char *name) {
-  AudioNode *node = calloc(1, sizeof(AudioNode));
-  node->logical_id = ++g_next_node_id;
-  node->vtable = OSC_VTABLE;
-  node->name = name;
-
-  // Allocate and initialize memory
-  float *memory = calloc(OSC_MEMORY_SIZE, sizeof(float));
-  memory[OSC_PHASE] = 0.0f;
-  memory[OSC_INC] = freq_hz / 48000.0f; // assume 48kHz for now
-  node->state = memory;
-
-  add_node_to_builder(gb, node);
-  return node;
-}
-
-AudioNode *create_gain(GraphBuilder *gb, float gain_value, const char *name) {
-  AudioNode *node = calloc(1, sizeof(AudioNode));
-  node->logical_id = ++g_next_node_id;
-  node->vtable = GAIN_VTABLE;
-  node->name = name;
-
-  // Allocate and initialize memory
-  float *memory = calloc(GAIN_MEMORY_SIZE, sizeof(float));
-  memory[GAIN_VALUE] = gain_value;
-  node->state = memory;
-
-  add_node_to_builder(gb, node);
-  return node;
-}
-
-AudioNode *create_mixer2(GraphBuilder *gb, const char *name) {
-  AudioNode *node = calloc(1, sizeof(AudioNode));
-  node->logical_id = ++g_next_node_id;
-  node->vtable = MIX2_VTABLE;
-  node->name = name;
-  node->state = NULL; // mixer has no memory
-
-  add_node_to_builder(gb, node);
-  return node;
-}
-
-AudioNode *create_mixer3(GraphBuilder *gb, const char *name) {
-  AudioNode *node = calloc(1, sizeof(AudioNode));
-  node->logical_id = ++g_next_node_id;
-  node->vtable = (NodeVTable){
-      .process = mix3_process, .init = NULL, .reset = NULL, .migrate = NULL};
-  node->name = name;
-  node->state = NULL; // mixer has no memory
-
-  add_node_to_builder(gb, node);
-  return node;
-}
-
-// ===================== Generic Node Creation Helper =====================
-
-AudioNode *create_generic_node(GraphBuilder *gb, KernelFn process_fn,
-                               int memory_size, int num_inputs, int num_outputs,
-                               const char *name) {
-  AudioNode *node = calloc(1, sizeof(AudioNode));
-  if (!node)
-    return NULL;
-
-  node->logical_id = ++g_next_node_id;
-  node->vtable.process = process_fn;
-  node->vtable.init = NULL; // Generic nodes don't have init by default
-  node->vtable.reset = NULL;
-  node->vtable.migrate = NULL; // Generic nodes don't migrate by default
-  node->name = name;
-
-  // Allocate memory if needed
-  if (memory_size > 0) {
-    node->state = calloc(memory_size, sizeof(float));
-    if (!node->state) {
-      free(node);
+  // New port-based edge pool
+  lg->edges = calloc(lg->edge_capacity, sizeof(LiveEdge));
+  for (int i = 0; i < lg->edge_capacity; i++) {
+    lg->edges[i].buf = alloc_aligned(64, block_size * sizeof(float));
+    if (!lg->edges[i].buf) {
       return NULL;
     }
-  } else {
-    node->state = NULL;
+    lg->edges[i].in_use = false;
+    lg->edges[i].refcount = 0;
+    lg->edges[i].src_node = -1;
+    lg->edges[i].src_port = -1;
   }
 
-  // Store I/O counts for potential future use
-  // (Currently AudioNode doesn't store these, but RTNode will get them during
-  // compilation)
-  (void)num_inputs;
-  (void)num_outputs;
+  // Support buffers for port system
+  lg->silence_buf = alloc_aligned(64, block_size * sizeof(float));
+  lg->scratch_null = alloc_aligned(64, block_size * sizeof(float));
+  memset(lg->silence_buf, 0,
+         block_size * sizeof(float)); // keep silence buffer zeroed
 
-  add_node_to_builder(gb, node);
-  return node;
+  // Ready queue (ReadyQ with MPMC + semaphore for thread safety)
+  // BURST FIX: Increased capacity from 1024 to 4096 for wide graphs
+  lg->readyQueue = rq_create(4096);
+  if (!lg->readyQueue) {
+    // Handle allocation failure - clean up port-based edges
+    for (int i = 0; i < lg->edge_capacity; i++) {
+      free(lg->edges[i].buf);
+    }
+    free(lg->edges);
+    free(lg->silence_buf);
+    free(lg->scratch_null);
+    free(lg->nodes);
+    free(lg->pending);
+    free(lg->indegree);
+    free(lg->is_orphaned);
+    free(lg);
+    return NULL;
+  }
+
+  // Parameter mailbox
+  lg->params = calloc(1, sizeof(ParamRing));
+
+  lg->graphEditQueue = calloc(1, sizeof(GraphEditQueue));
+  geq_init(lg->graphEditQueue, 256);
+
+  // Initialize failed IDs tracking
+  lg->failed_ids_capacity = 64; // Start with reasonable capacity
+  lg->failed_ids = calloc(lg->failed_ids_capacity, sizeof(uint64_t));
+  lg->failed_ids_count = 0;
+
+  // Initialize atomic node ID counter (start at 1 to avoid confusion with DAC
+  // at 0)
+  atomic_init(&lg->next_node_id, 1);
+
+  // Initialize watch list system
+  lg->watch_list_capacity = 16;
+  lg->watch_list = calloc(lg->watch_list_capacity, sizeof(int));
+  lg->watch_list_count = 0;
+  pthread_mutex_init(&lg->watch_list_mutex, NULL);
+
+  // Initialize state store arrays (indexed by node_id)
+  lg->state_snapshots = calloc(lg->node_capacity, sizeof(void *));
+  lg->state_sizes = calloc(lg->node_capacity, sizeof(size_t));
+  pthread_rwlock_init(&lg->state_store_lock, NULL);
+
+  // Automatically create the DAC node at index 0
+  // DAC has one input and one output per channel
+  int dac_id = apply_add_node(lg, DAC_VTABLE, 0, 0, "DAC", lg->num_channels,
+                              lg->num_channels, NULL);
+  if (dac_id >= 0) {
+    lg->dac_node_id = dac_id; // Remember the DAC node
+
+    RTNode *dac = &lg->nodes[dac_id];
+    dac->nInputs = lg->num_channels; // DAC has N inputs (one per channel)
+    dac->nOutputs =
+        lg->num_channels; // DAC has N outputs (for reading final audio)
+    if (!ensure_port_arrays(dac)) {
+      // DAC node allocation failed - this is critical
+      return NULL;
+    }
+
+    // Allocate output edges for each channel of the DAC
+    for (int ch = 0; ch < lg->num_channels; ch++) {
+      int output_edge = alloc_edge(lg);
+      if (output_edge >= 0) {
+        dac->outEdgeId[ch] = output_edge; // Use port-based system
+      }
+    }
+  }
+
+  lg->label = label;
+  return lg;
 }
 
-// ===================== Connection API =====================
+void destroy_live_graph(LiveGraph *lg) {
+  if (!lg)
+    return;
 
-// ===================== Graph Compilation Helpers =====================
-
-int count_total_edges(GraphBuilder *gb) {
-  int total = 0;
-  for (int i = 0; i < gb->node_count; i++) {
-    total += gb->nodes[i]->output_count;
+  // Free all edge buffers
+  if (lg->edges) {
+    for (int i = 0; i < lg->edge_capacity; i++) {
+      if (lg->edges[i].buf) {
+        free(lg->edges[i].buf);
+      }
+    }
+    free(lg->edges);
   }
-  return total;
+
+  // Free all node state and port arrays
+  if (lg->nodes) {
+    for (int i = 0; i < lg->node_count; i++) { // Use count, not capacity
+      RTNode *node = &lg->nodes[i];
+
+      if (node->state) {
+        free(node->state);
+      }
+      if (node->inEdgeId) {
+        free(node->inEdgeId);
+      }
+      if (node->outEdgeId) {
+        free(node->outEdgeId);
+      }
+      if (node->fanin_sum_node_id) {
+        free(node->fanin_sum_node_id);
+      }
+      if (node->succ) {
+        free(node->succ);
+      }
+    }
+    free(lg->nodes);
+  }
+
+  // Free scheduling arrays
+  if (lg->pending)
+    free(lg->pending);
+  if (lg->indegree)
+    free(lg->indegree);
+  if (lg->is_orphaned)
+    free(lg->is_orphaned);
+
+  // Free support buffers
+  if (lg->silence_buf)
+    free(lg->silence_buf);
+  if (lg->scratch_null)
+    free(lg->scratch_null);
+
+  // Free queues
+  if (lg->readyQueue)
+    rq_destroy(lg->readyQueue);
+  if (lg->params)
+    free(lg->params);
+  if (lg->graphEditQueue) {
+    if (lg->graphEditQueue->buf)
+      free(lg->graphEditQueue->buf);
+    free(lg->graphEditQueue);
+  }
+
+  // Free failed IDs tracking
+  if (lg->failed_ids)
+    free(lg->failed_ids);
+
+  // Free watch list system
+  if (lg->watch_list)
+    free(lg->watch_list);
+  pthread_mutex_destroy(&lg->watch_list_mutex);
+
+  // Free state snapshots
+  if (lg->state_snapshots) {
+    for (int i = 0; i < lg->node_capacity; i++) {
+      if (lg->state_snapshots[i]) {
+        free(lg->state_snapshots[i]);
+      }
+    }
+    free(lg->state_snapshots);
+  }
+  if (lg->state_sizes)
+    free(lg->state_sizes);
+  pthread_rwlock_destroy(&lg->state_store_lock);
+
+  // Free the graph itself
+  free(lg);
+}
+
+int add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
+             const char *name, int nInputs, int nOutputs,
+             const void *initial_state, size_t initial_state_size) {
+  // Atomically allocate the next node ID (which is also the array index)
+  int node_id = atomic_fetch_add(&lg->next_node_id, 1);
+
+  // Create a copy of initial_state if provided
+  void *initial_state_copy = NULL;
+  if (initial_state && initial_state_size > 0) {
+    initial_state_copy = malloc(initial_state_size);
+    if (initial_state_copy) {
+      memcpy(initial_state_copy, initial_state, initial_state_size);
+    }
+  }
+
+  // Create the command
+  GraphEditCmd cmd = {
+      .op = GE_ADD_NODE,
+      .u.add_node = {
+          .vt = vtable,
+          .state_size = state_size,
+          .logical_id =
+              node_id, // Use node_id as the logical_id (they're the same)
+          .name = (char *)name,
+          .nInputs = nInputs,
+          .nOutputs = nOutputs,
+          .initial_state = initial_state_copy,
+          .initial_state_size = initial_state_size}};
+
+  // Queue the command
+  if (!geq_push(lg->graphEditQueue, &cmd)) {
+    // Queue full - consider this a failure
+    if (initial_state_copy) {
+      free(initial_state_copy);
+    }
+    add_failed_id(lg, node_id);
+    return -1;
+  }
+
+  // Return the pre-allocated node ID (which is both logical_id and array index)
+  return node_id;
+}
+
+bool is_failed_node(LiveGraph *lg, int logical_id) {
+  // Check if this logical ID is in the failed list
+  for (int i = 0; i < lg->failed_ids_count; i++) {
+    if (lg->failed_ids[i] == (uint64_t)logical_id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ===================== Queue-based API =====================
+
+bool delete_node(LiveGraph *lg, int node_id) {
+  GraphEditCmd cmd = {.op = GE_REMOVE_NODE,
+                      .u.remove_node = {.node_id = node_id}};
+
+  return geq_push(lg->graphEditQueue, &cmd);
+}
+
+bool graph_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
+                   int dst_port) {
+  // Check if either node has failed
+  if (is_failed_node(lg, src_node) || is_failed_node(lg, dst_node)) {
+    return false;
+  }
+
+  GraphEditCmd cmd = {.op = GE_CONNECT,
+                      .u.connect = {.src_id = src_node,
+                                    .src_port = src_port,
+                                    .dst_id = dst_node,
+                                    .dst_port = dst_port}};
+
+  return geq_push(lg->graphEditQueue, &cmd);
+}
+
+bool graph_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
+                      int dst_port) {
+  GraphEditCmd cmd = {.op = GE_DISCONNECT,
+                      .u.disconnect = {.src_id = src_node,
+                                       .src_port = src_port,
+                                       .dst_id = dst_node,
+                                       .dst_port = dst_port}};
+
+  return geq_push(lg->graphEditQueue, &cmd);
+}
+
+bool hot_swap_node(LiveGraph *lg, int node_id, NodeVTable vt, size_t state_size,
+                   int nin, int nout, bool xfade,
+                   void (*migrate)(void *, void *), const void *initial_state,
+                   size_t initial_state_size) {
+  if (is_failed_node(lg, node_id)) {
+    return false;
+  }
+
+  // Create a copy of initial_state if provided
+  void *initial_state_copy = NULL;
+  if (initial_state && initial_state_size > 0) {
+    initial_state_copy = malloc(initial_state_size);
+    if (initial_state_copy) {
+      memcpy(initial_state_copy, initial_state, initial_state_size);
+    }
+  }
+
+  GraphEditCmd cmd = {.op = GE_HOT_SWAP_NODE,
+                      .u.hot_swap_node =
+                          {
+                              .vt = vt,
+                              .state_size = state_size,
+                              .node_id = node_id,
+                              .new_nInputs = nin,
+                              .new_nOutputs = nout,
+                              .initial_state = initial_state_copy,
+                              .initial_state_size = initial_state_size,
+                          }
+
+  };
+  if (!geq_push(lg->graphEditQueue, &cmd)) {
+    // Queue push failed - clean up copied memory
+    if (initial_state_copy) {
+      free(initial_state_copy);
+    }
+    return false;
+  }
+  return true;
+}
+
+bool replace_keep_edges(LiveGraph *lg, int node_id, NodeVTable vt,
+                        size_t state_size, int nin, int nout, bool xfade,
+                        void (*migrate)(void *, void *),
+                        const void *initial_state, size_t initial_state_size) {
+  // Create a copy of initial_state if provided
+  void *initial_state_copy = NULL;
+  if (initial_state && initial_state_size > 0) {
+    initial_state_copy = malloc(initial_state_size);
+    if (initial_state_copy) {
+      memcpy(initial_state_copy, initial_state, initial_state_size);
+    }
+  }
+
+  GraphEditCmd cmd = {.op = GE_REPLACE_KEEP_EDGES,
+                      .u.replace_keep_edges = {
+                          .vt = vt,
+                          .state_size = state_size,
+                          .node_id = node_id,
+                          .new_nInputs = nin,
+                          .new_nOutputs = nout,
+                          .initial_state = initial_state_copy,
+                          .initial_state_size = initial_state_size,
+
+                      }};
+  if (!geq_push(lg->graphEditQueue, &cmd)) {
+    // Queue push failed - clean up copied memory
+    if (initial_state_copy) {
+      free(initial_state_copy);
+    }
+    return false;
+  }
+  return true;
+}
+
+void retire_later(LiveGraph *lg, void *ptr, void (*deleter)(void *)) {
+  if (!ptr)
+    return;
+  if (lg->retire_count >= lg->retire_capacity) {
+    lg->retire_capacity = lg->retire_capacity ? lg->retire_capacity * 2 : 16;
+    lg->retire_list =
+        realloc(lg->retire_list, lg->retire_capacity * sizeof(RetireEntry));
+  }
+  lg->retire_list[lg->retire_count++] =
+      (RetireEntry){.ptr = ptr, .deleter = deleter};
+}
+
+// ===================== Watch List Implementation =====================
+
+bool add_node_to_watchlist(LiveGraph *lg, int node_id) {
+  if (!lg || node_id < 0 || node_id >= lg->node_capacity) {
+    return false;
+  }
+
+  pthread_mutex_lock(&lg->watch_list_mutex);
+
+  // Check if node is already in watchlist
+  for (int i = 0; i < lg->watch_list_count; i++) {
+    if (lg->watch_list[i] == node_id) {
+      pthread_mutex_unlock(&lg->watch_list_mutex);
+      return true; // Already watched
+    }
+  }
+
+  // Expand capacity if needed
+  if (lg->watch_list_count >= lg->watch_list_capacity) {
+    lg->watch_list_capacity *= 2;
+    lg->watch_list =
+        realloc(lg->watch_list, lg->watch_list_capacity * sizeof(int));
+    if (!lg->watch_list) {
+      pthread_mutex_unlock(&lg->watch_list_mutex);
+      return false;
+    }
+  }
+
+  // Add node to watchlist
+  lg->watch_list[lg->watch_list_count++] = node_id;
+  pthread_mutex_unlock(&lg->watch_list_mutex);
+
+  // Update orphan status so the watched node becomes active immediately
+  update_orphaned_status(lg);
+
+  return true;
+}
+
+bool remove_node_from_watchlist(LiveGraph *lg, int node_id) {
+  if (!lg || node_id < 0) {
+    return false;
+  }
+
+  pthread_mutex_lock(&lg->watch_list_mutex);
+
+  // Find and remove node from watchlist
+  for (int i = 0; i < lg->watch_list_count; i++) {
+    if (lg->watch_list[i] == node_id) {
+      // Shift remaining elements
+      for (int j = i; j < lg->watch_list_count - 1; j++) {
+        lg->watch_list[j] = lg->watch_list[j + 1];
+      }
+      lg->watch_list_count--;
+
+      // Clean up state snapshot if it exists
+      pthread_rwlock_wrlock(&lg->state_store_lock);
+      if (node_id < lg->node_capacity && lg->state_snapshots[node_id]) {
+        free(lg->state_snapshots[node_id]);
+        lg->state_snapshots[node_id] = NULL;
+        lg->state_sizes[node_id] = 0;
+      }
+      pthread_rwlock_unlock(&lg->state_store_lock);
+
+      pthread_mutex_unlock(&lg->watch_list_mutex);
+
+      // Update orphan status since the node may become orphaned again
+      update_orphaned_status(lg);
+
+      return true;
+    }
+  }
+
+  pthread_mutex_unlock(&lg->watch_list_mutex);
+  return false; // Node not found in watchlist
+}
+
+void *get_node_state(LiveGraph *lg, int node_id, size_t *state_size) {
+  if (!lg || node_id < 0 || node_id >= lg->node_capacity) {
+    if (state_size)
+      *state_size = 0;
+    return NULL;
+  }
+
+  pthread_rwlock_rdlock(&lg->state_store_lock);
+
+  void *result = NULL;
+  size_t size = 0;
+
+  if (lg->state_snapshots[node_id] && lg->state_sizes[node_id] > 0) {
+    size = lg->state_sizes[node_id];
+    result = malloc(size);
+    if (result) {
+      memcpy(result, lg->state_snapshots[node_id], size);
+    }
+  }
+
+  pthread_rwlock_unlock(&lg->state_store_lock);
+
+  if (state_size)
+    *state_size = size;
+  return result;
 }
