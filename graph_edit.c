@@ -296,6 +296,7 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
       if (!ok) {
         // Track the failed logical ID
         add_failed_id(lg, cmd.u.add_node.logical_id);
+        printf("failed to add node=%d\n", cmd.u.add_node.logical_id);
       }
       // Clean up allocated initial_state memory
       if (cmd.u.add_node.initial_state) {
@@ -309,6 +310,10 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
     case GE_CONNECT: {
       ok = apply_connect(lg, cmd.u.connect.src_id, cmd.u.connect.src_port,
                          cmd.u.connect.dst_id, cmd.u.connect.dst_port);
+      if (!ok) {
+        printf("failed to connect src=%d dest=%d\n", cmd.u.connect.src_id,
+               cmd.u.connect.dst_id);
+      }
       break;
     }
     case GE_DISCONNECT: {
@@ -1032,7 +1037,6 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
         free_id = atomic_fetch_add(&lg->next_node_id, 1);
       }
       sum_id = apply_add_node(lg, SUM_VTABLE, 0, free_id, "SUM", 2, 1, NULL);
-      printf("created add auto sum node=%d\n", sum_id);
       if (sum_id < 0)
         return false;
       RTNode *SUM = &lg->nodes[sum_id];
@@ -1065,7 +1069,6 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       }
 
       // Hook old_src → SUM.in0 (reuse existing edge)
-      printf("Reusing existing edge in sum.in0 eid=%d\n", existing_eid);
       SUM->inEdgeId[0] = existing_eid;
       lg->edges[existing_eid].refcount++; // SUM consumes it now
       indegree_inc_on_first_pred(lg, old_src, sum_id);
@@ -1074,7 +1077,6 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
       int sum_out = SUM->outEdgeId[0];
       if (sum_out == -1) {
         sum_out = alloc_edge(lg);
-        printf("allocating output edge for sum=%d\n", sum_out);
         if (sum_out < 0)
           return false;
         SUM->outEdgeId[0] = sum_out;
@@ -1084,10 +1086,8 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
 
       // New source S → SUM.in1
       int new_eid = S->outEdgeId[src_port];
-      printf("outEdgeId[src_port=%d] = %d", src_port, new_eid);
       if (new_eid == -1) {
         new_eid = alloc_edge(lg);
-        printf("had to allocate=%d\n", new_eid);
         if (new_eid < 0)
           return false;
         S->outEdgeId[src_port] = new_eid;

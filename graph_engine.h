@@ -153,6 +153,8 @@ typedef struct Engine {
   // Optional: Audio Workgroup token for co-scheduling (Apple-only usage)
   // Stored as opaque pointer to avoid hard dependency in public header.
   _Atomic(void *) oswg; // os_workgroup_t when available
+  _Atomic int oswg_join_pending; // set to 1 to wake workers for workgroup join
+  _Atomic int oswg_join_remaining; // count of workers that need to see the flag
   _Atomic int rt_log;   // enable lightweight debug prints from workers
   _Atomic int rt_time_constraint; // apply Mach RT time-constraint policy
 } Engine;

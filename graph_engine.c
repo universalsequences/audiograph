@@ -82,6 +82,8 @@ void initialize_engine(int block_Size, int sample_rate) {
   g_engine.blockSize = block_Size;
   g_engine.sampleRate = sample_rate;
   atomic_store_explicit(&g_engine.oswg, NULL, memory_order_relaxed);
+  atomic_store_explicit(&g_engine.oswg_join_pending, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_engine.oswg_join_remaining, 0, memory_order_relaxed);
   atomic_store_explicit(&g_engine.rt_time_constraint, 0, memory_order_relaxed);
 }
 
@@ -114,6 +116,9 @@ static void wait_for_block_start_or_shutdown(void) {
   pthread_mutex_lock(&g_engine.sess_mtx);
   for (;;) {
     if (!atomic_load_explicit(&g_engine.runFlag, memory_order_acquire))
+      break;
+    // Also wake if workgroup join is pending
+    if (atomic_load_explicit(&g_engine.oswg_join_pending, memory_order_acquire))
       break;
     LiveGraph *lg =
         atomic_load_explicit(&g_engine.workSession, memory_order_acquire);
@@ -189,11 +194,8 @@ static void *worker_main(void *arg) {
     if (!atomic_load_explicit(&g_engine.runFlag, memory_order_acquire))
       break;
 
-    LiveGraph *lg =
-        atomic_load_explicit(&g_engine.workSession, memory_order_acquire);
-    if (!lg)
-      continue; // spurious wake or block already ended
-
+    // Handle OS workgroup joining BEFORE checking for work session
+    // This allows workers to join even when there's no work yet
 #ifdef HAVE_OS_WORKGROUP
     if (!oswg_joined) {
       void *w = atomic_load_explicit(&g_engine.oswg, memory_order_acquire);
@@ -201,6 +203,18 @@ static void *worker_main(void *arg) {
         oswg = (os_workgroup_t)w;
         bool ok = os_workgroup_join(oswg, &oswg_token);
         oswg_joined = ok;
+        if (ok) {
+          printf("[audiograph] worker %p joined os_workgroup\n", (void *)pthread_self());
+          // Decrement counter; last worker to reach 0 clears the flag
+          int remaining =
+            atomic_fetch_sub_explicit(&g_engine.oswg_join_remaining, 1,
+                                    memory_order_acq_rel) -
+            1;
+          if (remaining == 0) {
+            atomic_store_explicit(&g_engine.oswg_join_pending, 0,
+                              memory_order_release);
+          }
+        } else {
         if (!oswg_logged) {
           fprintf(
               stderr,
@@ -209,14 +223,20 @@ static void *worker_main(void *arg) {
               (void *)pthread_self(), (void *)oswg);
           oswg_logged = true;
         }
+        }
       } else if (!oswg_warned) {
         fprintf(
             stderr,
             "[audiograph] os_workgroup pointer not set; workers not joined\n");
         oswg_warned = true;
       }
-    }
+         }
 #endif
+
+    LiveGraph *lg =
+        atomic_load_explicit(&g_engine.workSession, memory_order_acquire);
+    if (!lg)
+      continue; // spurious wake or no work - but workgroup joining is done
 
     // Hot loop: run until this block is complete
     for (;;) {
@@ -302,9 +322,19 @@ void engine_set_os_workgroup(void *oswg_ptr) {
 #ifdef HAVE_OS_WORKGROUP
   // Store opaque pointer; Swift side retains it.
   atomic_store_explicit(&g_engine.oswg, oswg_ptr, memory_order_release);
+
+  // Set counter to number of workers, then set flag and broadcast
+  // This ensures all workers see the flag before it's cleared
+  atomic_store_explicit(&g_engine.oswg_join_remaining, g_engine.workerCount,
+                        memory_order_release);
+  atomic_store_explicit(&g_engine.oswg_join_pending, 1, memory_order_release);
+  pthread_mutex_lock(&g_engine.sess_mtx);
+  pthread_cond_broadcast(&g_engine.sess_cv);
+  pthread_mutex_unlock(&g_engine.sess_mtx);
+
   fprintf(stderr,
-          "[audiograph] set os_workgroup=%p (will join on next block)\n",
-          oswg_ptr);
+          "[audiograph] set os_workgroup=%p (waking %d workers to join now)\n",
+          oswg_ptr, g_engine.workerCount);
 #else
   (void)oswg_ptr;
   fprintf(
@@ -408,10 +438,12 @@ static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes) {
   // Notify successors (node-level)
   for (int i = 0; i < node->succCount; i++) {
     int succ = node->succ[i];
-    if (succ < 0 || succ >= lg->node_count)
+    if (succ < 0 || succ >= lg->node_count) {
       continue;
-    if (lg->is_orphaned[succ])
+    }
+    if (lg->is_orphaned[succ]) {
       continue;
+    }
     if (atomic_fetch_sub_explicit(&lg->pending[succ], 1,
                                   memory_order_acq_rel) == 1) {
       rq_push_or_spin(lg->readyQueue, succ); // CRITICAL FIX: Never drop work
@@ -509,6 +541,7 @@ void process_live_block(LiveGraph *lg, int nframes) {
   if (atomic_load_explicit(&lg->jobsInFlight, memory_order_acquire) <= 0)
     return;
 
+
   if (g_engine.workerCount > 0) {
     // Publish session frames and graph
     atomic_store_explicit(&g_engine.sessionFrames, nframes,
@@ -562,6 +595,7 @@ void process_next_block(LiveGraph *lg, float *output_buffer, int nframes) {
   }
 
   apply_graph_edits(lg->graphEditQueue, lg);
+
   apply_params(lg);
 
   // Process in slices if callback frames exceed internal block size.

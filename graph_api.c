@@ -14,7 +14,7 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   lg->is_orphaned = calloc(lg->node_capacity, sizeof(bool));
 
   // Edge pool (start with generous capacity)
-  lg->edge_capacity = initial_capacity * 4;
+  lg->edge_capacity = initial_capacity * 32;
   lg->block_size = block_size;
   lg->num_channels = (num_channels > 0) ? num_channels : 1; // Default to mono
 
@@ -65,7 +65,7 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   lg->params = calloc(1, sizeof(ParamRing));
 
   lg->graphEditQueue = calloc(1, sizeof(GraphEditQueue));
-  geq_init(lg->graphEditQueue, 256);
+  geq_init(lg->graphEditQueue, 8192);
 
   // Initialize failed IDs tracking
   lg->failed_ids_capacity = 64; // Start with reasonable capacity
@@ -271,6 +271,7 @@ bool graph_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
                    int dst_port) {
   // Check if either node has failed
   if (is_failed_node(lg, src_node) || is_failed_node(lg, dst_node)) {
+    printf("could not connect because failed node\n");
     return false;
   }
 
