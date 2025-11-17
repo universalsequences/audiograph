@@ -522,6 +522,8 @@ static void drain_retire_list(LiveGraph *lg) {
   lg->retire_count = 0;
 }
 
+static void update_watched_node_states(LiveGraph *lg);
+
 void process_live_block(LiveGraph *lg, int nframes) {
   // Initialize pending counts and seed ready queue
   init_pending_and_seed(lg);
@@ -536,12 +538,15 @@ void process_live_block(LiveGraph *lg, int nframes) {
         memset(lg->edges[master_edge_id].buf, 0, nframes * sizeof(float));
       }
     }
+    update_watched_node_states(lg);
     return;
   }
 
   // check if no work to be done
-  if (atomic_load_explicit(&lg->jobsInFlight, memory_order_acquire) <= 0)
+  if (atomic_load_explicit(&lg->jobsInFlight, memory_order_acquire) <= 0) {
+    update_watched_node_states(lg);
     return;
+  }
 
 
   if (g_engine.workerCount > 0) {
@@ -576,14 +581,15 @@ void process_live_block(LiveGraph *lg, int nframes) {
   }
 
   drain_retire_list(lg);
+
+  // Update watched node states after processing this block (covers both
+  // direct process_live_block callers and the process_next_block wrapper).
+  update_watched_node_states(lg);
 }
 
 int find_live_output(LiveGraph *lg) {
   return lg->dac_node_id; // Simply return the DAC node - no searching needed
 }
-
-// Forward declaration for watch list function
-static void update_watched_node_states(LiveGraph *lg);
 
 // ===================== Live Engine Implementation =====================
 void process_next_block(LiveGraph *lg, float *output_buffer, int nframes) {

@@ -153,10 +153,16 @@ int main() {
   printf("Removed osc1 from watchlist: %s\n", removed ? "success" : "failed");
   assert(removed == true);
 
-  // Try to remove again (should fail)
+  process_next_block(lg, output_buffer, 128);
+
+  // Try to remove again (should be a no-op once first removal is applied)
   bool removed2 = remove_node_from_watchlist(lg, osc1_id);
-  printf("Tried to remove osc1 again: %s\n", removed2 ? "success" : "failed");
-  assert(removed2 == false);
+  printf("Tried to remove osc1 again (queued=%s)\n", removed2 ? "yes" : "no");
+  process_next_block(lg, output_buffer, 128);
+  void *state_after_second = get_node_state(lg, osc1_id, NULL);
+  assert(state_after_second == NULL);
+  if (state_after_second)
+    free(state_after_second);
 
   // Clean up
   destroy_live_graph(lg);

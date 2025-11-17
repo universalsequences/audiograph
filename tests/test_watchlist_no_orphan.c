@@ -120,6 +120,9 @@ int main() {
   remove_node_from_watchlist(lg, osc_id);
   remove_node_from_watchlist(lg, gain_id);
 
+  memset(output_buffer, 0, sizeof(output_buffer));
+  process_next_block(lg, output_buffer, 128);
+
   // Force orphan status update again
   update_orphaned_status(lg);
 

@@ -2,6 +2,7 @@
 #include "graph_engine.h"
 #include "graph_nodes.h"
 #include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -15,15 +16,14 @@ int main(void) {
     return 1;
   }
 
-  void **initial_snapshots = lg->state_snapshots;
-  size_t *initial_sizes = lg->state_sizes;
   const int total_nodes = 150; // ensure multiple growth operations
 
   for (int i = 1; i <= total_nodes; i++) {
     float init = (float)i;
-    int node_id = apply_add_node(
-        lg, NUMBER_VTABLE, NUMBER_MEMORY_SIZE * sizeof(float), (uint64_t)i,
-        "number", 0, 1, &init);
+    int node_id =
+        apply_add_node(lg, NUMBER_VTABLE,
+                       NUMBER_MEMORY_SIZE * sizeof(float), (uint64_t)i,
+                       "number", 0, 1, &init);
     if (node_id < 0) {
       printf("FAILED: apply_add_node returned %d at iteration %d\n", node_id,
              i);
@@ -40,69 +40,43 @@ int main(void) {
     }
   }
 
-  if (lg->node_capacity <= initial_capacity) {
-    printf("FAILED: node capacity did not grow (still %d)\n",
-           lg->node_capacity);
-    destroy_live_graph(lg);
-    return 1;
-  }
-
-  if (lg->state_snapshots == initial_snapshots) {
-    printf("FAILED: state_snapshots pointer did not change after growth\n");
-    destroy_live_graph(lg);
-    return 1;
-  }
-
-  if (lg->state_sizes == initial_sizes) {
-    printf("FAILED: state_sizes pointer did not change after growth\n");
-    destroy_live_graph(lg);
-    return 1;
-  }
-
   const int watched_nodes[] = {30, 60, 90, 120, 150};
   const size_t expected_size = NUMBER_MEMORY_SIZE * sizeof(float);
 
-  // Confirm newly sized arrays are addressable for high node IDs.
-  for (size_t i = 0; i < sizeof(watched_nodes) / sizeof(watched_nodes[0]);
-       i++) {
-    int node_id = watched_nodes[i];
-    if (node_id >= lg->node_capacity) {
-      printf("FAILED: node_id %d outside node_capacity %d\n", node_id,
-             lg->node_capacity);
-      destroy_live_graph(lg);
-      return 1;
-    }
-    if (lg->state_snapshots[node_id] != NULL ||
-        lg->state_sizes[node_id] != 0) {
-      printf("FAILED: expected fresh slots at node %d to be zeroed\n", node_id);
-      destroy_live_graph(lg);
-      return 1;
-    }
-
-    // Simulate snapshot allocation to ensure write/read succeeds.
-    lg->state_snapshots[node_id] = malloc(expected_size);
-    if (!lg->state_snapshots[node_id]) {
-      printf("FAILED: malloc for node %d snapshot slot\n", node_id);
-      destroy_live_graph(lg);
-      return 1;
-    }
-    lg->state_sizes[node_id] = expected_size;
-    memset(lg->state_snapshots[node_id], 0xAB, expected_size);
+  // Run a few blocks to let watchlist copy state snapshots.
+  float tmp_output[block_size];
+  for (int i = 0; i < 3; i++) {
+    process_next_block(lg, tmp_output, block_size);
   }
 
-  // Ensure runtime functions can run without crashing after growth.
-  process_live_block(lg, block_size);
-
-  // Clean up allocated test buffers.
-  for (size_t i = 0; i < sizeof(watched_nodes) / sizeof(watched_nodes[0]);
-       i++) {
+  for (size_t i = 0; i < sizeof(watched_nodes) / sizeof(watched_nodes[0]); i++) {
     int node_id = watched_nodes[i];
-    free(lg->state_snapshots[node_id]);
-    lg->state_snapshots[node_id] = NULL;
-    lg->state_sizes[node_id] = 0;
+    size_t snapshot_size = 0;
+    float *snapshot = (float *)get_node_state(lg, node_id, &snapshot_size);
+    if (!snapshot) {
+      printf("FAILED: snapshot missing for node %d\n", node_id);
+      destroy_live_graph(lg);
+      return 1;
+    }
+    if (snapshot_size != expected_size) {
+      printf("FAILED: snapshot size mismatch for node %d (expected %zu, got %zu)\n",
+             node_id, expected_size, snapshot_size);
+      free(snapshot);
+      destroy_live_graph(lg);
+      return 1;
+    }
+    float expected = (float)node_id;
+    if (fabsf(snapshot[0] - expected) > 0.0001f) {
+      printf("FAILED: snapshot value mismatch for node %d (expected %.1f, got %.6f)\n",
+             node_id, expected, snapshot[0]);
+      free(snapshot);
+      destroy_live_graph(lg);
+      return 1;
+    }
+    free(snapshot);
   }
 
   destroy_live_graph(lg);
-  printf("SUCCESS: state snapshot arrays resized with node capacity growth\n");
+  printf("SUCCESS: watchlist snapshots survive node capacity growth\n");
   return 0;
 }

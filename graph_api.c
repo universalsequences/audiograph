@@ -458,80 +458,18 @@ void retire_later(LiveGraph *lg, void *ptr, void (*deleter)(void *)) {
 // ===================== Watch List Implementation =====================
 
 bool add_node_to_watchlist(LiveGraph *lg, int node_id) {
-  printf("Adding node to watchlist\n");
-  if (!lg || node_id < 0 || node_id >= lg->node_capacity) {
+  if (!lg || node_id < 0)
     return false;
-  }
-
-  pthread_mutex_lock(&lg->watch_list_mutex);
-
-  // Check if node is already in watchlist
-  for (int i = 0; i < lg->watch_list_count; i++) {
-    if (lg->watch_list[i] == node_id) {
-      pthread_mutex_unlock(&lg->watch_list_mutex);
-      return true; // Already watched
-    }
-  }
-
-  // Expand capacity if needed
-  if (lg->watch_list_count >= lg->watch_list_capacity) {
-    printf("EXPANDING WATCH LIST CAP\n");
-    lg->watch_list_capacity *= 2;
-    lg->watch_list =
-        realloc(lg->watch_list, lg->watch_list_capacity * sizeof(int));
-    if (!lg->watch_list) {
-      pthread_mutex_unlock(&lg->watch_list_mutex);
-      return false;
-    }
-  }
-
-  // Add node to watchlist
-  lg->watch_list[lg->watch_list_count++] = node_id;
-  pthread_mutex_unlock(&lg->watch_list_mutex);
-
-  // Update orphan status so the watched node becomes active immediately
-  update_orphaned_status(lg);
-  printf("successfully added node to watchlist\n");
-
-  return true;
+  GraphEditCmd cmd = {.op = GE_ADD_WATCH, .u.add_watch = {.node_id = node_id}};
+  return geq_push(lg->graphEditQueue, &cmd);
 }
 
 bool remove_node_from_watchlist(LiveGraph *lg, int node_id) {
-  if (!lg || node_id < 0) {
+  if (!lg || node_id < 0)
     return false;
-  }
-
-  pthread_mutex_lock(&lg->watch_list_mutex);
-
-  // Find and remove node from watchlist
-  for (int i = 0; i < lg->watch_list_count; i++) {
-    if (lg->watch_list[i] == node_id) {
-      // Shift remaining elements
-      for (int j = i; j < lg->watch_list_count - 1; j++) {
-        lg->watch_list[j] = lg->watch_list[j + 1];
-      }
-      lg->watch_list_count--;
-
-      // Clean up state snapshot if it exists
-      pthread_rwlock_wrlock(&lg->state_store_lock);
-      if (node_id < lg->node_capacity && lg->state_snapshots[node_id]) {
-        free(lg->state_snapshots[node_id]);
-        lg->state_snapshots[node_id] = NULL;
-        lg->state_sizes[node_id] = 0;
-      }
-      pthread_rwlock_unlock(&lg->state_store_lock);
-
-      pthread_mutex_unlock(&lg->watch_list_mutex);
-
-      // Update orphan status since the node may become orphaned again
-      update_orphaned_status(lg);
-
-      return true;
-    }
-  }
-
-  pthread_mutex_unlock(&lg->watch_list_mutex);
-  return false; // Node not found in watchlist
+  GraphEditCmd cmd = {
+      .op = GE_REMOVE_WATCH, .u.remove_watch = {.node_id = node_id}};
+  return geq_push(lg->graphEditQueue, &cmd);
 }
 
 void *get_node_state(LiveGraph *lg, int node_id, size_t *state_size) {

@@ -128,6 +128,72 @@ static inline void indegree_dec_on_last_pred(LiveGraph *lg, int src, int dst) {
 
 // Forward declarations
 static bool apply_delete_node_internal(LiveGraph *lg, int node_id);
+static bool apply_add_watchlist(LiveGraph *lg, int node_id);
+static bool apply_remove_watchlist(LiveGraph *lg, int node_id);
+
+static bool apply_add_watchlist(LiveGraph *lg, int node_id) {
+  if (!lg || node_id < 0 || node_id >= lg->node_capacity) {
+    return false;
+  }
+
+  pthread_mutex_lock(&lg->watch_list_mutex);
+
+  for (int i = 0; i < lg->watch_list_count; i++) {
+    if (lg->watch_list[i] == node_id) {
+      pthread_mutex_unlock(&lg->watch_list_mutex);
+      return true;
+    }
+  }
+
+  if (lg->watch_list_count >= lg->watch_list_capacity) {
+    int new_cap = lg->watch_list_capacity ? lg->watch_list_capacity * 2 : 16;
+    int *new_list = realloc(lg->watch_list, new_cap * sizeof(int));
+    if (!new_list) {
+      pthread_mutex_unlock(&lg->watch_list_mutex);
+      return false;
+    }
+    lg->watch_list = new_list;
+    lg->watch_list_capacity = new_cap;
+  }
+
+  lg->watch_list[lg->watch_list_count++] = node_id;
+  pthread_mutex_unlock(&lg->watch_list_mutex);
+
+  update_orphaned_status(lg);
+  return true;
+}
+
+static bool apply_remove_watchlist(LiveGraph *lg, int node_id) {
+  if (!lg || node_id < 0) {
+    return false;
+  }
+
+  pthread_mutex_lock(&lg->watch_list_mutex);
+
+  for (int i = 0; i < lg->watch_list_count; i++) {
+    if (lg->watch_list[i] == node_id) {
+      for (int j = i; j < lg->watch_list_count - 1; j++) {
+        lg->watch_list[j] = lg->watch_list[j + 1];
+      }
+      lg->watch_list_count--;
+
+      pthread_rwlock_wrlock(&lg->state_store_lock);
+      if (node_id < lg->node_capacity && lg->state_snapshots[node_id]) {
+        free(lg->state_snapshots[node_id]);
+        lg->state_snapshots[node_id] = NULL;
+        lg->state_sizes[node_id] = 0;
+      }
+      pthread_rwlock_unlock(&lg->state_store_lock);
+
+      pthread_mutex_unlock(&lg->watch_list_mutex);
+      update_orphaned_status(lg);
+      return true;
+    }
+  }
+
+  pthread_mutex_unlock(&lg->watch_list_mutex);
+  return false;
+}
 
 // Recursive function to mark nodes reachable from DAC (port-based only)
 static void mark_reachable_from_dac(LiveGraph *lg, int node_id, bool *visited) {
@@ -327,6 +393,12 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
       break;
     case GE_REPLACE_KEEP_EDGES:
       ok = apply_replace_keep_edges(lg, &cmd.u.replace_keep_edges);
+      break;
+    case GE_ADD_WATCH:
+      ok = apply_add_watchlist(lg, cmd.u.add_watch.node_id);
+      break;
+    case GE_REMOVE_WATCH:
+      ok = apply_remove_watchlist(lg, cmd.u.remove_watch.node_id);
       break;
     default: {
       ok = false; // unknown op
@@ -778,8 +850,6 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
   while (new_capacity <= required_capacity) {
     new_capacity *= 2; // Double until sufficient
   }
-
-  printf("Growing new capacity cap=%d\n", new_capacity);
 
   int old_capacity = lg->node_capacity;
 

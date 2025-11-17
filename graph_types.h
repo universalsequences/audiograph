@@ -220,8 +220,10 @@ typedef enum {
   GE_CONNECT,
   GE_DISCONNECT,
   GE_HOT_SWAP_NODE, // port compatible: swap vtable+state (option xfade/migrate)
-  GE_REPLACE_KEEP_EDGES // incompatible signature: remap/auto-disconnect, keep
-                        // slot
+  GE_REPLACE_KEEP_EDGES, // incompatible signature: remap/auto-disconnect, keep
+                         // slot
+  GE_ADD_WATCH,
+  GE_REMOVE_WATCH
 
 } GraphEditOp;
 
@@ -273,6 +275,12 @@ typedef struct {
     } disconnect;
     GEHotSwapNode hot_swap_node;
     GEReplaceKeepEdges replace_keep_edges;
+    struct {
+      int node_id;
+    } add_watch;
+    struct {
+      int node_id;
+    } remove_watch;
   } u;
 } GraphEditCmd;
 
