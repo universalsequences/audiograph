@@ -14,7 +14,7 @@
 #include <unistd.h>
 
 // ===================== Constants =====================
-#define MAX_IO 32 // Increased to support larger mixer nodes
+#define MAX_IO 32 // Initial per-thread IO buffer chunk (grows dynamically)
 
 // ===================== Helpers =====================
 static inline void *alloc_aligned(size_t alignment, size_t size) {

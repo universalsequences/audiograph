@@ -273,8 +273,6 @@ int live_add_mixer8(LiveGraph *lg, const char *name) {
 int live_add_sum(LiveGraph *lg, const char *name, int nInputs) {
   if (!lg || nInputs <= 0)
     return -1;
-  if (nInputs > MAX_IO)
-    nInputs = MAX_IO;
   int node_id = allocate_logical_id(lg);
   return finalize_live_add(lg, node_id, SUM_VTABLE, 0, name, nInputs, 1, NULL);
 }

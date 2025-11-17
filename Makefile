@@ -69,7 +69,7 @@ profile: $(TARGET)
 	instruments -t "Time Profiler" ./$(TARGET)
 
 # Test targets
-test: tests/test_watchlist tests/test_watchlist_advanced tests/test_watchlist_validation tests/test_watchlist_capacity_growth tests/test_watchlist_initial_capacity tests/test_watchlist_upstream_processing tests/test_mpmc_queue tests/test_live_graph_partial_connections tests/test_disconnect tests/test_graph_edit_queue tests/test_queue_api tests/test_capacity_growth tests/test_simple_teardown tests/test_orphan_comprehensive tests/test_auto_sum tests/test_ordered_sum_topology tests/test_sum_behavior tests/test_hot_swap tests/test_multi_port_routing tests/test_complex_topology tests/test_4_node_topology tests/test_4_node_fuzz tests/test_param_updates tests/test_stereo tests/test_patch_disconnect_orphan tests/test_indegree_unique_pred tests/test_deadlock_disconnect
+test: tests/test_watchlist tests/test_watchlist_advanced tests/test_watchlist_validation tests/test_watchlist_capacity_growth tests/test_watchlist_initial_capacity tests/test_watchlist_upstream_processing tests/test_mpmc_queue tests/test_live_graph_partial_connections tests/test_disconnect tests/test_graph_edit_queue tests/test_queue_api tests/test_capacity_growth tests/test_simple_teardown tests/test_orphan_comprehensive tests/test_auto_sum tests/test_ordered_sum_topology tests/test_sum_behavior tests/test_sum_high_fanin tests/test_hot_swap tests/test_multi_port_routing tests/test_complex_topology tests/test_4_node_topology tests/test_4_node_fuzz tests/test_param_updates tests/test_stereo tests/test_patch_disconnect_orphan tests/test_indegree_unique_pred tests/test_deadlock_disconnect
 	./tests/test_watchlist
 	./tests/test_watchlist_advanced
 	./tests/test_watchlist_validation
@@ -87,6 +87,7 @@ test: tests/test_watchlist tests/test_watchlist_advanced tests/test_watchlist_va
 	./tests/test_auto_sum
 	./tests/test_ordered_sum_topology
 	./tests/test_sum_behavior
+	./tests/test_sum_high_fanin
 	./tests/test_hot_swap
 	./tests/test_multi_port_routing
 	./tests/test_complex_topology
@@ -145,6 +146,10 @@ tests/test_ordered_sum_topology: tests/test_ordered_sum_topology.c $(HEADERS) $(
 # Build sum behavior test (verify actual audio summing)
 tests/test_sum_behavior: tests/test_sum_behavior.c $(HEADERS) $(TEST_OBJS)
 	$(CC) $(CFLAGS) -I. -o tests/test_sum_behavior tests/test_sum_behavior.c $(TEST_OBJS)
+
+# Build high fan-in sum stress test
+tests/test_sum_high_fanin: tests/test_sum_high_fanin.c $(HEADERS) $(TEST_OBJS)
+	$(CC) $(CFLAGS) -I. -o tests/test_sum_high_fanin tests/test_sum_high_fanin.c $(TEST_OBJS)
 
 # Build hot swap test (verify hot swap functionality)
 tests/test_hot_swap: tests/test_hot_swap.c $(HEADERS) $(TEST_OBJS)
@@ -241,7 +246,7 @@ tests/test_deadlock_disconnect: tests/test_deadlock_disconnect.c $(HEADERS) $(TE
 clean: clean_tests
 
 clean_tests:
-	rm -f tests/test_watchlist tests/test_watchlist_advanced tests/test_watchlist_validation tests/test_watchlist_capacity_growth tests/test_watchlist_initial_capacity tests/test_watchlist_upstream_processing tests/test_mpmc_queue tests/test_engine_workers tests/test_live_graph_multithreaded tests/test_live_graph_workers tests/test_live_graph_partial_connections tests/test_disconnect tests/test_graph_edit_queue tests/test_queue_api tests/test_deletion_safety tests/test_capacity_growth tests/test_simple_teardown tests/test_orphan_comprehensive tests/test_auto_sum tests/test_sum_behavior tests/test_engine_workers_debug tests/test_number_node tests/test_orphan_edge_cases tests/test_new_worker_system tests/test_hot_swap tests/test_multi_port_routing tests/test_complex_topology tests/test_4_node_topology tests/test_4_node_fuzz tests/test_param_updates tests/test_stereo tests/test_patch_disconnect_orphan tests/test_indegree_unique_pred tests/test_deadlock_disconnect
+	rm -f tests/test_watchlist tests/test_watchlist_advanced tests/test_watchlist_validation tests/test_watchlist_capacity_growth tests/test_watchlist_initial_capacity tests/test_watchlist_upstream_processing tests/test_mpmc_queue tests/test_engine_workers tests/test_live_graph_multithreaded tests/test_live_graph_workers tests/test_live_graph_partial_connections tests/test_disconnect tests/test_graph_edit_queue tests/test_queue_api tests/test_deletion_safety tests/test_capacity_growth tests/test_simple_teardown tests/test_orphan_comprehensive tests/test_auto_sum tests/test_sum_behavior tests/test_sum_high_fanin tests/test_engine_workers_debug tests/test_number_node tests/test_orphan_edge_cases tests/test_new_worker_system tests/test_hot_swap tests/test_multi_port_routing tests/test_complex_topology tests/test_4_node_topology tests/test_4_node_fuzz tests/test_param_updates tests/test_stereo tests/test_patch_disconnect_orphan tests/test_indegree_unique_pred tests/test_deadlock_disconnect
 	rm -rf tests/*.dSYM
 
 .PHONY: all debug release lib lib-release run clean valgrind profile test clean_tests

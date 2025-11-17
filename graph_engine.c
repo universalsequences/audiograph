@@ -3,6 +3,7 @@
 #include "graph_nodes.h"
 #include <assert.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 
 // On Apple platforms, enable QoS hints for worker threads to reduce jitter.
@@ -50,24 +51,111 @@ Engine g_engine; // single global for demo
 // Thread-local storage for current node being processed
 static __thread RTNode *g_current_processing_node = NULL;
 
-// Thread-local scratch buffers for disconnected outputs
-// This prevents the write-write race that caused audio artifacts
-static __thread float *tls_out_scratch[MAX_IO] = {0};
-static __thread int tls_scratch_size = 0;
+// Thread-local storage for per-node IO binding
+static __thread float **tls_node_inputs = NULL;
+static __thread float **tls_node_outputs = NULL;
+static __thread int tls_io_capacity = 0;
 
-static inline float *get_tls_out_scratch(int port, int nframes) {
-  if (tls_scratch_size < nframes) {
-    // Reallocate all scratch buffers for this thread
-    for (int p = 0; p < MAX_IO; p++) {
-      free(tls_out_scratch[p]);
-      tls_out_scratch[p] = aligned_alloc(64, nframes * sizeof(float));
-      if (!tls_out_scratch[p]) {
-        // Fallback to regular malloc if aligned_alloc fails
-        tls_out_scratch[p] = malloc(nframes * sizeof(float));
-      }
-    }
-    tls_scratch_size = nframes;
+// Thread-local scratch buffers for disconnected outputs (grow-on-demand)
+static __thread float **tls_out_scratch = NULL;
+static __thread size_t *tls_out_scratch_sizes = NULL;
+static __thread int tls_scratch_ports = 0;
+
+static bool ensure_tls_io_capacity(int needed_inputs, int needed_outputs) {
+  int required = needed_inputs > needed_outputs ? needed_inputs : needed_outputs;
+  if (required <= tls_io_capacity)
+    return true;
+  if (required <= 0)
+    return true;
+
+  int new_cap = tls_io_capacity ? tls_io_capacity : MAX_IO;
+  while (new_cap < required) {
+    new_cap *= 2;
   }
+  if (new_cap <= 0)
+    new_cap = required;
+
+  float **new_inputs = malloc((size_t)new_cap * sizeof(float *));
+  float **new_outputs = malloc((size_t)new_cap * sizeof(float *));
+  if (!new_inputs || !new_outputs) {
+    if (new_inputs)
+      free(new_inputs);
+    if (new_outputs)
+      free(new_outputs);
+    return false;
+  }
+
+  if (tls_node_inputs) {
+    memcpy(new_inputs, tls_node_inputs,
+           (size_t)tls_io_capacity * sizeof(float *));
+    free(tls_node_inputs);
+  }
+  if (tls_node_outputs) {
+    memcpy(new_outputs, tls_node_outputs,
+           (size_t)tls_io_capacity * sizeof(float *));
+    free(tls_node_outputs);
+  }
+  for (int i = tls_io_capacity; i < new_cap; ++i) {
+    new_inputs[i] = NULL;
+    new_outputs[i] = NULL;
+  }
+
+  tls_node_inputs = new_inputs;
+  tls_node_outputs = new_outputs;
+  tls_io_capacity = new_cap;
+  return true;
+}
+
+static inline float *get_tls_out_scratch(LiveGraph *lg, int port, int nframes) {
+  if (port < 0)
+    return lg ? lg->scratch_null : NULL;
+
+  if (port >= tls_scratch_ports) {
+    int new_ports = tls_scratch_ports ? tls_scratch_ports : MAX_IO;
+    while (new_ports <= port)
+      new_ports *= 2;
+
+    float **new_buffers = calloc((size_t)new_ports, sizeof(float *));
+    size_t *new_sizes = calloc((size_t)new_ports, sizeof(size_t));
+    if (!new_buffers || !new_sizes) {
+      if (new_buffers)
+        free(new_buffers);
+      if (new_sizes)
+        free(new_sizes);
+      return lg ? lg->scratch_null : NULL;
+    }
+
+    if (tls_out_scratch) {
+      memcpy(new_buffers, tls_out_scratch,
+             (size_t)tls_scratch_ports * sizeof(float *));
+      free(tls_out_scratch);
+    }
+    if (tls_out_scratch_sizes) {
+      memcpy(new_sizes, tls_out_scratch_sizes,
+             (size_t)tls_scratch_ports * sizeof(size_t));
+      free(tls_out_scratch_sizes);
+    }
+
+    tls_out_scratch = new_buffers;
+    tls_out_scratch_sizes = new_sizes;
+    tls_scratch_ports = new_ports;
+  }
+
+  if ((size_t)nframes > tls_out_scratch_sizes[port]) {
+    float *new_buf = aligned_alloc(64, (size_t)nframes * sizeof(float));
+    if (!new_buf) {
+      new_buf = malloc((size_t)nframes * sizeof(float));
+      if (!new_buf)
+        return lg ? lg->scratch_null : NULL;
+    }
+    if (tls_out_scratch[port]) {
+      free(tls_out_scratch[port]);
+    }
+    memset(new_buf, 0, (size_t)nframes * sizeof(float));
+    tls_out_scratch[port] = new_buf;
+    tls_out_scratch_sizes[port] = (size_t)nframes;
+  }
+
   return tls_out_scratch[port];
 }
 
@@ -391,11 +479,22 @@ void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
   // Set thread-local context for SUM nodes to access input count
   g_current_processing_node = node;
 
-  float *inPtrs[MAX_IO];
-  float *outPtrs[MAX_IO];
+  int needed_inputs = node->nInputs > 0 ? node->nInputs : 0;
+  int needed_outputs = node->nOutputs > 0 ? node->nOutputs : 0;
+  if (!ensure_tls_io_capacity(needed_inputs, needed_outputs)) {
+    fprintf(stderr,
+            "[audiograph] WARN: bind_and_run_live unable to allocate IO "
+            "bindings for node %d (inputs=%d outputs=%d)\n",
+            nid, node->nInputs, node->nOutputs);
+    g_current_processing_node = NULL;
+    return;
+  }
+
+  float **inPtrs = tls_node_inputs;
+  float **outPtrs = tls_node_outputs;
 
   // Inputs: each port has 0/1 producer (edge id or -1)
-  for (int i = 0; i < node->nInputs && i < MAX_IO; i++) {
+  for (int i = 0; i < node->nInputs; i++) {
     int eid = node->inEdgeId ? node->inEdgeId[i] : -1;
     if (eid >= 0 && eid < lg->edge_capacity && lg->edges[eid].buf) {
       inPtrs[i] = lg->edges[eid].buf;
@@ -403,16 +502,24 @@ void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
       inPtrs[i] = lg->silence_buf;
     }
   }
+  // Guard against stale pointers beyond current input count
+  for (int i = node->nInputs; i < needed_inputs; i++) {
+    inPtrs[i] = lg->silence_buf;
+  }
 
   // Outputs: one buffer per output port (edge id or -1)
-  // CRITICAL FIX: Use thread-local scratch to prevent write-write races
-  for (int i = 0; i < node->nOutputs && i < MAX_IO; i++) {
+  // Use thread-local scratch to prevent write-write races
+  for (int i = 0; i < node->nOutputs; i++) {
     int eid = node->outEdgeId ? node->outEdgeId[i] : -1;
     if (eid >= 0 && eid < lg->edge_capacity && lg->edges[eid].buf) {
       outPtrs[i] = lg->edges[eid].buf;
     } else {
-      outPtrs[i] = get_tls_out_scratch(i, nframes);
+      float *scratch = get_tls_out_scratch(lg, i, nframes);
+      outPtrs[i] = scratch ? scratch : lg->scratch_null;
     }
+  }
+  for (int i = node->nOutputs; i < needed_outputs; i++) {
+    outPtrs[i] = lg->scratch_null;
   }
 
   if (node->vtable.process) {
