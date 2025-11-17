@@ -191,6 +191,13 @@ void destroy_live_graph(LiveGraph *lg);
 int apply_add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
                    uint64_t logical_id, const char *name, int nInputs,
                    int nOutputs, const void *initial_state);
+
+int live_add_oscillator(LiveGraph *lg, float freq_hz, const char *name);
+int live_add_gain(LiveGraph *lg, float gain_value, const char *name);
+int live_add_number(LiveGraph *lg, float value, const char *name);
+int live_add_mixer2(LiveGraph *lg, const char *name);
+int live_add_mixer8(LiveGraph *lg, const char *name);
+int live_add_sum(LiveGraph *lg, const char *name, int nInputs);
 bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
                    int dst_port);
 bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,

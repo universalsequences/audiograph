@@ -779,6 +779,8 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
     new_capacity *= 2; // Double until sufficient
   }
 
+  printf("Growing new capacity cap=%d\n", new_capacity);
+
   int old_capacity = lg->node_capacity;
 
   // Allocate new arrays (don't use realloc to avoid partial corruption)
@@ -789,8 +791,11 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
   bool *new_orphaned = malloc(new_capacity * sizeof(bool));
 
   atomic_int *new_pending = calloc(new_capacity, sizeof(atomic_int));
+  void **new_state_snapshots = calloc(new_capacity, sizeof(void *));
+  size_t *new_state_sizes = calloc(new_capacity, sizeof(size_t));
 
-  if (!new_nodes || !new_pending || !new_indegree || !new_orphaned) {
+  if (!new_nodes || !new_pending || !new_indegree || !new_orphaned ||
+      !new_state_snapshots || !new_state_sizes) {
     // Clean up any successful allocations
     if (new_nodes)
       free(new_nodes);
@@ -800,6 +805,10 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
       free(new_orphaned);
     if (new_pending)
       free(new_pending);
+    if (new_state_snapshots)
+      free(new_state_snapshots);
+    if (new_state_sizes)
+      free(new_state_sizes);
     return false;
   }
 
@@ -845,6 +854,11 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
 
   memcpy(new_indegree, lg->indegree, old_capacity * sizeof(int));
   memcpy(new_orphaned, lg->is_orphaned, old_capacity * sizeof(bool));
+  if (lg->state_snapshots)
+    memcpy(new_state_snapshots, lg->state_snapshots,
+           old_capacity * sizeof(void *));
+  if (lg->state_sizes)
+    memcpy(new_state_sizes, lg->state_sizes, old_capacity * sizeof(size_t));
 
   // Copy existing atomic values
   for (int i = 0; i < old_capacity; i++) {
@@ -881,12 +895,18 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
   free(lg->pending);
   free(lg->indegree);
   free(lg->is_orphaned);
+  if (lg->state_snapshots)
+    free(lg->state_snapshots);
+  if (lg->state_sizes)
+    free(lg->state_sizes);
 
   // Update pointers and capacity
   lg->nodes = new_nodes;
   lg->pending = new_pending;
   lg->indegree = new_indegree;
   lg->is_orphaned = new_orphaned;
+  lg->state_snapshots = new_state_snapshots;
+  lg->state_sizes = new_state_sizes;
   lg->node_capacity = new_capacity;
 
   return true;
@@ -901,6 +921,7 @@ int apply_add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
   if (node_id >= lg->node_capacity) {
     // Need to expand capacity
     if (!grow_node_capacity(lg, node_id)) {
+      printf("grow node capacity failed\n");
       return -1; // Growth failed
     }
   }
@@ -910,6 +931,10 @@ int apply_add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
   if (state_size > 0) {
     state = alloc_state_f32(state_size, 64);
     if (!state) {
+      printf(
+          "memory allocation "
+          "failed!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+          "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
       return -1; // Memory allocation
                  // failed
     }
@@ -980,22 +1005,30 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
                    int dst_port) {
   // --- Validate nodes/ports ---
   if (!lg || src_node < 0 || src_node >= lg->node_count || dst_node < 0 ||
-      dst_node >= lg->node_count)
+      dst_node >= lg->node_count) {
+    printf("first validation failed\n");
     return false;
+  }
 
   RTNode *S = &lg->nodes[src_node];
   RTNode *D = &lg->nodes[dst_node];
 
   if (src_port < 0 || src_port >= S->nOutputs || dst_port < 0 ||
-      dst_port >= D->nInputs)
+      dst_port >= D->nInputs) {
+    printf("second validation failed src_port=%d S->nOutputs=%d dst_port=%d "
+           "D->nInputs=%d\n",
+           src_port, S->nOutputs, dst_port, D->nInputs);
     return false;
+  }
 
   // Validate nodes before ensuring port arrays
   if (!is_node_valid(lg, src_node) || !is_node_valid(lg, dst_node)) {
+    printf("node is not valid\n");
     return false;
   }
 
   if (!ensure_port_arrays(S) || !ensure_port_arrays(D)) {
+    printf("ensure ports failed\n");
     return false;
   }
 

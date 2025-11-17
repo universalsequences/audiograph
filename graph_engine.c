@@ -416,8 +416,10 @@ void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
   }
 
   if (node->vtable.process) {
+    //printf("attempting to process nid=%d %p\n", nid, node->vtable.process);
     node->vtable.process((float *const *)inPtrs, (float *const *)outPtrs,
                          nframes, node->state);
+    //printf("succeeding process nid=%d %p\n", nid, node->vtable.process);
   }
 
   // Clear thread-local context

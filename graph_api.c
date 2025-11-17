@@ -205,6 +205,80 @@ void destroy_live_graph(LiveGraph *lg) {
   free(lg);
 }
 
+static int allocate_logical_id(LiveGraph *lg) {
+  return atomic_fetch_add(&lg->next_node_id, 1);
+}
+
+static int finalize_live_add(LiveGraph *lg, int node_id, NodeVTable vtable,
+                             size_t state_size, const char *name, int nInputs,
+                             int nOutputs, const void *initial_state) {
+  int result = apply_add_node(lg, vtable, state_size, (uint64_t)node_id, name,
+                              nInputs, nOutputs, initial_state);
+  if (result < 0) {
+    add_failed_id(lg, node_id);
+    return -1;
+  }
+  return result;
+}
+
+int live_add_oscillator(LiveGraph *lg, float freq_hz, const char *name) {
+  if (!lg)
+    return -1;
+  int node_id = allocate_logical_id(lg);
+  float init_state[1];
+  if (freq_hz < 0.0f)
+    freq_hz = 0.0f;
+  init_state[0] = freq_hz / 48000.0f; // default sample rate assumption
+  return finalize_live_add(lg, node_id, OSC_VTABLE,
+                           OSC_MEMORY_SIZE * sizeof(float), name, 0, 1,
+                           init_state);
+}
+
+int live_add_gain(LiveGraph *lg, float gain_value, const char *name) {
+  if (!lg)
+    return -1;
+  int node_id = allocate_logical_id(lg);
+  float init_state[1];
+  init_state[0] = gain_value;
+  return finalize_live_add(lg, node_id, GAIN_VTABLE,
+                           GAIN_MEMORY_SIZE * sizeof(float), name, 2, 1,
+                           init_state);
+}
+
+int live_add_number(LiveGraph *lg, float value, const char *name) {
+  if (!lg)
+    return -1;
+  int node_id = allocate_logical_id(lg);
+  float init_state[1];
+  init_state[0] = value;
+  return finalize_live_add(lg, node_id, NUMBER_VTABLE,
+                           NUMBER_MEMORY_SIZE * sizeof(float), name, 0, 1,
+                           init_state);
+}
+
+int live_add_mixer2(LiveGraph *lg, const char *name) {
+  if (!lg)
+    return -1;
+  int node_id = allocate_logical_id(lg);
+  return finalize_live_add(lg, node_id, MIX2_VTABLE, 0, name, 2, 1, NULL);
+}
+
+int live_add_mixer8(LiveGraph *lg, const char *name) {
+  if (!lg)
+    return -1;
+  int node_id = allocate_logical_id(lg);
+  return finalize_live_add(lg, node_id, MIX8_VTABLE, 0, name, 8, 1, NULL);
+}
+
+int live_add_sum(LiveGraph *lg, const char *name, int nInputs) {
+  if (!lg || nInputs <= 0)
+    return -1;
+  if (nInputs > MAX_IO)
+    nInputs = MAX_IO;
+  int node_id = allocate_logical_id(lg);
+  return finalize_live_add(lg, node_id, SUM_VTABLE, 0, name, nInputs, 1, NULL);
+}
+
 int add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
              const char *name, int nInputs, int nOutputs,
              const void *initial_state, size_t initial_state_size) {
@@ -384,6 +458,7 @@ void retire_later(LiveGraph *lg, void *ptr, void (*deleter)(void *)) {
 // ===================== Watch List Implementation =====================
 
 bool add_node_to_watchlist(LiveGraph *lg, int node_id) {
+  printf("Adding node to watchlist\n");
   if (!lg || node_id < 0 || node_id >= lg->node_capacity) {
     return false;
   }
@@ -400,6 +475,7 @@ bool add_node_to_watchlist(LiveGraph *lg, int node_id) {
 
   // Expand capacity if needed
   if (lg->watch_list_count >= lg->watch_list_capacity) {
+    printf("EXPANDING WATCH LIST CAP\n");
     lg->watch_list_capacity *= 2;
     lg->watch_list =
         realloc(lg->watch_list, lg->watch_list_capacity * sizeof(int));
@@ -415,6 +491,7 @@ bool add_node_to_watchlist(LiveGraph *lg, int node_id) {
 
   // Update orphan status so the watched node becomes active immediately
   update_orphaned_status(lg);
+  printf("successfully added node to watchlist\n");
 
   return true;
 }

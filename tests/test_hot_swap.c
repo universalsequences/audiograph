@@ -380,13 +380,14 @@ void test_retire_drain_system() {
 
   for (int i = 0; i < 4; i++) {
     // Memory will be allocated by library (starts with zero value)
+    float new_value = values[i];
     GEHotSwapNode hot_swap = {.vt = NUMBER_VTABLE,
                               .state_size = NUMBER_MEMORY_SIZE * sizeof(float),
                               .node_id = test_node,
                               .new_nInputs = 0,
                               .new_nOutputs = 1,
-                              .initial_state = NULL,
-                              .initial_state_size = 0};
+                              .initial_state = &new_value,
+                              .initial_state_size = sizeof(new_value)};
 
     bool swap_result = apply_hot_swap(lg, &hot_swap);
     assert(swap_result);
