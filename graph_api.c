@@ -13,6 +13,11 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   lg->indegree = calloc(lg->node_capacity, sizeof(int));
   lg->is_orphaned = calloc(lg->node_capacity, sizeof(bool));
 
+  // Buffer storage
+  lg->buffer_capacity = initial_capacity;
+  lg->buffers = calloc(lg->buffer_capacity, sizeof(BufferDesc));
+  lg->buffer_count = 0;
+
   // Edge pool (start with generous capacity)
   lg->edge_capacity = initial_capacity * 32;
   lg->block_size = block_size;
@@ -75,6 +80,7 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   // Initialize atomic node ID counter (start at 1 to avoid confusion with DAC
   // at 0)
   atomic_init(&lg->next_node_id, 1);
+  atomic_init(&lg->next_buffer_id, 0);
 
   // Initialize watch list system
   lg->watch_list_capacity = 16;
@@ -320,6 +326,62 @@ int add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
   return node_id;
 }
 
+int create_buffer(LiveGraph *lg, int size, int channel_count,
+                  const float *source_data) {
+  int buffer_id = atomic_fetch_add(&lg->next_buffer_id, 1);
+
+  // Copy source data if provided (so caller can free their copy)
+  float *source_copy = NULL;
+  size_t source_size = 0;
+  if (source_data && size > 0 && channel_count > 0) {
+    source_size = (size_t)size * (size_t)channel_count * sizeof(float);
+    source_copy = malloc(source_size);
+    if (source_copy) {
+      memcpy(source_copy, source_data, source_size);
+    }
+  }
+
+  GraphEditCmd cmd = {.op = GE_CREATE_BUFFER,
+                      .u.create_buffer = {.buffer_id = buffer_id,
+                                          .size = size,
+                                          .channel_count = channel_count,
+                                          .source_data = source_copy,
+                                          .source_data_size = source_size}};
+
+  if (!geq_push(lg->graphEditQueue, &cmd)) {
+    if (source_copy)
+      free(source_copy);
+    return -1;
+  }
+  return buffer_id;
+}
+
+int hot_swap_buffer(LiveGraph *lg, int buffer_id, const float *source_data,
+                    int size, int channel_count) {
+  if (!lg || buffer_id < 0 || !source_data || size <= 0 || channel_count <= 0) {
+    return false;
+  }
+
+  // Copy source data (so caller can free their copy)
+  size_t source_size = (size_t)size * (size_t)channel_count * sizeof(float);
+  float *source_copy = malloc(source_size);
+  if (!source_copy) {
+    return false;
+  }
+  memcpy(source_copy, source_data, source_size);
+
+  GraphEditCmd cmd = {.op = GE_HOTSWAP_BUFFER,
+                      .u.hotswap_buffer = {.buffer_id = buffer_id,
+                                           .source_data = source_copy,
+                                           .source_data_size = source_size}};
+
+  if (!geq_push(lg->graphEditQueue, &cmd)) {
+    free(source_copy);
+    return false;
+  }
+  return true;
+}
+
 bool is_failed_node(LiveGraph *lg, int logical_id) {
   // Check if this logical ID is in the failed list
   for (int i = 0; i < lg->failed_ids_count; i++) {
@@ -465,8 +527,8 @@ bool add_node_to_watchlist(LiveGraph *lg, int node_id) {
 bool remove_node_from_watchlist(LiveGraph *lg, int node_id) {
   if (!lg || node_id < 0)
     return false;
-  GraphEditCmd cmd = {
-      .op = GE_REMOVE_WATCH, .u.remove_watch = {.node_id = node_id}};
+  GraphEditCmd cmd = {.op = GE_REMOVE_WATCH,
+                      .u.remove_watch = {.node_id = node_id}};
   return geq_push(lg->graphEditQueue, &cmd);
 }
 

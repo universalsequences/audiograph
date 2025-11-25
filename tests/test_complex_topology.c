@@ -15,7 +15,7 @@ typedef struct {
 } DualOutputState;
 
 static void dual_output_process(float *const *inputs, float *const *outputs,
-                                int block_size, void *state) {
+                                int block_size, void *state, void *buffers) {
   (void)inputs; // No inputs
   DualOutputState *s = (DualOutputState *)state;
 
@@ -30,7 +30,8 @@ static void dual_output_process(float *const *inputs, float *const *outputs,
   }
 }
 
-static void dual_output_init(void *state, int sampleRate, int maxBlock, const void *initial_state) {
+static void dual_output_init(void *state, int sampleRate, int maxBlock,
+                             const void *initial_state) {
   (void)sampleRate;
   (void)maxBlock;
   DualOutputState *s = (DualOutputState *)state;

@@ -17,7 +17,8 @@ void osc_init(void *memory, int sr, int maxBlock, const void *initial_state) {
   }
 }
 
-void osc_process(float *const *in, float *const *out, int n, void *memory) {
+void osc_process(float *const *in, float *const *out, int n, void *memory,
+                 void *buffers) {
   (void)in;
   float *mem = (float *)memory;
   float *y = out[0];
@@ -45,7 +46,8 @@ void osc_migrate(void *newMemory, const void *oldMemory) {
 
 // ===================== Gain Implementation =====================
 
-void gain_process(float *const *in, float *const *out, int n, void *memory) {
+void gain_process(float *const *in, float *const *out, int n, void *memory,
+                  void *buffers) {
   float *mem = (float *)memory;
   float gain = mem[GAIN_VALUE];
   const float *a = in[0];
@@ -56,7 +58,8 @@ void gain_process(float *const *in, float *const *out, int n, void *memory) {
 
 // ===================== Number Implementation =====================
 
-void number_process(float *const *in, float *const *out, int n, void *memory) {
+void number_process(float *const *in, float *const *out, int n, void *memory,
+                    void *buffers) {
   (void)in; // Number generator has no inputs
   float *mem = (float *)memory;
   float value = mem[NUMBER_VALUE];
@@ -67,7 +70,8 @@ void number_process(float *const *in, float *const *out, int n, void *memory) {
 
 // ===================== Mixer Implementations =====================
 
-void mix2_process(float *const *in, float *const *out, int n, void *memory) {
+void mix2_process(float *const *in, float *const *out, int n, void *memory,
+                  void *buffers) {
   (void)memory; // Mixers have no state
   const float *a = in[0];
   const float *b = in[1];
@@ -77,7 +81,8 @@ void mix2_process(float *const *in, float *const *out, int n, void *memory) {
     y[i] = a[i] + b[i];
 }
 
-void mix3_process(float *const *in, float *const *out, int n, void *memory) {
+void mix3_process(float *const *in, float *const *out, int n, void *memory,
+                  void *buffers) {
   (void)memory; // Mixers have no state
   const float *a = in[0];
   const float *b = in[1];
@@ -87,7 +92,8 @@ void mix3_process(float *const *in, float *const *out, int n, void *memory) {
     y[i] = a[i] + b[i] + c[i];
 }
 
-void mix8_process(float *const *in, float *const *out, int n, void *memory) {
+void mix8_process(float *const *in, float *const *out, int n, void *memory,
+                  void *buffers) {
   (void)memory; // Mixers have no state
   float *y = out[0];
 
@@ -98,7 +104,8 @@ void mix8_process(float *const *in, float *const *out, int n, void *memory) {
   }
 }
 
-void dac_process(float *const *in, float *const *out, int n, void *memory) {
+void dac_process(float *const *in, float *const *out, int n, void *memory,
+                 void *buffers) {
   (void)memory; // DAC has no state
 
   // DAC is a pass-through - copy all input channels to output channels
@@ -122,7 +129,8 @@ void dac_process(float *const *in, float *const *out, int n, void *memory) {
 // Global accessor for current node's input count (to be implemented)
 extern int ap_current_node_ninputs(void);
 
-void sum_process(float *const *in, float *const *out, int n, void *memory) {
+void sum_process(float *const *in, float *const *out, int n, void *memory,
+                 void *buffers) {
   (void)memory; // SUM is stateless
   float *y = out[0];
 
@@ -152,7 +160,8 @@ const NodeVTable OSC_VTABLE = {.process = osc_process,
                                .reset = NULL,
                                .migrate = osc_migrate};
 
-static void gain_init(void *state, int sampleRate, int maxBlock, const void *initial_state) {
+static void gain_init(void *state, int sampleRate, int maxBlock,
+                      const void *initial_state) {
   (void)sampleRate;
   (void)maxBlock;
   float *memory = (float *)state;
@@ -169,7 +178,8 @@ static void gain_init(void *state, int sampleRate, int maxBlock, const void *ini
 const NodeVTable GAIN_VTABLE = {
     .process = gain_process, .init = gain_init, .reset = NULL, .migrate = NULL};
 
-static void number_init(void *state, int sampleRate, int maxBlock, const void *initial_state) {
+static void number_init(void *state, int sampleRate, int maxBlock,
+                        const void *initial_state) {
   (void)sampleRate;
   (void)maxBlock;
   float *memory = (float *)state;

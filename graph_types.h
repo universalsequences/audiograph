@@ -47,7 +47,7 @@ static inline uint64_t nsec_now(void) {
 
 // ===================== Kernel ABI =====================
 typedef void (*KernelFn)(float *const *in, float *const *out, int nframes,
-                         void *state);
+                         void *state, void *buffers);
 typedef void (*InitFn)(void *state, int sampleRate, int maxBlock,
                        const void *initial_state);
 typedef void (*ResetFn)(void *state);
@@ -223,7 +223,10 @@ typedef enum {
   GE_REPLACE_KEEP_EDGES, // incompatible signature: remap/auto-disconnect, keep
                          // slot
   GE_ADD_WATCH,
-  GE_REMOVE_WATCH
+  GE_REMOVE_WATCH,
+
+  GE_CREATE_BUFFER,
+  GE_HOTSWAP_BUFFER
 
 } GraphEditOp;
 
@@ -250,6 +253,20 @@ typedef struct {
   // deterministically
   // - if growing, new ports initialize to -1
 } GEReplaceKeepEdges;
+
+typedef struct {
+  uint64_t buffer_id;
+  int size;
+  int channel_count;
+  float *source_data;      // Optional: data to copy into buffer (caller-owned, freed after apply)
+  size_t source_data_size; // Size in bytes of source_data
+} GECreateBuffer;
+
+typedef struct {
+  uint64_t buffer_id;
+  float *source_data;      // New data to copy into buffer (caller-owned, freed after apply)
+  size_t source_data_size; // Size in bytes of source_data
+} GEHotSwapBuffer;
 
 typedef struct {
   GraphEditOp op;
@@ -281,6 +298,8 @@ typedef struct {
     struct {
       int node_id;
     } remove_watch;
+    GECreateBuffer create_buffer;
+    GEHotSwapBuffer hotswap_buffer;
   } u;
 } GraphEditCmd;
 

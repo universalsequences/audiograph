@@ -44,28 +44,11 @@ typedef struct RTNode {
   int succCount; // number of nodes that depend on this node's output
 } RTNode;
 
-typedef struct GraphState {
-  // immutable after build
-  RTNode *nodes;
-  int nodeCount;
-  float **edgeBufs; // edge buffers (mono), size=edgeCount
-  int edgeCount;
-  int maxBlock;
-  int masterEdge; // index of master out buffer
-
-  // per-block scheduling state
-  atomic_int *pending;   // size=nodeCount
-  MPMCQueue *readyQueue; // MPMC work queue for thread-safe job distribution
-  _Atomic int jobsInFlight;
-
-  // parameter mailbox (SPSC) for this graph
-  ParamRing *params;
-
-  // debugging label
-  const char *label;
-} GraphState;
-
-void free_graph(GraphState *g);
+typedef struct {
+  float *buffer;
+  int size;
+  int channel_count;
+} BufferDesc;
 
 // ===================== Live Editing System =====================
 
@@ -76,7 +59,8 @@ typedef struct RetireEntry {
 
 typedef struct LiveGraph {
   RTNode *nodes;
-  int node_count, node_capacity;
+  BufferDesc *buffers;
+  int node_count, node_capacity, buffer_count, buffer_capacity;
 
   // Dynamic edge pool (new port-based system)
   LiveEdge *edges; // edge pool with refcounting
@@ -121,6 +105,8 @@ typedef struct LiveGraph {
   // Atomic node ID allocation
   _Atomic int next_node_id; // Next node ID to allocate (thread-safe)
 
+  _Atomic int next_buffer_id; // Next buffer ID to allocate (thread-safe)
+
   // Watch list system for state monitoring
   int *watch_list;                  // Array of node IDs being watched
   int watch_list_count;             // Current number of watched nodes
@@ -152,10 +138,10 @@ typedef struct Engine {
 
   // Optional: Audio Workgroup token for co-scheduling (Apple-only usage)
   // Stored as opaque pointer to avoid hard dependency in public header.
-  _Atomic(void *) oswg; // os_workgroup_t when available
+  _Atomic(void *) oswg;          // os_workgroup_t when available
   _Atomic int oswg_join_pending; // set to 1 to wake workers for workgroup join
   _Atomic int oswg_join_remaining; // count of workers that need to see the flag
-  _Atomic int rt_log;   // enable lightweight debug prints from workers
+  _Atomic int rt_log; // enable lightweight debug prints from workers
   _Atomic int rt_time_constraint; // apply Mach RT time-constraint policy
 } Engine;
 
@@ -242,6 +228,18 @@ bool remove_node_from_watchlist(LiveGraph *lg, int node_id);
 void *get_node_state(LiveGraph *lg, int node_id, size_t *state_size);
 
 void update_orphaned_status(LiveGraph *lg);
+
+// ===================== Buffer API =====================
+
+// Create a buffer with optional initial data. Pass NULL for source_data to create empty buffer.
+// Returns buffer_id on success, -1 on failure.
+int create_buffer(LiveGraph *lg, int size, int channel_count,
+                  const float *source_data);
+
+// Hot-swap buffer contents. Copies source_data into existing buffer.
+// Returns true on success, false if buffer doesn't exist or on failure.
+int hot_swap_buffer(LiveGraph *lg, int buffer_id, const float *source_data,
+                    int size, int channel_count);
 
 // ===================== VTable Creation Functions =====================
 

@@ -136,6 +136,33 @@ bool remove_node_from_watchlist(LiveGraph *lg, int node_id);
 // If state_size is not NULL, it will be set to the size of the returned state
 void *get_node_state(LiveGraph *lg, int node_id, size_t *state_size);
 
+// ===================== Buffer API =====================
+
+// Create a buffer with optional initial data
+// Parameters:
+//   lg: LiveGraph instance
+//   size: Number of samples per channel
+//   channel_count: Number of channels in the buffer
+//   source_data: Initial data to copy (can be NULL for empty buffer)
+//                Format: interleaved [ch0_s0, ch1_s0, ch0_s1, ch1_s1, ...]
+//                Size should be: size * channel_count floats
+// Returns buffer_id on success, -1 on failure
+// Note: source_data is copied - caller can free it immediately after this call
+int create_buffer(LiveGraph *lg, int size, int channel_count,
+                  const float *source_data);
+
+// Hot-swap buffer contents with new data
+// Parameters:
+//   lg: LiveGraph instance
+//   buffer_id: ID of buffer to update (from create_buffer)
+//   source_data: New data to copy into buffer
+//   size: Number of samples per channel
+//   channel_count: Number of channels
+// Returns true on success, false if buffer doesn't exist or on failure
+// Note: source_data is copied - caller can free it immediately after this call
+int hot_swap_buffer(LiveGraph *lg, int buffer_id, const float *source_data,
+                    int size, int channel_count);
+
 // ===================== Node VTables for Custom Nodes =====================
 
 extern const NodeVTable OSC_VTABLE;

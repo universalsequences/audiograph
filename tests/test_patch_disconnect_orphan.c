@@ -31,7 +31,7 @@ static const float SRC_VAL_A = 1.0f;
 static const float SRC_VAL_B = 2.0f;
 
 static void src2_process(float *const *in, float *const *out, int n,
-                         void *memory) {
+                         void *memory, void *buffers) {
   (void)in;
   (void)memory;
   float *o0 = out[0];
@@ -47,7 +47,7 @@ static const NodeVTable SRC2_VT = {
 
 // 1-in / 1-out pass-through
 static void pass_process(float *const *in, float *const *out, int n,
-                         void *memory) {
+                         void *memory, void *buffers) {
   (void)memory;
   const float *i0 = in[0];
   float *o0 = out[0];
@@ -63,7 +63,7 @@ static const NodeVTable PASS_VT = {
 
 // 2-in / 2-out duplicator: out0=in0, out1=in1
 static void dup22_process(float *const *in, float *const *out, int n,
-                          void *memory) {
+                          void *memory, void *buffers) {
   (void)memory;
   const float *i0 = in[0];
   const float *i1 = in[1];
@@ -118,7 +118,6 @@ int main() {
   assert(apply_connect(lg, pass, 0, dac, 0));
   assert(apply_connect(lg, dup22, 1, dac, 1));
   assert(apply_connect(lg, dup22, 0, dac, 0)); // creates auto-SUM on DAC:0
-
 
   // Validate orphan status pre-disconnect (none orphaned)
   assert(!lg->is_orphaned[dac]);

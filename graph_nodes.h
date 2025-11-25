@@ -8,9 +8,9 @@
 // Oscillator memory layout
 #define OSC_MEMORY_SIZE 2
 #define OSC_PHASE 0
-#define OSC_INC   1
+#define OSC_INC 1
 
-// Gain memory layout  
+// Gain memory layout
 #define GAIN_MEMORY_SIZE 1
 #define GAIN_VALUE 0
 
@@ -24,26 +24,33 @@
 // ===================== Node Processing Functions =====================
 
 // Oscillator functions
-void osc_init(void* memory, int sr, int maxBlock, const void *initial_state);
-void osc_process(float* const* in, float* const* out, int n, void* memory);
-void osc_migrate(void* newMemory, const void* oldMemory);
+void osc_process(float *const *in, float *const *out, int n, void *memory,
+                 void *buffers);
+void osc_migrate(void *newMemory, const void *oldMemory);
 
 // Gain function
-void gain_process(float* const* in, float* const* out, int n, void* memory);
+void gain_process(float *const *in, float *const *out, int n, void *memory,
+                  void *buffers);
 
 // Number function
-void number_process(float* const* in, float* const* out, int n, void* memory);
+void number_process(float *const *in, float *const *out, int n, void *memory,
+                    void *buffers);
 
 // Mixer functions
-void mix2_process(float* const* in, float* const* out, int n, void* memory);
-void mix3_process(float* const* in, float* const* out, int n, void* memory);
-void mix8_process(float* const* in, float* const* out, int n, void* memory);
+void mix2_process(float *const *in, float *const *out, int n, void *memory,
+                  void *buffers);
+void mix3_process(float *const *in, float *const *out, int n, void *memory,
+                  void *buffers);
+void mix8_process(float *const *in, float *const *out, int n, void *memory,
+                  void *buffers);
 
 // DAC function (Digital-to-Analog Converter - final output sink)
-void dac_process(float* const* in, float* const* out, int n, void* memory);
+void dac_process(float *const *in, float *const *out, int n, void *memory,
+                 void *buffers);
 
 // SUM function (Auto-summing for multiple edges into same input)
-void sum_process(float* const* in, float* const* out, int n, void* memory);
+void sum_process(float *const *in, float *const *out, int n, void *memory,
+                 void *buffers);
 
 // ===================== Helper Functions =====================
 
@@ -59,6 +66,5 @@ extern const NodeVTable MIX2_VTABLE;
 extern const NodeVTable MIX8_VTABLE;
 extern const NodeVTable DAC_VTABLE;
 extern const NodeVTable SUM_VTABLE;
-
 
 #endif // GRAPH_NODES_H

@@ -25,7 +25,7 @@ typedef struct {
 
 // Custom node process functions
 static void number_gen_process(float *const *inputs, float *const *outputs,
-                               int block_size, void *state) {
+                               int block_size, void *state, void *buffers) {
   (void)inputs;
   NumberGenState *s = (NumberGenState *)state;
 
@@ -35,7 +35,7 @@ static void number_gen_process(float *const *inputs, float *const *outputs,
 }
 
 static void dual_output_process(float *const *inputs, float *const *outputs,
-                                int block_size, void *state) {
+                                int block_size, void *state, void *buffers) {
   (void)inputs;
   DualOutputState *s = (DualOutputState *)state;
 
@@ -46,7 +46,7 @@ static void dual_output_process(float *const *inputs, float *const *outputs,
 }
 
 static void multiplier_process(float *const *inputs, float *const *outputs,
-                               int block_size, void *state) {
+                               int block_size, void *state, void *buffers) {
   (void)state;
 
   for (int i = 0; i < block_size; i++) {

@@ -62,7 +62,8 @@ static __thread size_t *tls_out_scratch_sizes = NULL;
 static __thread int tls_scratch_ports = 0;
 
 static bool ensure_tls_io_capacity(int needed_inputs, int needed_outputs) {
-  int required = needed_inputs > needed_outputs ? needed_inputs : needed_outputs;
+  int required =
+      needed_inputs > needed_outputs ? needed_inputs : needed_outputs;
   if (required <= tls_io_capacity)
     return true;
   if (required <= 0)
@@ -292,25 +293,26 @@ static void *worker_main(void *arg) {
         bool ok = os_workgroup_join(oswg, &oswg_token);
         oswg_joined = ok;
         if (ok) {
-          printf("[audiograph] worker %p joined os_workgroup\n", (void *)pthread_self());
+          printf("[audiograph] worker %p joined os_workgroup\n",
+                 (void *)pthread_self());
           // Decrement counter; last worker to reach 0 clears the flag
           int remaining =
-            atomic_fetch_sub_explicit(&g_engine.oswg_join_remaining, 1,
-                                    memory_order_acq_rel) -
-            1;
+              atomic_fetch_sub_explicit(&g_engine.oswg_join_remaining, 1,
+                                        memory_order_acq_rel) -
+              1;
           if (remaining == 0) {
             atomic_store_explicit(&g_engine.oswg_join_pending, 0,
-                              memory_order_release);
+                                  memory_order_release);
           }
         } else {
-        if (!oswg_logged) {
-          fprintf(
-              stderr,
-              ok ? "[audiograph] worker %p joined os_workgroup %p\n"
-                 : "[audiograph] worker %p FAILED to join os_workgroup %p\n",
-              (void *)pthread_self(), (void *)oswg);
-          oswg_logged = true;
-        }
+          if (!oswg_logged) {
+            fprintf(
+                stderr,
+                ok ? "[audiograph] worker %p joined os_workgroup %p\n"
+                   : "[audiograph] worker %p FAILED to join os_workgroup %p\n",
+                (void *)pthread_self(), (void *)oswg);
+            oswg_logged = true;
+          }
         }
       } else if (!oswg_warned) {
         fprintf(
@@ -318,7 +320,7 @@ static void *worker_main(void *arg) {
             "[audiograph] os_workgroup pointer not set; workers not joined\n");
         oswg_warned = true;
       }
-         }
+    }
 #endif
 
     LiveGraph *lg =
@@ -523,10 +525,10 @@ void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
   }
 
   if (node->vtable.process) {
-    //printf("attempting to process nid=%d %p\n", nid, node->vtable.process);
+    // printf("attempting to process nid=%d %p\n", nid, node->vtable.process);
     node->vtable.process((float *const *)inPtrs, (float *const *)outPtrs,
-                         nframes, node->state);
-    //printf("succeeding process nid=%d %p\n", nid, node->vtable.process);
+                         nframes, node->state, lg->buffers);
+    // printf("succeeding process nid=%d %p\n", nid, node->vtable.process);
   }
 
   // Clear thread-local context
@@ -654,7 +656,6 @@ void process_live_block(LiveGraph *lg, int nframes) {
     update_watched_node_states(lg);
     return;
   }
-
 
   if (g_engine.workerCount > 0) {
     // Publish session frames and graph

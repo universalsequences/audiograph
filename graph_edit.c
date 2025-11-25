@@ -336,6 +336,85 @@ void add_failed_id(LiveGraph *lg, uint64_t logical_id) {
   lg->failed_ids[lg->failed_ids_count++] = logical_id;
 }
 
+bool grow_buffer_capacity(LiveGraph *lg) {
+  int old_capacity = lg->buffer_capacity;
+  lg->buffer_capacity *= 2;
+  BufferDesc *new_buffers = calloc(lg->buffer_capacity, sizeof(BufferDesc));
+  if (!new_buffers) {
+    return false;
+  }
+  for (int i = 0; i < old_capacity && i < lg->buffer_count; i++) {
+    new_buffers[i].buffer =
+        lg->buffers[i].buffer; // copy pointer of buffer over
+    new_buffers[i].size = lg->buffers[i].size;
+    new_buffers[i].channel_count = lg->buffers[i].channel_count;
+  }
+  lg->buffers = new_buffers;
+  return true;
+}
+
+bool apply_create_buffer(LiveGraph *lg, int buffer_id, int size,
+                         int channel_count, const float *source_data,
+                         size_t source_data_size) {
+  if (buffer_id < 0) {
+    return false;
+  }
+  if (buffer_id >= lg->buffer_capacity) {
+    if (!grow_buffer_capacity(lg)) {
+      // failed to grow buffer capacity
+      // TODO - mark buffer as invalid
+      return false;
+    }
+  }
+
+  BufferDesc *buf = &lg->buffers[buffer_id];
+  memset(buf, 0, sizeof(BufferDesc));
+
+  buf->size = size;
+  buf->channel_count = channel_count;
+  size_t total_samples = (size_t)channel_count * (size_t)size;
+  buf->buffer = (float *)calloc(total_samples, sizeof(float));
+
+  if (!buf->buffer) {
+    return false;
+  }
+
+  // Copy source data if provided
+  if (source_data && source_data_size > 0) {
+    size_t bytes_to_copy = total_samples * sizeof(float);
+    if (source_data_size < bytes_to_copy) {
+      bytes_to_copy = source_data_size; // Don't overflow source
+    }
+    memcpy(buf->buffer, source_data, bytes_to_copy);
+  }
+
+  lg->buffer_count++;
+  return true;
+}
+
+bool apply_hotswap_buffer(LiveGraph *lg, int buffer_id,
+                          const float *source_data, size_t source_data_size) {
+  if (buffer_id < 0 || buffer_id >= lg->buffer_capacity) {
+    return false;
+  }
+
+  BufferDesc *buf = &lg->buffers[buffer_id];
+  if (!buf->buffer) {
+    // Buffer doesn't exist yet - can't hotswap
+    return false;
+  }
+
+  // Copy new data into existing buffer
+  size_t total_samples = (size_t)buf->channel_count * (size_t)buf->size;
+  size_t bytes_to_copy = total_samples * sizeof(float);
+  if (source_data_size < bytes_to_copy) {
+    bytes_to_copy = source_data_size; // Don't overflow source
+  }
+  memcpy(buf->buffer, source_data, bytes_to_copy);
+
+  return true;
+}
+
 // to be called from block-boundary (i.e. before each block is executed)
 bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
   GraphEditCmd cmd;
@@ -362,7 +441,6 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
       if (!ok) {
         // Track the failed logical ID
         add_failed_id(lg, cmd.u.add_node.logical_id);
-        printf("failed to add node=%d\n", cmd.u.add_node.logical_id);
       }
       // Clean up allocated initial_state memory
       if (cmd.u.add_node.initial_state) {
@@ -399,6 +477,26 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
       break;
     case GE_REMOVE_WATCH:
       ok = apply_remove_watchlist(lg, cmd.u.remove_watch.node_id);
+      break;
+    case GE_CREATE_BUFFER:
+      ok = apply_create_buffer(lg, cmd.u.create_buffer.buffer_id,
+                               cmd.u.create_buffer.size,
+                               cmd.u.create_buffer.channel_count,
+                               cmd.u.create_buffer.source_data,
+                               cmd.u.create_buffer.source_data_size);
+      // Free the copied source data after apply
+      if (cmd.u.create_buffer.source_data) {
+        free(cmd.u.create_buffer.source_data);
+      }
+      break;
+    case GE_HOTSWAP_BUFFER:
+      ok = apply_hotswap_buffer(lg, cmd.u.hotswap_buffer.buffer_id,
+                                cmd.u.hotswap_buffer.source_data,
+                                cmd.u.hotswap_buffer.source_data_size);
+      // Free the copied source data after apply
+      if (cmd.u.hotswap_buffer.source_data) {
+        free(cmd.u.hotswap_buffer.source_data);
+      }
       break;
     default: {
       ok = false; // unknown op

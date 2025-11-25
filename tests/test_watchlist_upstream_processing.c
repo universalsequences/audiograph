@@ -11,7 +11,7 @@ typedef struct {
 } TestRecorderState;
 
 static void test_recorder_process(float *const *in, float *const *out,
-                                  int nframes, void *state) {
+                                  int nframes, void *state, void *memory) {
   TestRecorderState *s = (TestRecorderState *)state;
 
   // Record first input sample if available
@@ -112,7 +112,8 @@ int main() {
 
   // Verify recorder (watched) processed and saw input from nodeB
   size_t st_sz = 0;
-  TestRecorderState *st = (TestRecorderState *)get_node_state(lg, nodeC, &st_sz);
+  TestRecorderState *st =
+      (TestRecorderState *)get_node_state(lg, nodeC, &st_sz);
   assert(st && st_sz == sizeof(TestRecorderState));
   printf("Recorder state: count=%f, last_in=%f\n", st->processing_count,
          st->last_input_sample);
@@ -122,7 +123,7 @@ int main() {
   free(st);
 
   destroy_live_graph(lg);
-  printf("\n✓ Watchlist upstream propagation works: graph continues and inputs process.\n");
+  printf("\n✓ Watchlist upstream propagation works: graph continues and inputs "
+         "process.\n");
   return 0;
 }
-
