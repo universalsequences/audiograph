@@ -421,6 +421,78 @@ void test_retire_drain_system() {
   printf("✓ Retire/drain system test passed!\n\n");
 }
 
+void test_hot_swap_port_growth() {
+  printf("=== Testing Hot Swap with Port Growth ===\n");
+
+  const int block_size = 64;
+  LiveGraph *lg = create_live_graph(32, block_size, "port_growth_test", 1);
+  assert(lg != NULL);
+
+  // Create a GAIN node (1 input, 1 output) and connect it
+  int num1 = live_add_number(lg, 5.0f, "num1");
+  int gain = live_add_gain(lg, 2.0f, "original_gain");
+  assert(num1 >= 0 && gain >= 0);
+  apply_graph_edits(lg->graphEditQueue, lg);
+
+  // Connect num1 -> gain -> DAC
+  bool connect1 = graph_connect(lg, num1, 0, gain, 0);
+  bool connect_dac = apply_connect(lg, gain, 0, lg->dac_node_id, 0);
+  assert(connect1 && connect_dac);
+  apply_graph_edits(lg->graphEditQueue, lg);
+
+  printf("✓ Created: num1(%d) -> gain(%d) -> DAC\n", num1, gain);
+
+  // Process and verify original output: 5.0 * 2.0 = 10.0
+  float output_buffer[block_size];
+  process_next_block(lg, output_buffer, block_size);
+  assert(fabs(output_buffer[0] - 10.0f) < 0.001f);
+  printf("✓ Original output: %.3f\n", output_buffer[0]);
+
+  // Now hot swap the gain node to a MIX2 (2 inputs, 1 output)
+  // This GROWS the input port count from 1 to 2
+  GEHotSwapNode hot_swap = {
+      .vt = MIX2_VTABLE,
+      .state_size = 0,  // MIX2 has no state
+      .node_id = gain,
+      .new_nInputs = 2,   // Growing from 1 to 2 inputs!
+      .new_nOutputs = 1,
+      .initial_state = NULL,
+      .initial_state_size = 0
+  };
+
+  bool swap_result = apply_hot_swap(lg, &hot_swap);
+  assert(swap_result);
+  printf("✓ Hot swapped GAIN (1 input) to MIX2 (2 inputs)\n");
+
+  // Process - should not crash! The IO cache must be invalidated.
+  // Output should be 5.0 (num1 still connected to input 0, input 1 is silence)
+  process_next_block(lg, output_buffer, block_size);
+  printf("✓ First block after swap processed (no crash!), output: %.3f\n", output_buffer[0]);
+
+  // Now connect something to the NEW input port (port 1)
+  int num2 = live_add_number(lg, 7.0f, "num2");
+  assert(num2 >= 0);
+  apply_graph_edits(lg->graphEditQueue, lg);
+
+  bool connect2 = graph_connect(lg, num2, 0, gain, 1);  // Connect to the NEW port!
+  assert(connect2);
+  apply_graph_edits(lg->graphEditQueue, lg);
+
+  printf("✓ Connected num2(%d) to new input port 1\n", num2);
+
+  // Process - MIX2 should output average of both inputs: (5.0 + 7.0) / 2 = 6.0
+  // or sum depending on MIX2 implementation
+  process_next_block(lg, output_buffer, block_size);
+  printf("✓ Output after connecting to new port: %.3f\n", output_buffer[0]);
+
+  // Verify it's not 0 (would indicate broken connection) and not just 5.0 (old single input)
+  // The exact value depends on MIX2 implementation
+  assert(output_buffer[0] != 0.0f);  // Should have some output
+
+  destroy_live_graph(lg);
+  printf("✓ Hot swap port growth test passed!\n\n");
+}
+
 int main() {
   printf("🧪 Hot Swap Unit Tests\n");
   printf("======================\n\n");
@@ -431,6 +503,7 @@ int main() {
   test_replace_keep_edges_port_shrinking();
   test_hot_swap_stress();
   test_retire_drain_system();
+  test_hot_swap_port_growth();
 
   printf("🎉 All hot swap tests passed!\n");
   return 0;

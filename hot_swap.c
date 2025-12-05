@@ -102,6 +102,10 @@ bool apply_hot_swap(LiveGraph *lg, GEHotSwapNode *p) {
   if (!resize_ports_preserve(n, p->new_nInputs, p->new_nOutputs))
     return false;
 
+  // Invalidate cached IO pointers - port count changed, so cached arrays
+  // are wrong size. rebuild_node_io_cache() will reallocate on next process.
+  n->io_cache_valid = false;
+
   // Allocate new state memory if needed
   void *new_state = NULL;
   if (p->state_size > 0) {
@@ -195,6 +199,9 @@ bool apply_replace_keep_edges_internal(LiveGraph *lg, GEReplaceKeepEdges *p) {
   // preserved by resize_ports_preserve
   if (!resize_ports_preserve(n, p->new_nInputs, p->new_nOutputs))
     return false;
+
+  // Invalidate cached IO pointers - port count changed
+  n->io_cache_valid = false;
 
   // 4) Allocate and install new state/vtable
   void *new_state = NULL;
