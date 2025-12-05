@@ -186,12 +186,14 @@ void apply_params(LiveGraph *g) {
     return;
   ParamMsg m;
   while (params_pop(g->params, &m)) {
-    for (int i = 0; i < g->node_count; i++) {
-      if (g->nodes[i].logical_id == m.logical_id) {
-        if (g->nodes[i].state) { // Only apply if node has memory
-          float *memory = (float *)g->nodes[i].state;
-          memory[m.idx] = m.fvalue; // Direct indexed access
-        }
+    // O(1) direct lookup: logical_id is used as the array index in apply_add_node
+    int node_id = (int)m.logical_id;
+    if (node_id >= 0 && node_id < g->node_count) {
+      RTNode *node = &g->nodes[node_id];
+      // Verify logical_id matches (safety check for deleted/reused slots)
+      if (node->state && node->logical_id == m.logical_id) {
+        float *memory = (float *)node->state;
+        memory[m.idx] = m.fvalue;
       }
     }
   }

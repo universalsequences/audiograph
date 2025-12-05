@@ -323,31 +323,10 @@ void update_orphaned_status(LiveGraph *lg) {
   mark_reachable_from_dac(lg, lg->dac_node_id, visited);
   free(visited);
 
-  // After connectivity changes, recompute indegree from actual inputs to avoid
-  // drift when editing many ports. This ensures scheduling can't deadlock due
-  // to stale indegree values.
-  for (int d = 0; d < lg->node_count; d++) {
-    int uniq = 0;
-    if (lg->nodes[d].inEdgeId && lg->nodes[d].nInputs > 0) {
-      // Track seen predecessors for this destination
-      // Use a simple linear scan (node_count is small in tests)
-      for (int s = 0; s < lg->node_count; s++) {
-        bool uses = false;
-        for (int di = 0; di < lg->nodes[d].nInputs; di++) {
-          int eid = lg->nodes[d].inEdgeId[di];
-          if (eid < 0 || eid >= lg->edge_capacity || !lg->edges[eid].in_use)
-            continue;
-          if (lg->edges[eid].src_node == s) {
-            uses = true;
-            break;
-          }
-        }
-        if (uses)
-          uniq++;
-      }
-    }
-    lg->indegree[d] = uniq;
-  }
+  // NOTE: Indegree is maintained incrementally by connect/disconnect operations
+  // via indegree_inc_on_first_pred() and indegree_dec_on_last_pred().
+  // The O(n²) recomputation that was here was removed for performance -
+  // with 7000 nodes it caused ~50ms audio dropouts on topology changes.
 }
 
 // ===================== Failed ID Tracking =====================
@@ -761,6 +740,14 @@ bool apply_disconnect_internal(LiveGraph *lg, int src_node, int src_port,
         if (!has_successor(&lg->nodes[remaining_src], dst_node)) {
           add_successor_port(&lg->nodes[remaining_src], dst_node);
           added = true;
+        } else {
+          // remaining_src was ALREADY a predecessor of dst_node (via another port).
+          // SUM contributed 1 to dst_node's indegree, but remaining_src taking over
+          // doesn't add a new unique predecessor. So we must decrement indegree
+          // to account for SUM being removed.
+          if (lg->indegree[dst_node] > 0) {
+            lg->indegree[dst_node]--;
+          }
         }
         // Remove SUM from source's successors
         remove_successor(&lg->nodes[remaining_src], sum_id);
