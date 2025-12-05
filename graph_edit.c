@@ -236,6 +236,14 @@ static void mark_reachable_from_dac(LiveGraph *lg, int node_id, bool *visited) {
 
 // Update orphaned status for all nodes based on DAC reachability
 void update_orphaned_status(LiveGraph *lg) {
+  // Mark scheduling cache as dirty - topology has changed
+  lg->scheduling_dirty = true;
+
+  // Invalidate IO caches for all nodes - topology has changed
+  for (int i = 0; i < lg->node_count; i++) {
+    lg->nodes[i].io_cache_valid = false;
+  }
+
   // First, mark all nodes as orphaned (except watched nodes)
   for (int i = 0; i < lg->node_count; i++) {
     // Check if this node is in the watchlist
@@ -970,6 +978,17 @@ bool apply_delete_node_internal(LiveGraph *lg, int node_id) {
     node->succ = NULL;
   }
 
+  // Free cached IO pointers
+  if (node->cached_inPtrs) {
+    free(node->cached_inPtrs);
+    node->cached_inPtrs = NULL;
+  }
+  if (node->cached_outPtrs) {
+    free(node->cached_outPtrs);
+    node->cached_outPtrs = NULL;
+  }
+  node->io_cache_valid = false;
+
   // 4) Clear node data and mark as deleted
   // Note: Don't clear logical_id since it's now the array index
   node->state = NULL; // Mark as deleted (state is freed above)
@@ -1008,9 +1027,10 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
   atomic_int *new_pending = calloc(new_capacity, sizeof(atomic_int));
   void **new_state_snapshots = calloc(new_capacity, sizeof(void *));
   size_t *new_state_sizes = calloc(new_capacity, sizeof(size_t));
+  uint64_t *new_pending_generation = calloc(new_capacity, sizeof(uint64_t));
 
   if (!new_nodes || !new_pending || !new_indegree || !new_orphaned ||
-      !new_state_snapshots || !new_state_sizes) {
+      !new_state_snapshots || !new_state_sizes || !new_pending_generation) {
     // Clean up any successful allocations
     if (new_nodes)
       free(new_nodes);
@@ -1024,6 +1044,8 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
       free(new_state_snapshots);
     if (new_state_sizes)
       free(new_state_sizes);
+    if (new_pending_generation)
+      free(new_pending_generation);
     return false;
   }
 
@@ -1038,6 +1060,9 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
     new_nodes[i].outEdgeId = NULL;
     new_nodes[i].fanin_sum_node_id = NULL;
     new_nodes[i].succ = NULL;
+    new_nodes[i].cached_inPtrs = NULL;
+    new_nodes[i].cached_outPtrs = NULL;
+    new_nodes[i].io_cache_valid = false;  // Force rebuild after capacity growth
 
     // Re-allocate port arrays if the old node had them
     RTNode *old_node = &lg->nodes[i];
@@ -1074,6 +1099,8 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
            old_capacity * sizeof(void *));
   if (lg->state_sizes)
     memcpy(new_state_sizes, lg->state_sizes, old_capacity * sizeof(size_t));
+  if (lg->pending_generation)
+    memcpy(new_pending_generation, lg->pending_generation, old_capacity * sizeof(uint64_t));
 
   // Copy existing atomic values
   for (int i = 0; i < old_capacity; i++) {
@@ -1105,6 +1132,10 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
       free(old_node->fanin_sum_node_id);
     if (old_node->succ)
       free(old_node->succ);
+    if (old_node->cached_inPtrs)
+      free(old_node->cached_inPtrs);
+    if (old_node->cached_outPtrs)
+      free(old_node->cached_outPtrs);
   }
   free(lg->nodes);
   free(lg->pending);
@@ -1114,6 +1145,8 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
     free(lg->state_snapshots);
   if (lg->state_sizes)
     free(lg->state_sizes);
+  if (lg->pending_generation)
+    free(lg->pending_generation);
 
   // Update pointers and capacity
   lg->nodes = new_nodes;
@@ -1122,6 +1155,7 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
   lg->is_orphaned = new_orphaned;
   lg->state_snapshots = new_state_snapshots;
   lg->state_sizes = new_state_sizes;
+  lg->pending_generation = new_pending_generation;
   lg->node_capacity = new_capacity;
 
   return true;
@@ -1179,6 +1213,11 @@ int apply_add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
   node->inEdgeId = NULL;
   node->outEdgeId = NULL;
   node->succ = NULL;
+
+  // Initialize cached IO pointers (will be built lazily on first process)
+  node->cached_inPtrs = NULL;
+  node->cached_outPtrs = NULL;
+  node->io_cache_valid = false;
 
   // Set up port arrays if needed
   if (!ensure_port_arrays(node)) {

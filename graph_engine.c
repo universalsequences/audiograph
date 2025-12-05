@@ -31,6 +31,7 @@ extern bool rq_try_pop(ReadyQ *q, int32_t *out);
 extern bool rq_wait_nonempty(ReadyQ *q, int timeout_us);
 extern void rq_reset(ReadyQ *q);
 extern void rq_push_or_spin(ReadyQ *q, int32_t nid);
+extern void rq_push_batch(ReadyQ *q, const int32_t *nids, int count);
 
 // ===================== Forward Declarations =====================
 
@@ -467,6 +468,52 @@ void engine_stop_workers(void) {
 
 // ===================== Live Graph Operations =====================
 
+// Rebuild IO cache for a single node (called lazily when cache is invalid)
+static void rebuild_node_io_cache(LiveGraph *lg, RTNode *node, int nframes) {
+  (void)nframes;  // Currently unused but might be needed later
+
+  // Reallocate cached pointer arrays if size changed
+  // This handles cases where SUM nodes grow their input count
+  if (node->nInputs > 0) {
+    if (node->cached_inPtrs) {
+      free(node->cached_inPtrs);
+    }
+    node->cached_inPtrs = malloc(node->nInputs * sizeof(float *));
+  }
+  if (node->nOutputs > 0) {
+    if (node->cached_outPtrs) {
+      free(node->cached_outPtrs);
+    }
+    node->cached_outPtrs = malloc(node->nOutputs * sizeof(float *));
+  }
+
+  // Resolve input pointers
+  if (node->cached_inPtrs) {
+    for (int i = 0; i < node->nInputs; i++) {
+      int eid = node->inEdgeId ? node->inEdgeId[i] : -1;
+      if (eid >= 0 && eid < lg->edge_capacity && lg->edges[eid].buf) {
+        node->cached_inPtrs[i] = lg->edges[eid].buf;
+      } else {
+        node->cached_inPtrs[i] = lg->silence_buf;
+      }
+    }
+  }
+
+  // Resolve output pointers
+  if (node->cached_outPtrs) {
+    for (int i = 0; i < node->nOutputs; i++) {
+      int eid = node->outEdgeId ? node->outEdgeId[i] : -1;
+      if (eid >= 0 && eid < lg->edge_capacity && lg->edges[eid].buf) {
+        node->cached_outPtrs[i] = lg->edges[eid].buf;
+      } else {
+        node->cached_outPtrs[i] = lg->scratch_null;
+      }
+    }
+  }
+
+  node->io_cache_valid = true;
+}
+
 void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
   RTNode *node = &lg->nodes[nid];
 
@@ -481,59 +528,33 @@ void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
   // Set thread-local context for SUM nodes to access input count
   g_current_processing_node = node;
 
-  int needed_inputs = node->nInputs > 0 ? node->nInputs : 0;
-  int needed_outputs = node->nOutputs > 0 ? node->nOutputs : 0;
-  if (!ensure_tls_io_capacity(needed_inputs, needed_outputs)) {
-    fprintf(stderr,
-            "[audiograph] WARN: bind_and_run_live unable to allocate IO "
-            "bindings for node %d (inputs=%d outputs=%d)\n",
-            nid, node->nInputs, node->nOutputs);
-    g_current_processing_node = NULL;
-    return;
+  // === OPTIMIZATION: Use pre-cached IO pointers ===
+  // Only rebuild if cache is invalid (topology changed)
+  if (!node->io_cache_valid) {
+    rebuild_node_io_cache(lg, node, nframes);
   }
 
-  float **inPtrs = tls_node_inputs;
-  float **outPtrs = tls_node_outputs;
+  // Use cached pointers directly - no per-block loops!
+  float **inPtrs = node->cached_inPtrs;
+  float **outPtrs = node->cached_outPtrs;
 
-  // Inputs: each port has 0/1 producer (edge id or -1)
-  for (int i = 0; i < node->nInputs; i++) {
-    int eid = node->inEdgeId ? node->inEdgeId[i] : -1;
-    if (eid >= 0 && eid < lg->edge_capacity && lg->edges[eid].buf) {
-      inPtrs[i] = lg->edges[eid].buf;
-    } else {
-      inPtrs[i] = lg->silence_buf;
-    }
+  // Fallback to silence/scratch if no cached pointers (shouldn't happen)
+  if (!inPtrs && node->nInputs > 0) {
+    inPtrs = &lg->silence_buf;  // Single pointer fallback
   }
-  // Guard against stale pointers beyond current input count
-  for (int i = node->nInputs; i < needed_inputs; i++) {
-    inPtrs[i] = lg->silence_buf;
-  }
-
-  // Outputs: one buffer per output port (edge id or -1)
-  // Use thread-local scratch to prevent write-write races
-  for (int i = 0; i < node->nOutputs; i++) {
-    int eid = node->outEdgeId ? node->outEdgeId[i] : -1;
-    if (eid >= 0 && eid < lg->edge_capacity && lg->edges[eid].buf) {
-      outPtrs[i] = lg->edges[eid].buf;
-    } else {
-      float *scratch = get_tls_out_scratch(lg, i, nframes);
-      outPtrs[i] = scratch ? scratch : lg->scratch_null;
-    }
-  }
-  for (int i = node->nOutputs; i < needed_outputs; i++) {
-    outPtrs[i] = lg->scratch_null;
+  if (!outPtrs && node->nOutputs > 0) {
+    outPtrs = &lg->scratch_null;
   }
 
   if (node->vtable.process) {
-    // printf("attempting to process nid=%d %p\n", nid, node->vtable.process);
     node->vtable.process((float *const *)inPtrs, (float *const *)outPtrs,
                          nframes, node->state, lg->buffers);
-    // printf("succeeding process nid=%d %p\n", nid, node->vtable.process);
   }
 
   // Clear thread-local context
   g_current_processing_node = NULL;
 }
+
 
 static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes) {
   if (nid < 0 || nid >= lg->node_count) {
@@ -546,22 +567,29 @@ static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes) {
   bind_and_run_live(lg, nid, nframes); // uses silence/scratch for missing ports
 
   RTNode *node = &lg->nodes[nid];
-  // Notify successors (node-level)
-  for (int i = 0; i < node->succCount; i++) {
-    int succ = node->succ[i];
-    if (succ < 0 || succ >= lg->node_count) {
-      continue;
-    }
-    if (lg->is_orphaned[succ]) {
-      continue;
-    }
-    if (atomic_fetch_sub_explicit(&lg->pending[succ], 1,
-                                  memory_order_acq_rel) == 1) {
-      rq_push_or_spin(lg->readyQueue, succ); // CRITICAL FIX: Never drop work
+
+  // OPTIMIZATION: Check if we have any successors before the loop
+  // This avoids cache misses on is_orphaned for leaf nodes
+  if (node->succCount > 0) {
+    // Notify successors (node-level)
+    // Use release semantics to ensure our output buffer writes are visible
+    for (int i = 0; i < node->succCount; i++) {
+      int succ = node->succ[i];
+      if (succ < 0 || succ >= lg->node_count) {
+        continue;
+      }
+      if (lg->is_orphaned[succ]) {
+        continue;
+      }
+      // Use release on decrement to ensure buffer writes are visible to successor
+      if (atomic_fetch_sub_explicit(&lg->pending[succ], 1, memory_order_release) == 1) {
+        rq_push_or_spin(lg->readyQueue, succ);
+      }
     }
   }
 
-  atomic_fetch_sub_explicit(&lg->jobsInFlight, 1, memory_order_acq_rel);
+  // Relaxed is fine here - just a counter
+  atomic_fetch_sub_explicit(&lg->jobsInFlight, 1, memory_order_relaxed);
 }
 
 // Check if a node has any connected outputs (for scheduling)
@@ -577,41 +605,109 @@ static inline bool node_has_any_output_connected(LiveGraph *lg, int node_id) {
   return false;
 }
 
-static void init_pending_and_seed(LiveGraph *lg) {
+// ===================== OPTIMIZATION: Scheduling Cache =====================
+// Instead of O(n) scans every block, we cache source nodes and job counts.
+// The cache is rebuilt only when topology changes (scheduling_dirty flag).
+
+static void rebuild_scheduling_cache(LiveGraph *lg) {
   int totalJobs = 0;
+  int sourceCount = 0;
 
-  // CRITICAL FIX: Properly reset/drain the ready queue to prevent stale node
-  // IDs
-  rq_reset(lg->readyQueue);
-
-  // pending = indegree for reachable nodes, -1 for orphaned/deleted
+  // Count sources first to check capacity
   for (int i = 0; i < lg->node_count; i++) {
-    // Skip deleted nodes (no process fn AND no ports)
     bool deleted = (lg->nodes[i].vtable.process == NULL &&
                     lg->nodes[i].nInputs == 0 && lg->nodes[i].nOutputs == 0);
-    if (deleted || lg->is_orphaned[i]) {
-      atomic_store_explicit(&lg->pending[i], -1, memory_order_relaxed);
+    if (deleted || lg->is_orphaned[i])
       continue;
-    }
-
-    int indeg = lg->indegree[i]; // maintained incrementally at edits
-    atomic_store_explicit(&lg->pending[i], indeg, memory_order_relaxed);
 
     bool hasOut = node_has_any_output_connected(lg, i);
-    bool isSink = !hasOut && indeg > 0; // if you have true sinks that must run
+    bool isSink = !hasOut && lg->indegree[i] > 0;
 
     if (hasOut || isSink) {
       totalJobs++;
-      if (indeg == 0 && hasOut) {
-        rq_push_or_spin(lg->readyQueue, i); // CRITICAL FIX: Never drop work
+      if (lg->indegree[i] == 0 && hasOut) {
+        sourceCount++;
       }
     }
   }
 
-  atomic_store_explicit(&lg->jobsInFlight, totalJobs, memory_order_release);
+  // Grow source_nodes array if needed
+  if (sourceCount > lg->source_capacity) {
+    int new_cap = lg->source_capacity;
+    while (new_cap < sourceCount)
+      new_cap *= 2;
+    int32_t *new_sources = realloc(lg->source_nodes, new_cap * sizeof(int32_t));
+    if (new_sources) {
+      lg->source_nodes = new_sources;
+      lg->source_capacity = new_cap;
+    }
+  }
+
+  // Build source list
+  lg->source_count = 0;
+  for (int i = 0; i < lg->node_count; i++) {
+    bool deleted = (lg->nodes[i].vtable.process == NULL &&
+                    lg->nodes[i].nInputs == 0 && lg->nodes[i].nOutputs == 0);
+    if (deleted || lg->is_orphaned[i])
+      continue;
+
+    if (lg->indegree[i] == 0 && node_has_any_output_connected(lg, i)) {
+      if (lg->source_count < lg->source_capacity) {
+        lg->source_nodes[lg->source_count++] = i;
+      }
+    }
+  }
+
+  // Detect cycles at topology-change time (not every block!)
+  lg->has_cycle = (totalJobs > 0 && lg->source_count == 0);
+
+  lg->cached_total_jobs = totalJobs;
+  lg->scheduling_dirty = false;
+}
+
+static void init_pending_and_seed(LiveGraph *lg) {
+  // Rebuild cache if topology changed
+  if (lg->scheduling_dirty) {
+    rebuild_scheduling_cache(lg);
+  }
+
+  // CRITICAL FIX: Properly reset/drain the ready queue to prevent stale node
+  // IDs. Only drain if there might be stale items.
+  int32_t dummy;
+  while (rq_try_pop(lg->readyQueue, &dummy)) {
+    // Discard any stale items
+  }
+
+  // Reset pending counts to indegree for all active nodes
+  // This is O(n) but uses relaxed stores which are fast
+  // Workers will use atomic decrements on these values
+  for (int i = 0; i < lg->node_count; i++) {
+    bool deleted = (lg->nodes[i].vtable.process == NULL &&
+                    lg->nodes[i].nInputs == 0 && lg->nodes[i].nOutputs == 0);
+    if (deleted || lg->is_orphaned[i]) {
+      atomic_store_explicit(&lg->pending[i], -1, memory_order_relaxed);
+    } else {
+      atomic_store_explicit(&lg->pending[i], lg->indegree[i], memory_order_relaxed);
+    }
+  }
+
+  // Memory barrier to ensure all pending stores are visible before workers start
+  atomic_thread_fence(memory_order_release);
+
+  // Seed ready queue from cached source list - O(sources) instead of O(n)
+  // Use batch push to reduce semaphore signals from O(sources) to O(1)
+  rq_push_batch(lg->readyQueue, lg->source_nodes, lg->source_count);
+
+  atomic_store_explicit(&lg->jobsInFlight, lg->cached_total_jobs,
+                        memory_order_release);
 }
 
 bool detect_cycle(LiveGraph *lg) {
+  // Use cached result if available
+  if (!lg->scheduling_dirty) {
+    return lg->has_cycle;
+  }
+  // Fallback to full computation (shouldn't happen in hot path)
   int reachable = 0, zero_in = 0;
   for (int i = 0; i < lg->node_count; i++) {
     if (atomic_load_explicit(&lg->pending[i], memory_order_relaxed) < 0)

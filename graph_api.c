@@ -93,6 +93,18 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   lg->state_sizes = calloc(lg->node_capacity, sizeof(size_t));
   pthread_rwlock_init(&lg->state_store_lock, NULL);
 
+  // Initialize scheduling cache (optimization to avoid O(n) per block)
+  lg->source_capacity = 256;  // Start with reasonable capacity
+  lg->source_nodes = calloc(lg->source_capacity, sizeof(int32_t));
+  lg->source_count = 0;
+  lg->cached_total_jobs = 0;
+  lg->has_cycle = false;
+  lg->scheduling_dirty = true;  // Force initial rebuild
+
+  // Initialize generation-based lazy pending reset
+  atomic_init(&lg->block_generation, 1);  // Start at 1 so 0 means "never reset"
+  lg->pending_generation = calloc(lg->node_capacity, sizeof(uint64_t));
+
   // Automatically create the DAC node at index 0
   // DAC has one input and one output per channel
   int dac_id = apply_add_node(lg, DAC_VTABLE, 0, 0, "DAC", lg->num_channels,
@@ -156,6 +168,13 @@ void destroy_live_graph(LiveGraph *lg) {
       if (node->succ) {
         free(node->succ);
       }
+      // Free cached IO pointers
+      if (node->cached_inPtrs) {
+        free(node->cached_inPtrs);
+      }
+      if (node->cached_outPtrs) {
+        free(node->cached_outPtrs);
+      }
     }
     free(lg->nodes);
   }
@@ -206,6 +225,12 @@ void destroy_live_graph(LiveGraph *lg) {
   if (lg->state_sizes)
     free(lg->state_sizes);
   pthread_rwlock_destroy(&lg->state_store_lock);
+
+  // Free scheduling cache
+  if (lg->source_nodes)
+    free(lg->source_nodes);
+  if (lg->pending_generation)
+    free(lg->pending_generation);
 
   // Free the graph itself
   free(lg);

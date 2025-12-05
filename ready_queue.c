@@ -176,3 +176,33 @@ void rq_push_or_spin(ReadyQ *q, int32_t nid) {
     cpu_relax(); // Brief pause to reduce contention
   }
 }
+
+// Batch push multiple items with a single semaphore signal at the end
+// This dramatically reduces kernel calls when seeding many source nodes
+void rq_push_batch(ReadyQ *q, const int32_t *nids, int count) {
+  if (!q || !nids || count <= 0)
+    return;
+
+  int pushed = 0;
+  for (int i = 0; i < count; i++) {
+    // Push directly to MPMC without signaling
+    for (;;) {
+      if (mpmc_push(q->ring, nids[i])) {
+        atomic_fetch_add_explicit(&q->qlen, 1, memory_order_acq_rel);
+        pushed++;
+        break;
+      }
+      cpu_relax();
+    }
+  }
+
+  // Single signal after all items are pushed - wakes one worker
+  // which will then wake others as needed through work stealing
+  if (pushed > 0) {
+#ifdef __APPLE__
+    dispatch_semaphore_signal(q->items);
+#else
+    sem_post(&q->items);
+#endif
+  }
+}

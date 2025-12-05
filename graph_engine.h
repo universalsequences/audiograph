@@ -39,6 +39,13 @@ typedef struct RTNode {
   int32_t *fanin_sum_node_id; // array[nInputs]: SUM node ID per input port (-1
                               // if none)
 
+  // === OPTIMIZATION: Pre-cached IO pointers ===
+  // These are rebuilt only on topology changes, not every block
+  // Eliminates per-block input/output loops in bind_and_run_live
+  float **cached_inPtrs;   // Pre-resolved input buffer pointers
+  float **cached_outPtrs;  // Pre-resolved output buffer pointers
+  bool io_cache_valid;     // False if topology changed, needs rebuild
+
   // scheduling
   int32_t *succ; // successor node indices
   int succCount; // number of nodes that depend on this node's output
@@ -117,6 +124,20 @@ typedef struct LiveGraph {
   void **state_snapshots;            // Array of state copies indexed by node_id
   size_t *state_sizes;               // Array of state sizes indexed by node_id
   pthread_rwlock_t state_store_lock; // Reader-writer lock for state access
+
+  // === OPTIMIZATION: Cached scheduling metadata ===
+  // These are rebuilt only on topology changes, not every block
+  int32_t *source_nodes;    // Array of source node IDs (indegree=0, has outputs)
+  int source_count;         // Number of source nodes
+  int source_capacity;      // Allocated capacity for source_nodes
+  int cached_total_jobs;    // Pre-computed job count for the block
+  bool has_cycle;           // Cached cycle detection result
+  bool scheduling_dirty;    // True if topology changed, needs rebuild
+
+  // === OPTIMIZATION: Generation-based lazy pending reset ===
+  // Eliminates O(n) atomic stores per block
+  _Atomic uint64_t block_generation;  // Incremented each block
+  uint64_t *pending_generation;       // Per-node: generation when pending was last valid
 } LiveGraph;
 
 // ===================== Worker Pool / Engine =====================

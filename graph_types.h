@@ -352,5 +352,6 @@ bool rq_try_pop(ReadyQ *q, int32_t *out);
 bool rq_wait_nonempty(ReadyQ *q, int timeout_us);
 void rq_reset(ReadyQ *q); // Reset/drain queue for clean block start
 void rq_push_or_spin(ReadyQ *q, int32_t nid); // Retry until enqueue succeeds
+void rq_push_batch(ReadyQ *q, const int32_t *nids, int count); // Batch push with single signal
 
 #endif // GRAPH_TYPES_H
