@@ -290,6 +290,86 @@ void test_hot_swap_invalid_buffer() {
   printf("✓ Invalid buffer test passed!\n\n");
 }
 
+void test_hot_swap_resize() {
+  printf("=== Testing Hot Swap Buffer Resize ===\n");
+
+  const int block_size = 64;
+  LiveGraph *lg = create_live_graph(16, block_size, "buffer_test", 1);
+  assert(lg != NULL);
+
+  // Create a small initial buffer (simulating 1 second at low sample rate)
+  const int initial_samples = 128;
+  const int num_channels = 1;
+  float initial_data[initial_samples];
+  for (int i = 0; i < initial_samples; i++) {
+    initial_data[i] = 1.0f;
+  }
+
+  int buf_id = create_buffer(lg, initial_samples, num_channels, initial_data);
+  assert(buf_id >= 0);
+  printf("✓ Created initial buffer: id=%d (%d samples)\n", buf_id, initial_samples);
+
+  // Apply buffer creation
+  apply_graph_edits(lg->graphEditQueue, lg);
+
+  // Verify initial size
+  BufferDesc *buf = &lg->buffers[buf_id];
+  assert(buf->size == initial_samples);
+  printf("✓ Initial buffer size verified: %d samples\n", buf->size);
+
+  // Now hot swap with a LARGER buffer (simulating loading a longer audio file)
+  const int new_samples = 1024;  // 8x larger
+  float *new_data = malloc(new_samples * sizeof(float));
+  for (int i = 0; i < new_samples; i++) {
+    new_data[i] = 2.0f + (float)i * 0.001f;  // Unique values to verify
+  }
+
+  int result = hot_swap_buffer(lg, buf_id, new_data, new_samples, num_channels);
+  assert(result);
+  printf("✓ Queued hot swap with larger buffer (%d samples)\n", new_samples);
+
+  // Apply the hot swap
+  bool apply_result = apply_graph_edits(lg->graphEditQueue, lg);
+  assert(apply_result);
+  printf("✓ Applied hot swap successfully\n");
+
+  // Verify buffer was resized
+  assert(buf->size == new_samples);
+  printf("✓ Buffer resized to: %d samples\n", buf->size);
+
+  // Verify ALL new data is present (not just the first initial_samples)
+  bool data_correct = true;
+  for (int i = 0; i < new_samples; i++) {
+    float expected = 2.0f + (float)i * 0.001f;
+    if (fabsf(buf->buffer[i] - expected) > 0.0001f) {
+      data_correct = false;
+      printf("  Mismatch at index %d: expected %.4f, got %.4f\n", i,
+             expected, buf->buffer[i]);
+      break;
+    }
+  }
+  assert(data_correct);
+  printf("✓ All %d samples have correct data (no truncation)\n", new_samples);
+
+  // Test shrinking too
+  const int smaller_samples = 64;
+  float smaller_data[smaller_samples];
+  for (int i = 0; i < smaller_samples; i++) {
+    smaller_data[i] = 3.0f;
+  }
+
+  hot_swap_buffer(lg, buf_id, smaller_data, smaller_samples, num_channels);
+  apply_graph_edits(lg->graphEditQueue, lg);
+
+  assert(buf->size == smaller_samples);
+  assert(fabsf(buf->buffer[0] - 3.0f) < 0.0001f);
+  printf("✓ Buffer can also shrink: now %d samples\n", buf->size);
+
+  free(new_data);
+  destroy_live_graph(lg);
+  printf("✓ Hot swap resize test passed!\n\n");
+}
+
 int main(int argc, char *argv[]) {
   (void)argc;
   (void)argv;
@@ -301,6 +381,7 @@ int main(int argc, char *argv[]) {
   test_create_buffer_empty();
   test_create_buffer_with_data();
   test_hot_swap_buffer();
+  test_hot_swap_resize();
   test_multiple_buffers();
   test_buffer_capacity_growth();
   test_hot_swap_invalid_buffer();

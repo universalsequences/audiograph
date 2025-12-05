@@ -397,6 +397,8 @@ int hot_swap_buffer(LiveGraph *lg, int buffer_id, const float *source_data,
 
   GraphEditCmd cmd = {.op = GE_HOTSWAP_BUFFER,
                       .u.hotswap_buffer = {.buffer_id = buffer_id,
+                                           .size = size,
+                                           .channel_count = channel_count,
                                            .source_data = source_copy,
                                            .source_data_size = source_size}};
 

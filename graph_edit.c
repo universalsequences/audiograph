@@ -397,8 +397,9 @@ bool apply_create_buffer(LiveGraph *lg, int buffer_id, int size,
   return true;
 }
 
-bool apply_hotswap_buffer(LiveGraph *lg, int buffer_id,
-                          const float *source_data, size_t source_data_size) {
+bool apply_hotswap_buffer(LiveGraph *lg, int buffer_id, int new_size,
+                          int new_channel_count, const float *source_data,
+                          size_t source_data_size) {
   if (buffer_id < 0 || buffer_id >= lg->buffer_capacity) {
     return false;
   }
@@ -409,9 +410,23 @@ bool apply_hotswap_buffer(LiveGraph *lg, int buffer_id,
     return false;
   }
 
-  // Copy new data into existing buffer
-  size_t total_samples = (size_t)buf->channel_count * (size_t)buf->size;
-  size_t bytes_to_copy = total_samples * sizeof(float);
+  size_t new_total_samples = (size_t)new_channel_count * (size_t)new_size;
+  size_t old_total_samples = (size_t)buf->channel_count * (size_t)buf->size;
+
+  // Reallocate if size changed
+  if (new_total_samples != old_total_samples) {
+    float *new_buffer = (float *)calloc(new_total_samples, sizeof(float));
+    if (!new_buffer) {
+      return false;
+    }
+    free(buf->buffer);
+    buf->buffer = new_buffer;
+    buf->size = new_size;
+    buf->channel_count = new_channel_count;
+  }
+
+  // Copy new data into buffer
+  size_t bytes_to_copy = new_total_samples * sizeof(float);
   if (source_data_size < bytes_to_copy) {
     bytes_to_copy = source_data_size; // Don't overflow source
   }
@@ -505,6 +520,8 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
       break;
     case GE_HOTSWAP_BUFFER:
       ok = apply_hotswap_buffer(lg, cmd.u.hotswap_buffer.buffer_id,
+                                cmd.u.hotswap_buffer.size,
+                                cmd.u.hotswap_buffer.channel_count,
                                 cmd.u.hotswap_buffer.source_data,
                                 cmd.u.hotswap_buffer.source_data_size);
       // Free the copied source data after apply

@@ -264,6 +264,8 @@ typedef struct {
 
 typedef struct {
   uint64_t buffer_id;
+  int size;                // New size (samples per channel)
+  int channel_count;       // New channel count
   float *source_data;      // New data to copy into buffer (caller-owned, freed after apply)
   size_t source_data_size; // Size in bytes of source_data
 } GEHotSwapBuffer;
