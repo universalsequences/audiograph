@@ -3,6 +3,8 @@
 #include "hot_swap.h"
 #include <assert.h>
 
+// Forward declaration for internal function (defined later in file)
+
 static void retire_edge(LiveGraph *lg, int eid) {
   if (eid < 0 || eid >= lg->edge_capacity)
     return;
@@ -127,11 +129,12 @@ static inline void indegree_dec_on_last_pred(LiveGraph *lg, int src, int dst) {
 }
 
 // Forward declarations
-static bool apply_delete_node_internal(LiveGraph *lg, int node_id);
+bool apply_delete_node_internal(LiveGraph *lg, int node_id);
 static bool apply_add_watchlist(LiveGraph *lg, int node_id);
 static bool apply_remove_watchlist(LiveGraph *lg, int node_id);
 
-static bool apply_add_watchlist(LiveGraph *lg, int node_id) {
+// Internal version that skips update_orphaned_status for batched operations
+static bool apply_add_watchlist_internal(LiveGraph *lg, int node_id) {
   if (!lg || node_id < 0 || node_id >= lg->node_capacity) {
     return false;
   }
@@ -159,11 +162,19 @@ static bool apply_add_watchlist(LiveGraph *lg, int node_id) {
   lg->watch_list[lg->watch_list_count++] = node_id;
   pthread_mutex_unlock(&lg->watch_list_mutex);
 
-  update_orphaned_status(lg);
   return true;
 }
 
-static bool apply_remove_watchlist(LiveGraph *lg, int node_id) {
+static bool apply_add_watchlist(LiveGraph *lg, int node_id) {
+  bool result = apply_add_watchlist_internal(lg, node_id);
+  if (result) {
+    update_orphaned_status(lg);
+  }
+  return result;
+}
+
+// Internal version that skips update_orphaned_status for batched operations
+static bool apply_remove_watchlist_internal(LiveGraph *lg, int node_id) {
   if (!lg || node_id < 0) {
     return false;
   }
@@ -186,13 +197,20 @@ static bool apply_remove_watchlist(LiveGraph *lg, int node_id) {
       pthread_rwlock_unlock(&lg->state_store_lock);
 
       pthread_mutex_unlock(&lg->watch_list_mutex);
-      update_orphaned_status(lg);
       return true;
     }
   }
 
   pthread_mutex_unlock(&lg->watch_list_mutex);
   return false;
+}
+
+static bool apply_remove_watchlist(LiveGraph *lg, int node_id) {
+  bool result = apply_remove_watchlist_internal(lg, node_id);
+  if (result) {
+    update_orphaned_status(lg);
+  }
+  return result;
 }
 
 // Recursive function to mark nodes reachable from DAC (port-based only)
@@ -422,6 +440,7 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
   const int MAX_CMDS_PER_BLOCK = 0;
   int applied = 0;
   bool all_ok = true;
+  bool needs_orphan_update = false;
 
   while (geq_pop(r, &cmd)) {
     if (MAX_CMDS_PER_BLOCK && applied >= MAX_CMDS_PER_BLOCK) {
@@ -429,8 +448,10 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
     }
 
     bool ok = true;
+    bool topology_changed = false;
 
     // then we have a cmd to run
+    // Use internal versions that skip update_orphaned_status for batching
     switch (cmd.op) {
     case GE_ADD_NODE: {
       int nid = apply_add_node(lg, cmd.u.add_node.vt, cmd.u.add_node.state_size,
@@ -449,11 +470,14 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
       break;
     }
     case GE_REMOVE_NODE:
-      ok = apply_delete_node(lg, cmd.u.remove_node.node_id);
+      ok = apply_delete_node_internal(lg, cmd.u.remove_node.node_id);
+      topology_changed = ok;
       break;
     case GE_CONNECT: {
-      ok = apply_connect(lg, cmd.u.connect.src_id, cmd.u.connect.src_port,
-                         cmd.u.connect.dst_id, cmd.u.connect.dst_port);
+      ok = apply_connect_internal(lg, cmd.u.connect.src_id,
+                                  cmd.u.connect.src_port, cmd.u.connect.dst_id,
+                                  cmd.u.connect.dst_port);
+      topology_changed = ok;
       if (!ok) {
         printf("failed to connect src=%d dest=%d\n", cmd.u.connect.src_id,
                cmd.u.connect.dst_id);
@@ -461,29 +485,32 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
       break;
     }
     case GE_DISCONNECT: {
-      ok = apply_disconnect(lg, cmd.u.disconnect.src_id,
-                            cmd.u.disconnect.src_port, cmd.u.disconnect.dst_id,
-                            cmd.u.disconnect.dst_port);
+      ok = apply_disconnect_internal(
+          lg, cmd.u.disconnect.src_id, cmd.u.disconnect.src_port,
+          cmd.u.disconnect.dst_id, cmd.u.disconnect.dst_port);
+      topology_changed = ok;
       break;
     }
     case GE_HOT_SWAP_NODE:
       ok = apply_hot_swap(lg, &cmd.u.hot_swap_node);
       break;
     case GE_REPLACE_KEEP_EDGES:
-      ok = apply_replace_keep_edges(lg, &cmd.u.replace_keep_edges);
+      ok = apply_replace_keep_edges_internal(lg, &cmd.u.replace_keep_edges);
+      topology_changed = ok;
       break;
     case GE_ADD_WATCH:
-      ok = apply_add_watchlist(lg, cmd.u.add_watch.node_id);
+      ok = apply_add_watchlist_internal(lg, cmd.u.add_watch.node_id);
+      topology_changed = ok;
       break;
     case GE_REMOVE_WATCH:
-      ok = apply_remove_watchlist(lg, cmd.u.remove_watch.node_id);
+      ok = apply_remove_watchlist_internal(lg, cmd.u.remove_watch.node_id);
+      topology_changed = ok;
       break;
     case GE_CREATE_BUFFER:
-      ok = apply_create_buffer(lg, cmd.u.create_buffer.buffer_id,
-                               cmd.u.create_buffer.size,
-                               cmd.u.create_buffer.channel_count,
-                               cmd.u.create_buffer.source_data,
-                               cmd.u.create_buffer.source_data_size);
+      ok = apply_create_buffer(
+          lg, cmd.u.create_buffer.buffer_id, cmd.u.create_buffer.size,
+          cmd.u.create_buffer.channel_count, cmd.u.create_buffer.source_data,
+          cmd.u.create_buffer.source_data_size);
       // Free the copied source data after apply
       if (cmd.u.create_buffer.source_data) {
         free(cmd.u.create_buffer.source_data);
@@ -507,19 +534,25 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
     if (!ok) {
       all_ok = false;
     }
+    if (topology_changed) {
+      needs_orphan_update = true;
+    }
+  }
+
+  // Batch the orphan status update
+  if (needs_orphan_update) {
+    update_orphaned_status(lg);
   }
 
   return all_ok;
 }
 
 /**
- * Disconnect a logical connection between src_node:src_port and
- * dst_node:dst_port. This function is transparent to SUM nodes - it handles the
- * hidden SUM logic automatically. Returns true if the logical connection
- * existed and was removed.
+ * Internal disconnect - skips update_orphaned_status for batched operations.
+ * Also uses apply_delete_node_internal to avoid nested orphan updates.
  */
-bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
-                      int dst_port) {
+bool apply_disconnect_internal(LiveGraph *lg, int src_node, int src_port,
+                               int dst_node, int dst_port) {
   if (!lg || src_node < 0 || src_node >= lg->node_count || dst_node < 0 ||
       dst_node >= lg->node_count) {
     return false;
@@ -661,8 +694,8 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
         retire_edge(lg, sum_out);
       }
 
-      // Delete the SUM node
-      apply_delete_node(lg, sum_id);
+      // Delete the SUM node (use internal to avoid nested orphan updates)
+      apply_delete_node_internal(lg, sum_id);
     } else if (SUM->nInputs == 1) {
       // Only one input left - collapse SUM back to direct connection
       int remaining_eid = SUM->inEdgeId[0];
@@ -748,8 +781,8 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
         }
       }
 
-      // Let apply_delete_node handle all edge cleanup and retirement
-      apply_delete_node(lg, sum_id);
+      // Let apply_delete_node_internal handle all edge cleanup and retirement
+      apply_delete_node_internal(lg, sum_id);
 
       // Restore the direct connection that apply_delete_node cleared
       D->inEdgeId[dst_port] = direct_eid;
@@ -789,12 +822,26 @@ bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
     // If SUM->nInputs > 1, SUM continues to exist with fewer inputs
   }
 
-  // Update orphaned status based on DAC reachability
-  update_orphaned_status(lg);
   return true;
 }
 
-static bool apply_delete_node_internal(LiveGraph *lg, int node_id) {
+/**
+ * Disconnect a logical connection between src_node:src_port and
+ * dst_node:dst_port. This function is transparent to SUM nodes - it handles the
+ * hidden SUM logic automatically. Returns true if the logical connection
+ * existed and was removed.
+ */
+bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
+                      int dst_port) {
+  bool result =
+      apply_disconnect_internal(lg, src_node, src_port, dst_node, dst_port);
+  if (result) {
+    update_orphaned_status(lg);
+  }
+  return result;
+}
+
+bool apply_delete_node_internal(LiveGraph *lg, int node_id) {
   if (!lg || node_id < 0 || node_id >= lg->node_count) {
     return false;
   }
@@ -1169,8 +1216,9 @@ bool apply_delete_node(LiveGraph *lg, int node_id) {
   return result;
 }
 
-bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
-                   int dst_port) {
+// Internal version that skips update_orphaned_status for batched operations
+bool apply_connect_internal(LiveGraph *lg, int src_node, int src_port,
+                            int dst_node, int dst_port) {
   // --- Validate nodes/ports ---
   if (!lg || src_node < 0 || src_node >= lg->node_count || dst_node < 0 ||
       dst_node >= lg->node_count) {
@@ -1345,8 +1393,15 @@ bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
     }
   }
 
-  // Update orphaned status based on DAC reachability
-  update_orphaned_status(lg);
-
   return true;
+}
+
+bool apply_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
+                   int dst_port) {
+  bool result =
+      apply_connect_internal(lg, src_node, src_port, dst_node, dst_port);
+  if (result) {
+    update_orphaned_status(lg);
+  }
+  return result;
 }

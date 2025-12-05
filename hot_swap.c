@@ -1,4 +1,5 @@
 #include "hot_swap.h"
+#include "graph_edit.h"
 
 // ports.c
 
@@ -128,7 +129,8 @@ bool apply_hot_swap(LiveGraph *lg, GEHotSwapNode *p) {
   return true;
 }
 
-bool apply_replace_keep_edges(LiveGraph *lg, GEReplaceKeepEdges *p) {
+// Internal version that skips update_orphaned_status for batched operations
+bool apply_replace_keep_edges_internal(LiveGraph *lg, GEReplaceKeepEdges *p) {
   int id = p->node_id;
   if (id >= lg->node_count || lg->dac_node_id == id || id < 0) {
     // node does not exist / is dac (which can't be hotswapped)
@@ -147,6 +149,7 @@ bool apply_replace_keep_edges(LiveGraph *lg, GEReplaceKeepEdges *p) {
   int old_nout = n->nOutputs;
 
   // 1) If shrinking inputs, auto-disconnect ports [p->new_nInputs .. old_nin-1]
+  // Use internal version to skip per-disconnect orphan updates
   if (p->new_nInputs < old_nin) {
     for (int di = p->new_nInputs; di < old_nin; di++) {
       int eid = n->inEdgeId[di];
@@ -154,7 +157,7 @@ bool apply_replace_keep_edges(LiveGraph *lg, GEReplaceKeepEdges *p) {
         int src_id = lg->edges[eid].src_node;
         int src_port = lg->edges[eid].src_port;
         if (src_id >= 0 && src_port >= 0) {
-          apply_disconnect(lg, src_id, src_port, id, di);
+          apply_disconnect_internal(lg, src_id, src_port, id, di);
         }
       }
     }
@@ -162,6 +165,7 @@ bool apply_replace_keep_edges(LiveGraph *lg, GEReplaceKeepEdges *p) {
 
   // 2) If shrinking outputs, auto-disconnect all consumers of ports
   // [p->new_nOutputs .. old_nout-1]
+  // Use internal version to skip per-disconnect orphan updates
   if (p->new_nOutputs < old_nout) {
     for (int sp = p->new_nOutputs; sp < old_nout; sp++) {
       int eid = n->outEdgeId[sp];
@@ -178,9 +182,9 @@ bool apply_replace_keep_edges(LiveGraph *lg, GEReplaceKeepEdges *p) {
           continue;
         for (int di = 0; di < D->nInputs; di++) {
           if (D->inEdgeId[di] == eid) {
-            // we found the edge to delete (so we  disconnect these two
+            // we found the edge to delete (so we disconnect these two
             // nodes+ports)
-            apply_disconnect(lg, id, sp, dst, di);
+            apply_disconnect_internal(lg, id, sp, dst, di);
           }
         }
       }
@@ -215,8 +219,8 @@ bool apply_replace_keep_edges(LiveGraph *lg, GEReplaceKeepEdges *p) {
 
   retire_later(lg, old_state, free);
 
-  // Topology changed (some ports disconnected), so refresh orphan flags
-  update_orphaned_status(lg);
+  // Note: update_orphaned_status is NOT called here - caller is responsible
+  // for calling it after all batched operations are complete
 
   // After hot swap replacement, ensure indegree matches actual unique
   // predecessors This fixes edge cases where port shrinking can leave indegree
@@ -238,4 +242,12 @@ bool apply_replace_keep_edges(LiveGraph *lg, GEReplaceKeepEdges *p) {
   lg->indegree[id] = actual_unique_preds;
 
   return true;
+}
+
+bool apply_replace_keep_edges(LiveGraph *lg, GEReplaceKeepEdges *p) {
+  bool result = apply_replace_keep_edges_internal(lg, p);
+  if (result) {
+    update_orphaned_status(lg);
+  }
+  return result;
 }

@@ -70,7 +70,7 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   lg->params = calloc(1, sizeof(ParamRing));
 
   lg->graphEditQueue = calloc(1, sizeof(GraphEditQueue));
-  geq_init(lg->graphEditQueue, 8192);
+  geq_init(lg->graphEditQueue, 8192 * 16);
 
   // Initialize failed IDs tracking
   lg->failed_ids_capacity = 64; // Start with reasonable capacity

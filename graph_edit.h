@@ -37,6 +37,7 @@ static inline bool geq_push(GraphEditQueue *r, const GraphEditCmd *cmd) {
   uint32_t next = head + 1;
 
   if ((next & r->mask) == (tail & r->mask)) {
+    printf("We are full next=%d tail=%d\n", next, tail);
     // we're full so ignoring
     return false;
   }
@@ -66,5 +67,14 @@ static inline bool geq_pop(GraphEditQueue *r, GraphEditCmd *cmd) {
 }
 
 bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg);
+
+// Internal versions that skip update_orphaned_status (for batched operations)
+// These are used by apply_graph_edits to defer orphan updates to the end
+bool apply_connect_internal(LiveGraph *lg, int src_node, int src_port,
+                            int dst_node, int dst_port);
+bool apply_disconnect_internal(LiveGraph *lg, int src_node, int src_port,
+                               int dst_node, int dst_port);
+bool apply_delete_node_internal(LiveGraph *lg, int node_id);
+bool apply_replace_keep_edges_internal(LiveGraph *lg, GEReplaceKeepEdges *p);
 
 #endif // GRAPH_EDIT_H_
