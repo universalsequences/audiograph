@@ -174,6 +174,7 @@ void initialize_engine(int block_Size, int sample_rate) {
   atomic_store_explicit(&g_engine.oswg, NULL, memory_order_relaxed);
   atomic_store_explicit(&g_engine.oswg_join_pending, 0, memory_order_relaxed);
   atomic_store_explicit(&g_engine.oswg_join_remaining, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_engine.oswg_version, 0, memory_order_relaxed);
   atomic_store_explicit(&g_engine.rt_time_constraint, 0, memory_order_relaxed);
 }
 
@@ -272,10 +273,10 @@ static void *worker_main(void *arg) {
 
 #ifdef HAVE_OS_WORKGROUP
   os_workgroup_t oswg = NULL;
-  os_workgroup_join_token_t oswg_token = {0};
+  os_workgroup_join_token_s oswg_token;  // Stack-allocated token struct (not pointer)
+  memset(&oswg_token, 0, sizeof(oswg_token));
   bool oswg_joined = false;
-  bool oswg_logged = false;
-  bool oswg_warned = false;
+  int oswg_local_version = 0; // Track which version we've joined
 #endif
   for (;;) {
     if (!atomic_load_explicit(&g_engine.runFlag, memory_order_acquire))
@@ -286,42 +287,46 @@ static void *worker_main(void *arg) {
     if (!atomic_load_explicit(&g_engine.runFlag, memory_order_acquire))
       break;
 
-    // Handle OS workgroup joining BEFORE checking for work session
-    // This allows workers to join even when there's no work yet
+    // Handle OS workgroup joining/re-joining when version changes
+    // This allows workers to switch workgroups without being recreated
 #ifdef HAVE_OS_WORKGROUP
-    if (!oswg_joined) {
+    int global_version = atomic_load_explicit(&g_engine.oswg_version, memory_order_acquire);
+    if (global_version != oswg_local_version) {
+      // Version changed - need to leave old workgroup and join new one
+      // IMPORTANT: We must leave using our saved oswg pointer and token,
+      // not the global one (which may have changed or been freed)
+      if (oswg_joined) {
+        // We have a valid join - leave using our saved references
+        os_workgroup_leave(oswg, &oswg_token);
+        fprintf(stderr, "[audiograph] worker %p left os_workgroup %p (version %d -> %d)\n",
+                (void *)pthread_self(), (void *)oswg, oswg_local_version, global_version);
+        oswg_joined = false;
+        oswg = NULL;
+        memset(&oswg_token, 0, sizeof(oswg_token));
+      }
+
+      // Update local version before attempting join
+      oswg_local_version = global_version;
+
       void *w = atomic_load_explicit(&g_engine.oswg, memory_order_acquire);
       if (w) {
         oswg = (os_workgroup_t)w;
-        bool ok = os_workgroup_join(oswg, &oswg_token);
-        oswg_joined = ok;
-        if (ok) {
-          printf("[audiograph] worker %p joined os_workgroup\n",
-                 (void *)pthread_self());
-          // Decrement counter; last worker to reach 0 clears the flag
-          int remaining =
-              atomic_fetch_sub_explicit(&g_engine.oswg_join_remaining, 1,
-                                        memory_order_acq_rel) -
-              1;
-          if (remaining == 0) {
-            atomic_store_explicit(&g_engine.oswg_join_pending, 0,
-                                  memory_order_release);
-          }
+        int ok = os_workgroup_join(oswg, &oswg_token);
+        oswg_joined = (ok == 0);
+        if (oswg_joined) {
+          fprintf(stderr, "[audiograph] worker %p joined os_workgroup %p (version %d)\n",
+                  (void *)pthread_self(), (void *)oswg, global_version);
         } else {
-          if (!oswg_logged) {
-            fprintf(
-                stderr,
-                ok ? "[audiograph] worker %p joined os_workgroup %p\n"
-                   : "[audiograph] worker %p FAILED to join os_workgroup %p\n",
-                (void *)pthread_self(), (void *)oswg);
-            oswg_logged = true;
-          }
+          fprintf(stderr, "[audiograph] worker %p FAILED to join os_workgroup %p (err=%d)\n",
+                  (void *)pthread_self(), (void *)oswg, ok);
+          oswg = NULL;  // Don't keep stale pointer on failure
         }
-      } else if (!oswg_warned) {
-        fprintf(
-            stderr,
-            "[audiograph] os_workgroup pointer not set; workers not joined\n");
-        oswg_warned = true;
+      }
+      // Decrement remaining counter; last worker clears the pending flag
+      int remaining = atomic_fetch_sub_explicit(&g_engine.oswg_join_remaining, 1,
+                                                memory_order_acq_rel) - 1;
+      if (remaining == 0) {
+        atomic_store_explicit(&g_engine.oswg_join_pending, 0, memory_order_release);
       }
     }
 #endif
@@ -378,7 +383,7 @@ static void *worker_main(void *arg) {
   // Thread exiting: leave workgroup if still joined
 #ifdef HAVE_OS_WORKGROUP
   if (oswg_joined && oswg) {
-    os_workgroup_leave(oswg, oswg_token);
+    os_workgroup_leave(oswg, &oswg_token);
     oswg_joined = false;
   }
 #endif
@@ -416,6 +421,10 @@ void engine_set_os_workgroup(void *oswg_ptr) {
   // Store opaque pointer; Swift side retains it.
   atomic_store_explicit(&g_engine.oswg, oswg_ptr, memory_order_release);
 
+  // Increment version to signal workers to re-join
+  int new_version = atomic_fetch_add_explicit(&g_engine.oswg_version, 1,
+                                              memory_order_acq_rel) + 1;
+
   // Set counter to number of workers, then set flag and broadcast
   // This ensures all workers see the flag before it's cleared
   atomic_store_explicit(&g_engine.oswg_join_remaining, g_engine.workerCount,
@@ -426,8 +435,8 @@ void engine_set_os_workgroup(void *oswg_ptr) {
   pthread_mutex_unlock(&g_engine.sess_mtx);
 
   fprintf(stderr,
-          "[audiograph] set os_workgroup=%p (waking %d workers to join now)\n",
-          oswg_ptr, g_engine.workerCount);
+          "[audiograph] set os_workgroup=%p (version %d, notifying %d existing workers)\n",
+          oswg_ptr, new_version, g_engine.workerCount);
 #else
   (void)oswg_ptr;
   fprintf(
@@ -436,7 +445,45 @@ void engine_set_os_workgroup(void *oswg_ptr) {
 #endif
 }
 
-void engine_clear_os_workgroup(void) { engine_set_os_workgroup(NULL); }
+void engine_clear_os_workgroup(void) {
+#ifdef HAVE_OS_WORKGROUP
+  // First, signal workers to leave by setting NULL and incrementing version
+  atomic_store_explicit(&g_engine.oswg, NULL, memory_order_release);
+  int new_version = atomic_fetch_add_explicit(&g_engine.oswg_version, 1,
+                                              memory_order_acq_rel) + 1;
+
+  atomic_store_explicit(&g_engine.oswg_join_remaining, g_engine.workerCount,
+                        memory_order_release);
+  atomic_store_explicit(&g_engine.oswg_join_pending, 1, memory_order_release);
+  pthread_mutex_lock(&g_engine.sess_mtx);
+  pthread_cond_broadcast(&g_engine.sess_cv);
+  pthread_mutex_unlock(&g_engine.sess_mtx);
+
+  fprintf(stderr,
+          "[audiograph] clearing os_workgroup (version %d, waiting for %d workers to leave)\n",
+          new_version, g_engine.workerCount);
+
+  // IMPORTANT: Wait for all workers to leave before returning
+  // This ensures Swift can safely release the old workgroup
+  int timeout_ms = 1000;  // 1 second timeout
+  int waited_ms = 0;
+  while (atomic_load_explicit(&g_engine.oswg_join_pending, memory_order_acquire) != 0) {
+    usleep(1000);  // 1ms
+    waited_ms++;
+    if (waited_ms >= timeout_ms) {
+      int remaining = atomic_load_explicit(&g_engine.oswg_join_remaining, memory_order_acquire);
+      fprintf(stderr,
+              "[audiograph] WARNING: timeout waiting for workers to leave workgroup (%d remaining)\n",
+              remaining);
+      break;
+    }
+  }
+
+  fprintf(stderr, "[audiograph] os_workgroup cleared (workers left in %d ms)\n", waited_ms);
+#else
+  fprintf(stderr, "[audiograph] os_workgroup unsupported; clear ignored\n");
+#endif
+}
 
 void engine_enable_rt_time_constraint(int enable) {
   atomic_store_explicit(&g_engine.rt_time_constraint, enable ? 1 : 0,

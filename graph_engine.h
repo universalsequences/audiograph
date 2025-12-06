@@ -162,6 +162,7 @@ typedef struct Engine {
   _Atomic(void *) oswg;          // os_workgroup_t when available
   _Atomic int oswg_join_pending; // set to 1 to wake workers for workgroup join
   _Atomic int oswg_join_remaining; // count of workers that need to see the flag
+  _Atomic int oswg_version;      // incremented on each workgroup change for re-join detection
   _Atomic int rt_log; // enable lightweight debug prints from workers
   _Atomic int rt_time_constraint; // apply Mach RT time-constraint policy
 } Engine;
