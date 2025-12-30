@@ -28,13 +28,12 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   lg->retire_count = 0;
   lg->retire_list = calloc(lg->retire_capacity, sizeof(RetireEntry));
 
-  // New port-based edge pool
+  // New port-based edge pool (lazy allocation - buffers allocated on demand in
+  // alloc_edge)
   lg->edges = calloc(lg->edge_capacity, sizeof(LiveEdge));
   for (int i = 0; i < lg->edge_capacity; i++) {
-    lg->edges[i].buf = alloc_aligned(64, block_size * sizeof(float));
-    if (!lg->edges[i].buf) {
-      return NULL;
-    }
+    // Buffer allocated lazily in alloc_edge() when edge is first used
+    lg->edges[i].buf = NULL;
     lg->edges[i].in_use = false;
     lg->edges[i].refcount = 0;
     lg->edges[i].src_node = -1;
@@ -51,10 +50,7 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   // BURST FIX: Increased capacity from 1024 to 4096 for wide graphs
   lg->readyQueue = rq_create(4096);
   if (!lg->readyQueue) {
-    // Handle allocation failure - clean up port-based edges
-    for (int i = 0; i < lg->edge_capacity; i++) {
-      free(lg->edges[i].buf);
-    }
+    // Handle allocation failure - edge buffers are NULL (lazy allocation)
     free(lg->edges);
     free(lg->silence_buf);
     free(lg->scratch_null);
