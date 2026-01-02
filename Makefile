@@ -2,7 +2,8 @@
 # Builds the modular audio graph demo with proper C11 threading support
 
 CC = gcc
-CFLAGS = -std=c11 -O2 -Wall -Wextra -pthread
+MACOS_MIN = -mmacosx-version-min=14.0
+CFLAGS = -std=c11 -O2 -Wall -Wextra -pthread $(MACOS_MIN)
 TARGET = audiograph
 DYLIB_TARGET = libaudiograph.dylib
 

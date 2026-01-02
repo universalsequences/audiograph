@@ -2,6 +2,7 @@
 #include "graph_edit.h"
 #include "graph_nodes.h"
 #include <assert.h>
+#include <sched.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -815,11 +816,22 @@ void process_live_block(LiveGraph *lg, int nframes) {
 
     // Audio thread helps do some work
     int32_t nid;
+    int empty_spins = 0;
     while (atomic_load_explicit(&lg->jobsInFlight, memory_order_acquire) > 0) {
       if (rq_try_pop(lg->readyQueue, &nid)) {
         execute_and_fanout(lg, nid, nframes);
+        empty_spins = 0; // Reset on successful work
       } else {
-        cpu_relax(); // Brief pause when no work available
+        // Queue empty but work in flight - workers processing
+        // Check again if work completed (avoids unnecessary spins)
+        if (atomic_load_explicit(&lg->jobsInFlight, memory_order_acquire) == 0)
+          break;
+        cpu_relax();
+        // After many empty spins, yield to reduce CPU burn
+        if (++empty_spins > 64) {
+          sched_yield();
+          empty_spins = 0;
+        }
       }
     }
 
