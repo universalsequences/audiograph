@@ -354,6 +354,7 @@ bool grow_buffer_capacity(LiveGraph *lg) {
     new_buffers[i].size = lg->buffers[i].size;
     new_buffers[i].channel_count = lg->buffers[i].channel_count;
   }
+  free(lg->buffers);
   lg->buffers = new_buffers;
   return true;
 }
@@ -439,16 +440,10 @@ bool apply_hotswap_buffer(LiveGraph *lg, int buffer_id, int new_size,
 bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
   GraphEditCmd cmd;
 
-  const int MAX_CMDS_PER_BLOCK = 0;
-  int applied = 0;
   bool all_ok = true;
   bool needs_orphan_update = false;
 
   while (geq_pop(r, &cmd)) {
-    if (MAX_CMDS_PER_BLOCK && applied >= MAX_CMDS_PER_BLOCK) {
-      break;
-    }
-
     bool ok = true;
     bool topology_changed = false;
 
@@ -480,10 +475,6 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
                                   cmd.u.connect.src_port, cmd.u.connect.dst_id,
                                   cmd.u.connect.dst_port);
       topology_changed = ok;
-      if (!ok) {
-        printf("failed to connect src=%d dest=%d\n", cmd.u.connect.src_id,
-               cmd.u.connect.dst_id);
-      }
       break;
     }
     case GE_DISCONNECT: {
@@ -534,7 +525,6 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
       break;
     }
     }
-    applied++;
     if (!ok) {
       all_ok = false;
     }
@@ -1031,10 +1021,9 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
   atomic_int *new_pending = calloc(new_capacity, sizeof(atomic_int));
   void **new_state_snapshots = calloc(new_capacity, sizeof(void *));
   size_t *new_state_sizes = calloc(new_capacity, sizeof(size_t));
-  uint64_t *new_pending_generation = calloc(new_capacity, sizeof(uint64_t));
 
   if (!new_nodes || !new_pending || !new_indegree || !new_orphaned ||
-      !new_state_snapshots || !new_state_sizes || !new_pending_generation) {
+      !new_state_snapshots || !new_state_sizes) {
     // Clean up any successful allocations
     if (new_nodes)
       free(new_nodes);
@@ -1048,8 +1037,6 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
       free(new_state_snapshots);
     if (new_state_sizes)
       free(new_state_sizes);
-    if (new_pending_generation)
-      free(new_pending_generation);
     return false;
   }
 
@@ -1103,8 +1090,6 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
            old_capacity * sizeof(void *));
   if (lg->state_sizes)
     memcpy(new_state_sizes, lg->state_sizes, old_capacity * sizeof(size_t));
-  if (lg->pending_generation)
-    memcpy(new_pending_generation, lg->pending_generation, old_capacity * sizeof(uint64_t));
 
   // Copy existing atomic values
   for (int i = 0; i < old_capacity; i++) {
@@ -1149,8 +1134,6 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
     free(lg->state_snapshots);
   if (lg->state_sizes)
     free(lg->state_sizes);
-  if (lg->pending_generation)
-    free(lg->pending_generation);
 
   // Update pointers and capacity
   lg->nodes = new_nodes;
@@ -1159,7 +1142,6 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
   lg->is_orphaned = new_orphaned;
   lg->state_snapshots = new_state_snapshots;
   lg->state_sizes = new_state_sizes;
-  lg->pending_generation = new_pending_generation;
   lg->node_capacity = new_capacity;
 
   return true;
@@ -1174,8 +1156,7 @@ int apply_add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
   if (node_id >= lg->node_capacity) {
     // Need to expand capacity
     if (!grow_node_capacity(lg, node_id)) {
-      printf("grow node capacity failed\n");
-      return -1; // Growth failed
+      return -1;
     }
   }
 
@@ -1184,19 +1165,15 @@ int apply_add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
   if (state_size > 0) {
     state = alloc_state_f32(state_size, 64);
     if (!state) {
-      printf(
-          "memory allocation "
-          "failed!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-          "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
-      return -1; // Memory allocation
-                 // failed
+      return -1;
     }
     memset(state, 0, state_size); // Zero-initialize the state memory
 
     // Call NodeVTable init function if provided
     if (vtable.init) {
-      vtable.init(state, 48000, 256,
-                  initial_state); // Use engine sample rate and block size
+      int sr = g_engine.sampleRate > 0 ? g_engine.sampleRate : 48000;
+      int bs = g_engine.blockSize > 0 ? g_engine.blockSize : 256;
+      vtable.init(state, sr, bs, initial_state);
     }
   }
 
@@ -1265,7 +1242,6 @@ bool apply_connect_internal(LiveGraph *lg, int src_node, int src_port,
   // --- Validate nodes/ports ---
   if (!lg || src_node < 0 || src_node >= lg->node_count || dst_node < 0 ||
       dst_node >= lg->node_count) {
-    printf("first validation failed\n");
     return false;
   }
 
@@ -1274,20 +1250,15 @@ bool apply_connect_internal(LiveGraph *lg, int src_node, int src_port,
 
   if (src_port < 0 || src_port >= S->nOutputs || dst_port < 0 ||
       dst_port >= D->nInputs) {
-    printf("second validation failed src_port=%d S->nOutputs=%d dst_port=%d "
-           "D->nInputs=%d\n",
-           src_port, S->nOutputs, dst_port, D->nInputs);
     return false;
   }
 
   // Validate nodes before ensuring port arrays
   if (!is_node_valid(lg, src_node) || !is_node_valid(lg, dst_node)) {
-    printf("node is not valid\n");
     return false;
   }
 
   if (!ensure_port_arrays(S) || !ensure_port_arrays(D)) {
-    printf("ensure ports failed\n");
     return false;
   }
 

@@ -24,16 +24,6 @@
 #endif
 #endif
 
-// Include ReadyQ implementation
-extern ReadyQ *rq_create(int capacity);
-extern void rq_destroy(ReadyQ *q);
-extern bool rq_push(ReadyQ *q, int32_t nid);
-extern bool rq_try_pop(ReadyQ *q, int32_t *out);
-extern bool rq_wait_nonempty(ReadyQ *q, int timeout_us);
-extern void rq_reset(ReadyQ *q);
-extern void rq_push_or_spin(ReadyQ *q, int32_t nid);
-extern void rq_push_batch(ReadyQ *q, const int32_t *nids, int count);
-
 // ===================== Forward Declarations =====================
 
 void bind_and_run_live(LiveGraph *lg, int nid, int nframes);
@@ -264,7 +254,7 @@ static void *worker_main(void *arg) {
     if (kr != KERN_SUCCESS) {
       fprintf(stderr,
               "[audiograph] WARN: thread_policy_set RT failed (kr=%d)\n", kr);
-    } else {
+    } else if (atomic_load_explicit(&g_engine.rt_log, memory_order_relaxed)) {
       fprintf(stderr,
               "[audiograph] worker %p set Mach RT TC (period=%.2f ms)\n",
               (void *)pthread_self(), period_ns_d / 1e6);
@@ -299,8 +289,9 @@ static void *worker_main(void *arg) {
       if (oswg_joined) {
         // We have a valid join - leave using our saved references
         os_workgroup_leave(oswg, &oswg_token);
-        fprintf(stderr, "[audiograph] worker %p left os_workgroup %p (version %d -> %d)\n",
-                (void *)pthread_self(), (void *)oswg, oswg_local_version, global_version);
+        if (atomic_load_explicit(&g_engine.rt_log, memory_order_relaxed))
+          fprintf(stderr, "[audiograph] worker %p left os_workgroup %p (version %d -> %d)\n",
+                  (void *)pthread_self(), (void *)oswg, oswg_local_version, global_version);
         oswg_joined = false;
         oswg = NULL;
         memset(&oswg_token, 0, sizeof(oswg_token));
@@ -315,8 +306,9 @@ static void *worker_main(void *arg) {
         int ok = os_workgroup_join(oswg, &oswg_token);
         oswg_joined = (ok == 0);
         if (oswg_joined) {
-          fprintf(stderr, "[audiograph] worker %p joined os_workgroup %p (version %d)\n",
-                  (void *)pthread_self(), (void *)oswg, global_version);
+          if (atomic_load_explicit(&g_engine.rt_log, memory_order_relaxed))
+            fprintf(stderr, "[audiograph] worker %p joined os_workgroup %p (version %d)\n",
+                    (void *)pthread_self(), (void *)oswg, global_version);
         } else {
           fprintf(stderr, "[audiograph] worker %p FAILED to join os_workgroup %p (err=%d)\n",
                   (void *)pthread_self(), (void *)oswg, ok);
@@ -435,14 +427,12 @@ void engine_set_os_workgroup(void *oswg_ptr) {
   pthread_cond_broadcast(&g_engine.sess_cv);
   pthread_mutex_unlock(&g_engine.sess_mtx);
 
-  fprintf(stderr,
-          "[audiograph] set os_workgroup=%p (version %d, notifying %d existing workers)\n",
-          oswg_ptr, new_version, g_engine.workerCount);
+  if (atomic_load_explicit(&g_engine.rt_log, memory_order_relaxed))
+    fprintf(stderr,
+            "[audiograph] set os_workgroup=%p (version %d, notifying %d existing workers)\n",
+            oswg_ptr, new_version, g_engine.workerCount);
 #else
   (void)oswg_ptr;
-  fprintf(
-      stderr,
-      "[audiograph] os_workgroup unsupported at compile time; ignoring set\n");
 #endif
 }
 
@@ -460,9 +450,10 @@ void engine_clear_os_workgroup(void) {
   pthread_cond_broadcast(&g_engine.sess_cv);
   pthread_mutex_unlock(&g_engine.sess_mtx);
 
-  fprintf(stderr,
-          "[audiograph] clearing os_workgroup (version %d, waiting for %d workers to leave)\n",
-          new_version, g_engine.workerCount);
+  if (atomic_load_explicit(&g_engine.rt_log, memory_order_relaxed))
+    fprintf(stderr,
+            "[audiograph] clearing os_workgroup (version %d, waiting for %d workers to leave)\n",
+            new_version, g_engine.workerCount);
 
   // IMPORTANT: Wait for all workers to leave before returning
   // This ensures Swift can safely release the old workgroup
@@ -480,10 +471,15 @@ void engine_clear_os_workgroup(void) {
     }
   }
 
-  fprintf(stderr, "[audiograph] os_workgroup cleared (workers left in %d ms)\n", waited_ms);
+  if (atomic_load_explicit(&g_engine.rt_log, memory_order_relaxed))
+    fprintf(stderr, "[audiograph] os_workgroup cleared (workers left in %d ms)\n", waited_ms);
 #else
-  fprintf(stderr, "[audiograph] os_workgroup unsupported; clear ignored\n");
+  (void)0; // os_workgroup unsupported
 #endif
+}
+
+void engine_enable_rt_logging(int enable) {
+  atomic_store_explicit(&g_engine.rt_log, enable ? 1 : 0, memory_order_release);
 }
 
 void engine_enable_rt_time_constraint(int enable) {

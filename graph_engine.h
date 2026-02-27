@@ -5,14 +5,7 @@
 
 // ===================== Runtime Graph Types =====================
 
-// Per edge (really: "signal" on an output port)
-typedef struct {
-  float *buf;   // size = block_size
-  int refcount; // number of input ports consuming this signal
-  bool in_use;
-} EdgeBuf;
-
-// Live graph edge buffer (compatible with EdgeBuf but for LiveGraph)
+// Live graph edge buffer
 typedef struct {
   float *buf;   // size = block_size
   int refcount; // number of input ports consuming this signal
@@ -134,10 +127,6 @@ typedef struct LiveGraph {
   bool has_cycle;           // Cached cycle detection result
   bool scheduling_dirty;    // True if topology changed, needs rebuild
 
-  // === OPTIMIZATION: Generation-based lazy pending reset ===
-  // Eliminates O(n) atomic stores per block
-  _Atomic uint64_t block_generation;  // Incremented each block
-  uint64_t *pending_generation;       // Per-node: generation when pending was last valid
 } LiveGraph;
 
 // ===================== Worker Pool / Engine =====================
@@ -166,14 +155,6 @@ typedef struct Engine {
   _Atomic int rt_log; // enable lightweight debug prints from workers
   _Atomic int rt_time_constraint; // apply Mach RT time-constraint policy
 } Engine;
-
-// ===================== Ready Queue Operations =====================
-
-// ===================== Graph Management =====================
-
-// ===================== Block Processing =====================
-
-// ===================== Worker Pool Management =====================
 
 void engine_start_workers(int workers);
 void engine_stop_workers(void);

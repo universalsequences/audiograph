@@ -20,14 +20,9 @@ void osc_init(void *memory, int sr, int maxBlock, const void *initial_state) {
 void osc_process(float *const *in, float *const *out, int n, void *memory,
                  void *buffers) {
   (void)in;
+  (void)buffers;
   float *mem = (float *)memory;
   float *y = out[0];
-
-  // DEBUG: Track frame processing for race condition detection
-  static _Atomic int debug_block_counter = 0;
-  static _Atomic int debug_frame_counts[64] = {0}; // Max 64 oscillators
-  static int debug_osc_index =
-      0; // This is not thread-safe, but good enough for debugging
 
   for (int i = 0; i < n; i++) {
     y[i] = 2.0f * mem[OSC_PHASE] - 1.0f;
@@ -48,6 +43,7 @@ void osc_migrate(void *newMemory, const void *oldMemory) {
 
 void gain_process(float *const *in, float *const *out, int n, void *memory,
                   void *buffers) {
+  (void)buffers;
   float *mem = (float *)memory;
   float gain = mem[GAIN_VALUE];
   const float *a = in[0];
@@ -60,7 +56,8 @@ void gain_process(float *const *in, float *const *out, int n, void *memory,
 
 void number_process(float *const *in, float *const *out, int n, void *memory,
                     void *buffers) {
-  (void)in; // Number generator has no inputs
+  (void)in;
+  (void)buffers;
   float *mem = (float *)memory;
   float value = mem[NUMBER_VALUE];
   float *y = out[0];
@@ -72,7 +69,8 @@ void number_process(float *const *in, float *const *out, int n, void *memory,
 
 void mix2_process(float *const *in, float *const *out, int n, void *memory,
                   void *buffers) {
-  (void)memory; // Mixers have no state
+  (void)memory;
+  (void)buffers;
   const float *a = in[0];
   const float *b = in[1];
   float *y = out[0];
@@ -81,20 +79,10 @@ void mix2_process(float *const *in, float *const *out, int n, void *memory,
     y[i] = a[i] + b[i];
 }
 
-void mix3_process(float *const *in, float *const *out, int n, void *memory,
-                  void *buffers) {
-  (void)memory; // Mixers have no state
-  const float *a = in[0];
-  const float *b = in[1];
-  const float *c = in[2];
-  float *y = out[0];
-  for (int i = 0; i < n; i++)
-    y[i] = a[i] + b[i] + c[i];
-}
-
 void mix8_process(float *const *in, float *const *out, int n, void *memory,
                   void *buffers) {
-  (void)memory; // Mixers have no state
+  (void)memory;
+  (void)buffers;
   float *y = out[0];
 
   // Sum all 8 inputs
@@ -106,7 +94,8 @@ void mix8_process(float *const *in, float *const *out, int n, void *memory,
 
 void dac_process(float *const *in, float *const *out, int n, void *memory,
                  void *buffers) {
-  (void)memory; // DAC has no state
+  (void)memory;
+  (void)buffers;
 
   // DAC is a pass-through - copy all input channels to output channels
   // Number of channels is determined by the node's port configuration
@@ -126,12 +115,13 @@ void dac_process(float *const *in, float *const *out, int n, void *memory,
 
 // ===================== SUM Implementation =====================
 
-// Global accessor for current node's input count (to be implemented)
+// Global accessor for current node's input count (defined in graph_engine.c)
 extern int ap_current_node_ninputs(void);
 
 void sum_process(float *const *in, float *const *out, int n, void *memory,
                  void *buffers) {
-  (void)memory; // SUM is stateless
+  (void)memory;
+  (void)buffers;
   float *y = out[0];
 
   // Zero output buffer
@@ -147,10 +137,6 @@ void sum_process(float *const *in, float *const *out, int n, void *memory,
       y[i] += x[i];
     }
   }
-
-  // Optional normalization to avoid gain jump with fan-in:
-  // float g = 1.0f / (float)(nIn > 0 ? nIn : 1);
-  // for (int i = 0; i < n; i++) y[i] *= g;
 }
 
 // ===================== Node VTables =====================

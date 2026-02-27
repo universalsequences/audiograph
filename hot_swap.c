@@ -1,7 +1,7 @@
 #include "hot_swap.h"
 #include "graph_edit.h"
 
-// ports.c
+// Hot-swap and port resizing operations for live graph nodes
 
 static int highest_connected_input_index(const RTNode *n) {
   if (!n->inEdgeId)
@@ -113,13 +113,12 @@ bool apply_hot_swap(LiveGraph *lg, GEHotSwapNode *p) {
     if (!new_state) {
       return false; // Memory allocation failed
     }
-    memset(new_state, 0, p->state_size); // Zero-initialize the new state
 
     // Call NodeVTable init function if provided
     if (p->vt.init) {
-      printf("DEBUG: apply_hot_swap - calling init function\n");
-      p->vt.init(new_state, 48000, 256, p->initial_state); // Use engine sample rate and block size
-      printf("DEBUG: apply_hot_swap - init function completed\n");
+      int sr = g_engine.sampleRate > 0 ? g_engine.sampleRate : 48000;
+      int bs = g_engine.blockSize > 0 ? g_engine.blockSize : 256;
+      p->vt.init(new_state, sr, bs, p->initial_state);
     }
   }
 
@@ -213,9 +212,9 @@ bool apply_replace_keep_edges_internal(LiveGraph *lg, GEReplaceKeepEdges *p) {
 
     // Call NodeVTable init function if provided
     if (p->vt.init) {
-      printf("DEBUG: apply_replace_keep_edges - calling init function\n");
-      p->vt.init(new_state, 48000, 256, p->initial_state); // Use engine sample rate and block size
-      printf("DEBUG: apply_replace_keep_edges - init function completed\n");
+      int sr = g_engine.sampleRate > 0 ? g_engine.sampleRate : 48000;
+      int bs = g_engine.blockSize > 0 ? g_engine.blockSize : 256;
+      p->vt.init(new_state, sr, bs, p->initial_state);
     }
   }
 
@@ -233,19 +232,20 @@ bool apply_replace_keep_edges_internal(LiveGraph *lg, GEReplaceKeepEdges *p) {
   // predecessors This fixes edge cases where port shrinking can leave indegree
   // inconsistent
   int actual_unique_preds = 0;
-  bool seen[8192] = {0}; // Assume max nodes < 8192
-  if (n->inEdgeId) {
+  bool *seen = calloc(lg->node_count, sizeof(bool));
+  if (seen && n->inEdgeId) {
     for (int di = 0; di < n->nInputs; di++) {
       int eid = n->inEdgeId[di];
       if (eid < 0)
         continue;
       int s = lg->edges[eid].src_node;
-      if (s >= 0 && s < 8192 && !seen[s]) {
+      if (s >= 0 && s < lg->node_count && !seen[s]) {
         seen[s] = true;
         actual_unique_preds++;
       }
     }
   }
+  free(seen);
   lg->indegree[id] = actual_unique_preds;
 
   return true;

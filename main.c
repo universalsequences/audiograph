@@ -3,6 +3,7 @@
 #include "graph_types.h"
 
 int main(int argc, char *argv[]) {
-  // Default to live demo, allow choosing compiled demo
-  return 1;
+  (void)argc;
+  (void)argv;
+  return 0;
 }

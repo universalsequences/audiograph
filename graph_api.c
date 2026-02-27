@@ -97,10 +97,6 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   lg->has_cycle = false;
   lg->scheduling_dirty = true;  // Force initial rebuild
 
-  // Initialize generation-based lazy pending reset
-  atomic_init(&lg->block_generation, 1);  // Start at 1 so 0 means "never reset"
-  lg->pending_generation = calloc(lg->node_capacity, sizeof(uint64_t));
-
   // Automatically create the DAC node at index 0
   // DAC has one input and one output per channel
   int dac_id = apply_add_node(lg, DAC_VTABLE, 0, 0, "DAC", lg->num_channels,
@@ -114,6 +110,7 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
         lg->num_channels; // DAC has N outputs (for reading final audio)
     if (!ensure_port_arrays(dac)) {
       // DAC node allocation failed - this is critical
+      destroy_live_graph(lg);
       return NULL;
     }
 
@@ -195,8 +192,7 @@ void destroy_live_graph(LiveGraph *lg) {
   if (lg->params)
     free(lg->params);
   if (lg->graphEditQueue) {
-    if (lg->graphEditQueue->buf)
-      free(lg->graphEditQueue->buf);
+    geq_deinit(lg->graphEditQueue);
     free(lg->graphEditQueue);
   }
 
@@ -222,11 +218,13 @@ void destroy_live_graph(LiveGraph *lg) {
     free(lg->state_sizes);
   pthread_rwlock_destroy(&lg->state_store_lock);
 
+  // Free retire list
+  if (lg->retire_list)
+    free(lg->retire_list);
+
   // Free scheduling cache
   if (lg->source_nodes)
     free(lg->source_nodes);
-  if (lg->pending_generation)
-    free(lg->pending_generation);
 
   // Free the graph itself
   free(lg);
@@ -255,7 +253,8 @@ int live_add_oscillator(LiveGraph *lg, float freq_hz, const char *name) {
   float init_state[1];
   if (freq_hz < 0.0f)
     freq_hz = 0.0f;
-  init_state[0] = freq_hz / 48000.0f; // default sample rate assumption
+  float sr = g_engine.sampleRate > 0 ? (float)g_engine.sampleRate : 48000.0f;
+  init_state[0] = freq_hz / sr;
   return finalize_live_add(lg, node_id, OSC_VTABLE,
                            OSC_MEMORY_SIZE * sizeof(float), name, 0, 1,
                            init_state);
@@ -428,7 +427,6 @@ bool graph_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
                    int dst_port) {
   // Check if either node has failed
   if (is_failed_node(lg, src_node) || is_failed_node(lg, dst_node)) {
-    printf("could not connect because failed node\n");
     return false;
   }
 
@@ -456,6 +454,8 @@ bool hot_swap_node(LiveGraph *lg, int node_id, NodeVTable vt, size_t state_size,
                    int nin, int nout, bool xfade,
                    void (*migrate)(void *, void *), const void *initial_state,
                    size_t initial_state_size) {
+  (void)xfade;
+  (void)migrate;
   if (is_failed_node(lg, node_id)) {
     return false;
   }
@@ -496,6 +496,8 @@ bool replace_keep_edges(LiveGraph *lg, int node_id, NodeVTable vt,
                         size_t state_size, int nin, int nout, bool xfade,
                         void (*migrate)(void *, void *),
                         const void *initial_state, size_t initial_state_size) {
+  (void)xfade;
+  (void)migrate;
   // Create a copy of initial_state if provided
   void *initial_state_copy = NULL;
   if (initial_state && initial_state_size > 0) {
@@ -530,9 +532,13 @@ void retire_later(LiveGraph *lg, void *ptr, void (*deleter)(void *)) {
   if (!ptr)
     return;
   if (lg->retire_count >= lg->retire_capacity) {
-    lg->retire_capacity = lg->retire_capacity ? lg->retire_capacity * 2 : 16;
-    lg->retire_list =
-        realloc(lg->retire_list, lg->retire_capacity * sizeof(RetireEntry));
+    int new_cap = lg->retire_capacity ? lg->retire_capacity * 2 : 16;
+    RetireEntry *new_list =
+        realloc(lg->retire_list, new_cap * sizeof(RetireEntry));
+    if (!new_list)
+      return; // allocation failed, skip retirement
+    lg->retire_list = new_list;
+    lg->retire_capacity = new_cap;
   }
   lg->retire_list[lg->retire_count++] =
       (RetireEntry){.ptr = ptr, .deleter = deleter};

@@ -59,7 +59,8 @@ run: $(TARGET)
 
 # Clean up build artifacts
 clean:
-	rm -f $(TARGET) $(DYLIB_TARGET) $(OBJECTS) $(TARGET).dSYM a.out
+	rm -f $(TARGET) $(DYLIB_TARGET) $(OBJECTS) a.out
+	rm -rf $(TARGET).dSYM debug_iteration_* graph_test test_auto_sum test_sum_chain
 
 # Check for memory leaks (macOS)
 valgrind: $(TARGET)

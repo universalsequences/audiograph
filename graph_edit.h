@@ -37,8 +37,6 @@ static inline bool geq_push(GraphEditQueue *r, const GraphEditCmd *cmd) {
   uint32_t next = head + 1;
 
   if ((next & r->mask) == (tail & r->mask)) {
-    printf("We are full next=%d tail=%d\n", next, tail);
-    // we're full so ignoring
     return false;
   }
 
