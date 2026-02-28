@@ -1293,6 +1293,38 @@ bool apply_delete_node(LiveGraph *lg, int node_id) {
   return result;
 }
 
+// ===================== Cycle Prevention =====================
+// DFS reachability: can we get from 'from' to 'target' via successor edges?
+static bool can_reach(LiveGraph *lg, int from, int target, bool *visited) {
+  if (from == target)
+    return true;
+  if (from < 0 || from >= lg->node_count)
+    return false;
+  if (visited[from])
+    return false;
+  visited[from] = true;
+
+  RTNode *node = &lg->nodes[from];
+  for (int i = 0; i < node->succCount; i++) {
+    if (can_reach(lg, node->succ[i], target, visited))
+      return true;
+  }
+  return false;
+}
+
+// Would connecting src_node → dst_node create a cycle?
+// Checks if dst_node can already reach src_node via existing edges.
+static bool would_create_cycle(LiveGraph *lg, int src_node, int dst_node) {
+  if (src_node == dst_node)
+    return true; // self-loop
+  bool *visited = calloc(lg->node_count, sizeof(bool));
+  if (!visited)
+    return false; // alloc failure → fail-open
+  bool found = can_reach(lg, dst_node, src_node, visited);
+  free(visited);
+  return found;
+}
+
 // Internal version that skips update_orphaned_status for batched operations
 bool apply_connect_internal(LiveGraph *lg, int src_node, int src_port,
                             int dst_node, int dst_port) {
@@ -1316,6 +1348,11 @@ bool apply_connect_internal(LiveGraph *lg, int src_node, int src_port,
   }
 
   if (!ensure_port_arrays(S) || !ensure_port_arrays(D)) {
+    return false;
+  }
+
+  // Reject connections that would create a cycle
+  if (would_create_cycle(lg, src_node, dst_node)) {
     return false;
   }
 
