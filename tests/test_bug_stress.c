@@ -216,7 +216,7 @@ static bool run_single_iteration(int iteration) {
            iteration);
     printf("   Expected: %.3f, Got: %.3f\n", expected_output, actual_output);
     printf("   DAC indegree: %d (should be 1)\n",
-           lg->indegree[lg->dac_node_id]);
+           lg->sched.indegree[lg->dac_node_id]);
 
     // Check actual DAC connections
     RTNode *dac = &lg->nodes[lg->dac_node_id];
@@ -329,13 +329,13 @@ static bool run_different_sequences(int iteration) {
   // Different sequences have different expected outputs
   // For simplicity, just check if output is near zero when it shouldn't be
   has_bug =
-      (fabs(actual_output) < 0.001f) && (lg->indegree[lg->dac_node_id] > 0);
+      (fabs(actual_output) < 0.001f) && (lg->sched.indegree[lg->dac_node_id] > 0);
 
   if (has_bug) {
     printf("🐛 BUG FOUND in sequence '%s' (iteration %d)!\n",
            sequences[seq_index], iteration);
     printf("   Output: %.6f, DAC indegree: %d\n", actual_output,
-           lg->indegree[lg->dac_node_id]);
+           lg->sched.indegree[lg->dac_node_id]);
   }
 
   destroy_live_graph(lg);

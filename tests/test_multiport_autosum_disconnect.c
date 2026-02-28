@@ -65,10 +65,10 @@ int main() {
   
   // Debug the indegree values
   printf("DEBUG: After creating SUM:\n");
-  printf("  num_node1 indegree: %d\n", lg->indegree[num_node1]);
-  printf("  num_node2 indegree: %d\n", lg->indegree[num_node2]);
-  printf("  sum_node indegree: %d\n", lg->indegree[sum_id]); 
-  printf("  gain_node indegree: %d\n", lg->indegree[gain_node]);
+  printf("  num_node1 indegree: %d\n", lg->sched.indegree[num_node1]);
+  printf("  num_node2 indegree: %d\n", lg->sched.indegree[num_node2]);
+  printf("  sum_node indegree: %d\n", lg->sched.indegree[sum_id]); 
+  printf("  gain_node indegree: %d\n", lg->sched.indegree[gain_node]);
   
   // Process - should get 5.0 + 5.0 = 10.0, then gain of 2.0 = 20.0
   process_next_block(lg, output_buffer, 128);
@@ -93,13 +93,13 @@ int main() {
   
   // Debug the indegree values after disconnect
   printf("DEBUG: After disconnect:\n");
-  printf("  num_node1 indegree: %d\n", lg->indegree[num_node1]);
-  printf("  num_node2 indegree: %d\n", lg->indegree[num_node2]);
-  printf("  gain_node indegree: %d\n", lg->indegree[gain_node]);
+  printf("  num_node1 indegree: %d\n", lg->sched.indegree[num_node1]);
+  printf("  num_node2 indegree: %d\n", lg->sched.indegree[num_node2]);
+  printf("  gain_node indegree: %d\n", lg->sched.indegree[gain_node]);
   
   // Only print sum_node indegree if SUM still exists
   if (lg->nodes[gain_node].fanin_sum_node_id[0] != -1) {
-    printf("  sum_node indegree: %d\n", lg->indegree[sum_id]);
+    printf("  sum_node indegree: %d\n", lg->sched.indegree[sum_id]);
   } else {
     printf("  sum_node: collapsed (no longer exists)\n");
   }

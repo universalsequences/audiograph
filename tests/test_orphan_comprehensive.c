@@ -21,7 +21,7 @@ static bool validate_specific_nodes(LiveGraph *lg, int *node_ids,
 
   for (int i = 0; i < count; i++) {
     int node_id = node_ids[i];
-    bool actual = lg->is_orphaned[node_id];
+    bool actual = lg->sched.is_orphaned[node_id];
     bool expect = expected[i];
 
     if (actual != expect) {
@@ -44,7 +44,7 @@ static void print_all_nodes(LiveGraph *lg, const char *scenario) {
   printf("\n--- %s: %d nodes, DAC=%d ---\n", scenario, lg->node_count,
          lg->dac_node_id);
   for (int i = 0; i < lg->node_count; i++) {
-    printf("  Node %d: %s\n", i, lg->is_orphaned[i] ? "ORPHANED" : "CONNECTED");
+    printf("  Node %d: %s\n", i, lg->sched.is_orphaned[i] ? "ORPHANED" : "CONNECTED");
   }
 }
 
@@ -106,7 +106,7 @@ static bool test_no_dac(void) {
     if (i == 0)
       continue; // DAC was at node 0
 
-    if (!lg->is_orphaned[i]) {
+    if (!lg->sched.is_orphaned[i]) {
       printf("❌ Node %d should be orphaned (DAC deleted)\n", i);
       all_orphaned = false;
     }
@@ -172,7 +172,7 @@ static bool test_disconnection(void) {
   print_all_nodes(lg, "Before Disconnect");
 
   // Check all connected
-  if (lg->is_orphaned[dac] || lg->is_orphaned[osc] || lg->is_orphaned[gain]) {
+  if (lg->sched.is_orphaned[dac] || lg->sched.is_orphaned[osc] || lg->sched.is_orphaned[gain]) {
     printf("❌ All nodes should be connected initially\n");
     destroy_live_graph(lg);
     return false;
@@ -191,15 +191,15 @@ static bool test_disconnection(void) {
   // osc is not reachable from DAC, so it stays orphaned
 
   bool step2_passed = true;
-  if (!lg->is_orphaned[osc]) {
+  if (!lg->sched.is_orphaned[osc]) {
     printf("❌ osc should be orphaned (no path from osc to DAC)\n");
     step2_passed = false;
   }
-  if (lg->is_orphaned[gain]) {
+  if (lg->sched.is_orphaned[gain]) {
     printf("❌ gain should NOT be orphaned (gain -> DAC path exists)\n");
     step2_passed = false;
   }
-  if (lg->is_orphaned[dac]) {
+  if (lg->sched.is_orphaned[dac]) {
     printf("❌ DAC should NOT be orphaned (it's the search root)\n");
     step2_passed = false;
   }

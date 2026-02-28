@@ -54,13 +54,13 @@ int main() {
   // Systematically verify all LiveGraph fields after growth
   printf("\n=== Post-Growth Field Verification ===\n");
   printf("nodes pointer: %p\n", (void*)lg->nodes);
-  printf("pending pointer: %p\n", (void*)lg->pending);
-  printf("indegree pointer: %p\n", (void*)lg->indegree);
-  printf("is_orphaned pointer: %p\n", (void*)lg->is_orphaned);
+  printf("pending pointer: %p\n", (void*)lg->sched.pending);
+  printf("indegree pointer: %p\n", (void*)lg->sched.indegree);
+  printf("is_orphaned pointer: %p\n", (void*)lg->sched.is_orphaned);
   printf("edges pointer: %p\n", (void*)lg->edges);
   printf("silence_buf pointer: %p\n", (void*)lg->silence_buf);
   printf("scratch_null pointer: %p\n", (void*)lg->scratch_null);
-  printf("readyQueue pointer: %p\n", (void*)lg->readyQueue);
+  printf("readyQueue pointer: %p\n", (void*)lg->sched.readyQueue);
   printf("params pointer: %p\n", (void*)lg->params);
   printf("graphEditQueue pointer: %p\n", (void*)lg->graphEditQueue);
   printf("failed_ids pointer: %p\n", (void*)lg->failed_ids);
@@ -68,9 +68,9 @@ int main() {
   // Check if any pointers look suspicious (very low values indicate corruption)
   bool corruption_detected = false;
   if ((uintptr_t)lg->nodes < 1000) { printf("WARNING: nodes pointer looks corrupted!\n"); corruption_detected = true; }
-  if ((uintptr_t)lg->pending < 1000) { printf("WARNING: pending pointer looks corrupted!\n"); corruption_detected = true; }
-  if ((uintptr_t)lg->indegree < 1000) { printf("WARNING: indegree pointer looks corrupted!\n"); corruption_detected = true; }
-  if ((uintptr_t)lg->is_orphaned < 1000) { printf("WARNING: is_orphaned pointer looks corrupted!\n"); corruption_detected = true; }
+  if ((uintptr_t)lg->sched.pending < 1000) { printf("WARNING: pending pointer looks corrupted!\n"); corruption_detected = true; }
+  if ((uintptr_t)lg->sched.indegree < 1000) { printf("WARNING: indegree pointer looks corrupted!\n"); corruption_detected = true; }
+  if ((uintptr_t)lg->sched.is_orphaned < 1000) { printf("WARNING: is_orphaned pointer looks corrupted!\n"); corruption_detected = true; }
   
   if (!corruption_detected) {
     printf("✓ All major pointers look valid\n");

@@ -137,11 +137,11 @@ static bool validate_final_state() {
     
     // Check indegrees for anomalies
     printf("\n📊 Indegree Analysis:\n");
-    printf("   Node 1 indegree: %d (should be 0)\n", lg->indegree[node1_id]);
-    printf("   Node 2 indegree: %d (should be 0)\n", lg->indegree[node2_id]);
-    printf("   Node 3 indegree: %d (should be 1)\n", lg->indegree[node3_id]);
-    printf("   Node 4 indegree: %d (should be 0)\n", lg->indegree[node4_id]);
-    printf("   DAC indegree: %d (should be 1)\n", lg->indegree[lg->dac_node_id]);
+    printf("   Node 1 indegree: %d (should be 0)\n", lg->sched.indegree[node1_id]);
+    printf("   Node 2 indegree: %d (should be 0)\n", lg->sched.indegree[node2_id]);
+    printf("   Node 3 indegree: %d (should be 1)\n", lg->sched.indegree[node3_id]);
+    printf("   Node 4 indegree: %d (should be 0)\n", lg->sched.indegree[node4_id]);
+    printf("   DAC indegree: %d (should be 1)\n", lg->sched.indegree[lg->dac_node_id]);
     
     // Check for orphaned or invalid nodes
     printf("\n🔍 Node State Analysis:\n");

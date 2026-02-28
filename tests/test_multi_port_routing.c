@@ -189,14 +189,14 @@ void test_multi_port_routing() {
 
   // Check orphan status and scheduling
   printf("DEBUG: Node1 orphan status: %s, indegree: %d\n",
-         lg->is_orphaned[node1] ? "ORPHANED" : "CONNECTED",
-         lg->indegree[node1]);
+         lg->sched.is_orphaned[node1] ? "ORPHANED" : "CONNECTED",
+         lg->sched.indegree[node1]);
   printf("DEBUG: Node2 orphan status: %s, indegree: %d\n",
-         lg->is_orphaned[node2] ? "ORPHANED" : "CONNECTED",
-         lg->indegree[node2]);
+         lg->sched.is_orphaned[node2] ? "ORPHANED" : "CONNECTED",
+         lg->sched.indegree[node2]);
   printf("DEBUG: DAC orphan status: %s, indegree: %d\n",
-         lg->is_orphaned[lg->dac_node_id] ? "ORPHANED" : "CONNECTED",
-         lg->indegree[lg->dac_node_id]);
+         lg->sched.is_orphaned[lg->dac_node_id] ? "ORPHANED" : "CONNECTED",
+         lg->sched.indegree[lg->dac_node_id]);
 
   // Verify edge connections
   printf("DEBUG: Node1 output edges: [0]=%d, [1]=%d\n", node1_rt->outEdgeId[0],

@@ -35,16 +35,16 @@ int main() {
   // Check initial orphan status
   printf("=== Initial Orphan Status (before watchlist) ===\n");
   printf("  Scope osc (not connected to DAC): %s\n",
-         lg->is_orphaned[osc_id] ? "ORPHANED" : "ACTIVE");
+         lg->sched.is_orphaned[osc_id] ? "ORPHANED" : "ACTIVE");
   printf("  Scope gain (not connected to DAC): %s\n",
-         lg->is_orphaned[gain_id] ? "ORPHANED" : "ACTIVE");
+         lg->sched.is_orphaned[gain_id] ? "ORPHANED" : "ACTIVE");
   printf("  Main osc (connected to DAC): %s\n",
-         lg->is_orphaned[main_osc_id] ? "ORPHANED" : "ACTIVE");
+         lg->sched.is_orphaned[main_osc_id] ? "ORPHANED" : "ACTIVE");
 
   // The scope chain should be orphaned since it's not connected to DAC
-  assert(lg->is_orphaned[osc_id] == true);
-  assert(lg->is_orphaned[gain_id] == true);
-  assert(lg->is_orphaned[main_osc_id] == false);
+  assert(lg->sched.is_orphaned[osc_id] == true);
+  assert(lg->sched.is_orphaned[gain_id] == true);
+  assert(lg->sched.is_orphaned[main_osc_id] == false);
   printf("✓ Unconnected nodes correctly marked as orphaned\n\n");
 
   // Now add the scope nodes to watchlist
@@ -60,16 +60,16 @@ int main() {
   // Check orphan status after adding to watchlist
   printf("\n=== Orphan Status AFTER Watchlist ===\n");
   printf("  Scope osc (watched): %s\n",
-         lg->is_orphaned[osc_id] ? "ORPHANED" : "ACTIVE");
+         lg->sched.is_orphaned[osc_id] ? "ORPHANED" : "ACTIVE");
   printf("  Scope gain (watched): %s\n",
-         lg->is_orphaned[gain_id] ? "ORPHANED" : "ACTIVE");
+         lg->sched.is_orphaned[gain_id] ? "ORPHANED" : "ACTIVE");
   printf("  Main osc (connected to DAC): %s\n",
-         lg->is_orphaned[main_osc_id] ? "ORPHANED" : "ACTIVE");
+         lg->sched.is_orphaned[main_osc_id] ? "ORPHANED" : "ACTIVE");
 
   // CRITICAL TEST: Watched nodes should NOT be orphaned even without DAC connection
-  assert(lg->is_orphaned[osc_id] == false);
-  assert(lg->is_orphaned[gain_id] == false);
-  assert(lg->is_orphaned[main_osc_id] == false);
+  assert(lg->sched.is_orphaned[osc_id] == false);
+  assert(lg->sched.is_orphaned[gain_id] == false);
+  assert(lg->sched.is_orphaned[main_osc_id] == false);
   printf("✓ SUCCESS: Watched nodes are NOT orphaned despite no DAC connection!\n\n");
 
   // Process blocks and verify watched nodes are actually processing
@@ -128,13 +128,13 @@ int main() {
 
   printf("After removing from watchlist:\n");
   printf("  Scope osc: %s\n",
-         lg->is_orphaned[osc_id] ? "ORPHANED" : "ACTIVE");
+         lg->sched.is_orphaned[osc_id] ? "ORPHANED" : "ACTIVE");
   printf("  Scope gain: %s\n",
-         lg->is_orphaned[gain_id] ? "ORPHANED" : "ACTIVE");
+         lg->sched.is_orphaned[gain_id] ? "ORPHANED" : "ACTIVE");
 
   // Should be orphaned again after removal from watchlist
-  assert(lg->is_orphaned[osc_id] == true);
-  assert(lg->is_orphaned[gain_id] == true);
+  assert(lg->sched.is_orphaned[osc_id] == true);
+  assert(lg->sched.is_orphaned[gain_id] == true);
   printf("✓ Nodes correctly re-orphaned after watchlist removal\n");
 
   // Clean up

@@ -208,7 +208,7 @@ bool process_and_validate_partial_block(int block_num) {
          g_partial_test.mixer_node,
          g_partial_test.live_graph->nodes[g_partial_test.mixer_node].nInputs,
          atomic_load_explicit(
-             &g_partial_test.live_graph->pending[g_partial_test.mixer_node],
+             &g_partial_test.live_graph->sched.pending[g_partial_test.mixer_node],
              memory_order_acquire));
 
   if (g_partial_test.live_graph->nodes[output_node].nInputs == 0) {
@@ -349,7 +349,7 @@ bool test_partial_connections() {
   bool all_blocks_valid = true;
 
   for (int i = 0; i < g_partial_test.live_graph->node_count; i++) {
-    if (g_partial_test.live_graph->is_orphaned[i]) {
+    if (g_partial_test.live_graph->sched.is_orphaned[i]) {
       printf("Node %d is orphaned\n", i);
     } else {
       printf("Node %d is used\n", i);

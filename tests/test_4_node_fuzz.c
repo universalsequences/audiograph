@@ -213,16 +213,16 @@ static bool validate_graph_state(Edge *edges, int edge_count,
   bool indegrees_valid = true;
 
   // Node 1 should always have indegree 0 (source node)
-  if (lg->indegree[node1_id] != 0) {
+  if (lg->sched.indegree[node1_id] != 0) {
     printf("🐛 INDEGREE BUG: Node 1 has indegree %d, expected 0\n",
-           lg->indegree[node1_id]);
+           lg->sched.indegree[node1_id]);
     indegrees_valid = false;
   }
 
   // Node 2 should always have indegree 0 (source node)
-  if (lg->indegree[node2_id] != 0) {
+  if (lg->sched.indegree[node2_id] != 0) {
     printf("🐛 INDEGREE BUG: Node 2 has indegree %d, expected 0\n",
-           lg->indegree[node2_id]);
+           lg->sched.indegree[node2_id]);
     indegrees_valid = false;
   }
 
@@ -232,9 +232,9 @@ static bool validate_graph_state(Edge *edges, int edge_count,
            actual, actual - expected);
     printf("   Active edges: %d\n", active_count);
     printf("   Indegrees: N1=%d, N2=%d, N3=%d, N4=%d, DAC=%d\n",
-           lg->indegree[node1_id], lg->indegree[node2_id],
-           lg->indegree[node3_id], lg->indegree[node4_id],
-           lg->indegree[lg->dac_node_id]);
+           lg->sched.indegree[node1_id], lg->sched.indegree[node2_id],
+           lg->sched.indegree[node3_id], lg->sched.indegree[node4_id],
+           lg->sched.indegree[lg->dac_node_id]);
     printf("   Active edges: ");
     for (int i = 0; i < edge_count; i++) {
       if (edges[i].is_active) {
@@ -244,7 +244,7 @@ static bool validate_graph_state(Edge *edges, int edge_count,
     printf("\n");
 
     // CRITICAL DEBUG: Check actual graph data structures
-    if (lg->indegree[lg->dac_node_id] == 0 &&
+    if (lg->sched.indegree[lg->dac_node_id] == 0 &&
         fabs(actual - expected) > 0.001f) {
       printf("🔍 CRITICAL BUG: DAC indegree=0 but expected non-zero output\n");
       printf("   Examining actual DAC connections in graph data structures:\n");
@@ -266,7 +266,7 @@ static bool validate_graph_state(Edge *edges, int edge_count,
       }
 
       printf("   Orphaned status: DAC=%s\n",
-             lg->is_orphaned[lg->dac_node_id] ? "ORPHANED" : "CONNECTED");
+             lg->sched.is_orphaned[lg->dac_node_id] ? "ORPHANED" : "CONNECTED");
     }
 
     return false;

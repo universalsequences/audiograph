@@ -9,9 +9,9 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   // Node storage
   lg->node_capacity = initial_capacity;
   lg->nodes = calloc(lg->node_capacity, sizeof(RTNode));
-  lg->pending = calloc(lg->node_capacity, sizeof(atomic_int));
-  lg->indegree = calloc(lg->node_capacity, sizeof(int));
-  lg->is_orphaned = calloc(lg->node_capacity, sizeof(bool));
+  lg->sched.pending = calloc(lg->node_capacity, sizeof(atomic_int));
+  lg->sched.indegree = calloc(lg->node_capacity, sizeof(int));
+  lg->sched.is_orphaned = calloc(lg->node_capacity, sizeof(bool));
 
   // Buffer storage
   lg->buffer_capacity = initial_capacity;
@@ -24,21 +24,22 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   lg->num_channels = (num_channels > 0) ? num_channels : 1; // Default to mono
 
   // Initialize Retire List
-  lg->retire_capacity = 32;
-  lg->retire_count = 0;
-  lg->retire_list = calloc(lg->retire_capacity, sizeof(RetireEntry));
+  lg->retire.capacity = 32;
+  lg->retire.count = 0;
+  lg->retire.list = calloc(lg->retire.capacity, sizeof(RetireEntry));
 
-  // New port-based edge pool (lazy allocation - buffers allocated on demand in
-  // alloc_edge)
+  // Edge pool with free-list (buffers allocated lazily in alloc_edge)
   lg->edges = calloc(lg->edge_capacity, sizeof(LiveEdge));
   for (int i = 0; i < lg->edge_capacity; i++) {
-    // Buffer allocated lazily in alloc_edge() when edge is first used
     lg->edges[i].buf = NULL;
     lg->edges[i].in_use = false;
     lg->edges[i].refcount = 0;
     lg->edges[i].src_node = -1;
     lg->edges[i].src_port = -1;
+    lg->edges[i].next_free = i + 1; // chain into free list
   }
+  lg->edges[lg->edge_capacity - 1].next_free = -1; // terminate list
+  lg->edge_free_head = 0;
 
   // Support buffers for port system
   lg->silence_buf = alloc_aligned(64, block_size * sizeof(float));
@@ -48,16 +49,16 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
 
   // Ready queue (ReadyQ with MPMC + semaphore for thread safety)
   // BURST FIX: Increased capacity from 1024 to 4096 for wide graphs
-  lg->readyQueue = rq_create(4096);
-  if (!lg->readyQueue) {
+  lg->sched.readyQueue = rq_create(4096);
+  if (!lg->sched.readyQueue) {
     // Handle allocation failure - edge buffers are NULL (lazy allocation)
     free(lg->edges);
     free(lg->silence_buf);
     free(lg->scratch_null);
     free(lg->nodes);
-    free(lg->pending);
-    free(lg->indegree);
-    free(lg->is_orphaned);
+    free(lg->sched.pending);
+    free(lg->sched.indegree);
+    free(lg->sched.is_orphaned);
     free(lg);
     return NULL;
   }
@@ -79,23 +80,23 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   atomic_init(&lg->next_buffer_id, 0);
 
   // Initialize watch list system
-  lg->watch_list_capacity = 16;
-  lg->watch_list = calloc(lg->watch_list_capacity, sizeof(int));
-  lg->watch_list_count = 0;
-  pthread_mutex_init(&lg->watch_list_mutex, NULL);
+  lg->watch.capacity = 16;
+  lg->watch.list = calloc(lg->watch.capacity, sizeof(int));
+  lg->watch.count = 0;
+  pthread_mutex_init(&lg->watch.mutex, NULL);
 
   // Initialize state store arrays (indexed by node_id)
-  lg->state_snapshots = calloc(lg->node_capacity, sizeof(void *));
-  lg->state_sizes = calloc(lg->node_capacity, sizeof(size_t));
-  pthread_rwlock_init(&lg->state_store_lock, NULL);
+  lg->watch.snapshots = calloc(lg->node_capacity, sizeof(void *));
+  lg->watch.sizes = calloc(lg->node_capacity, sizeof(size_t));
+  pthread_rwlock_init(&lg->watch.lock, NULL);
 
   // Initialize scheduling cache (optimization to avoid O(n) per block)
-  lg->source_capacity = 256;  // Start with reasonable capacity
-  lg->source_nodes = calloc(lg->source_capacity, sizeof(int32_t));
-  lg->source_count = 0;
-  lg->cached_total_jobs = 0;
-  lg->has_cycle = false;
-  lg->scheduling_dirty = true;  // Force initial rebuild
+  lg->sched.source_capacity = 256;  // Start with reasonable capacity
+  lg->sched.source_nodes = calloc(lg->sched.source_capacity, sizeof(int32_t));
+  lg->sched.source_count = 0;
+  lg->sched.cached_total_jobs = 0;
+  lg->sched.has_cycle = false;
+  lg->sched.dirty = true;  // Force initial rebuild
 
   // Automatically create the DAC node at index 0
   // DAC has one input and one output per channel
@@ -173,12 +174,12 @@ void destroy_live_graph(LiveGraph *lg) {
   }
 
   // Free scheduling arrays
-  if (lg->pending)
-    free(lg->pending);
-  if (lg->indegree)
-    free(lg->indegree);
-  if (lg->is_orphaned)
-    free(lg->is_orphaned);
+  if (lg->sched.pending)
+    free(lg->sched.pending);
+  if (lg->sched.indegree)
+    free(lg->sched.indegree);
+  if (lg->sched.is_orphaned)
+    free(lg->sched.is_orphaned);
 
   // Free support buffers
   if (lg->silence_buf)
@@ -187,8 +188,8 @@ void destroy_live_graph(LiveGraph *lg) {
     free(lg->scratch_null);
 
   // Free queues
-  if (lg->readyQueue)
-    rq_destroy(lg->readyQueue);
+  if (lg->sched.readyQueue)
+    rq_destroy(lg->sched.readyQueue);
   if (lg->params)
     free(lg->params);
   if (lg->graphEditQueue) {
@@ -201,30 +202,30 @@ void destroy_live_graph(LiveGraph *lg) {
     free(lg->failed_ids);
 
   // Free watch list system
-  if (lg->watch_list)
-    free(lg->watch_list);
-  pthread_mutex_destroy(&lg->watch_list_mutex);
+  if (lg->watch.list)
+    free(lg->watch.list);
+  pthread_mutex_destroy(&lg->watch.mutex);
 
   // Free state snapshots
-  if (lg->state_snapshots) {
+  if (lg->watch.snapshots) {
     for (int i = 0; i < lg->node_capacity; i++) {
-      if (lg->state_snapshots[i]) {
-        free(lg->state_snapshots[i]);
+      if (lg->watch.snapshots[i]) {
+        free(lg->watch.snapshots[i]);
       }
     }
-    free(lg->state_snapshots);
+    free(lg->watch.snapshots);
   }
-  if (lg->state_sizes)
-    free(lg->state_sizes);
-  pthread_rwlock_destroy(&lg->state_store_lock);
+  if (lg->watch.sizes)
+    free(lg->watch.sizes);
+  pthread_rwlock_destroy(&lg->watch.lock);
 
   // Free retire list
-  if (lg->retire_list)
-    free(lg->retire_list);
+  if (lg->retire.list)
+    free(lg->retire.list);
 
   // Free scheduling cache
-  if (lg->source_nodes)
-    free(lg->source_nodes);
+  if (lg->sched.source_nodes)
+    free(lg->sched.source_nodes);
 
   // Free the graph itself
   free(lg);
@@ -531,16 +532,16 @@ bool replace_keep_edges(LiveGraph *lg, int node_id, NodeVTable vt,
 void retire_later(LiveGraph *lg, void *ptr, void (*deleter)(void *)) {
   if (!ptr)
     return;
-  if (lg->retire_count >= lg->retire_capacity) {
-    int new_cap = lg->retire_capacity ? lg->retire_capacity * 2 : 16;
+  if (lg->retire.count >= lg->retire.capacity) {
+    int new_cap = lg->retire.capacity ? lg->retire.capacity * 2 : 16;
     RetireEntry *new_list =
-        realloc(lg->retire_list, new_cap * sizeof(RetireEntry));
+        realloc(lg->retire.list, new_cap * sizeof(RetireEntry));
     if (!new_list)
       return; // allocation failed, skip retirement
-    lg->retire_list = new_list;
-    lg->retire_capacity = new_cap;
+    lg->retire.list = new_list;
+    lg->retire.capacity = new_cap;
   }
-  lg->retire_list[lg->retire_count++] =
+  lg->retire.list[lg->retire.count++] =
       (RetireEntry){.ptr = ptr, .deleter = deleter};
 }
 
@@ -568,20 +569,20 @@ void *get_node_state(LiveGraph *lg, int node_id, size_t *state_size) {
     return NULL;
   }
 
-  pthread_rwlock_rdlock(&lg->state_store_lock);
+  pthread_rwlock_rdlock(&lg->watch.lock);
 
   void *result = NULL;
   size_t size = 0;
 
-  if (lg->state_snapshots[node_id] && lg->state_sizes[node_id] > 0) {
-    size = lg->state_sizes[node_id];
+  if (lg->watch.snapshots[node_id] && lg->watch.sizes[node_id] > 0) {
+    size = lg->watch.sizes[node_id];
     result = malloc(size);
     if (result) {
-      memcpy(result, lg->state_snapshots[node_id], size);
+      memcpy(result, lg->watch.snapshots[node_id], size);
     }
   }
 
-  pthread_rwlock_unlock(&lg->state_store_lock);
+  pthread_rwlock_unlock(&lg->watch.lock);
 
   if (state_size)
     *state_size = size;

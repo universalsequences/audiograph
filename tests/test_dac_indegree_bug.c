@@ -144,7 +144,7 @@ int main() {
 
   // Validate initial state
   printf("📊 Initial state:\n");
-  printf("   DAC indegree: %d\n", lg->indegree[lg->dac_node_id]);
+  printf("   DAC indegree: %d\n", lg->sched.indegree[lg->dac_node_id]);
 
   float output_buffer[block_size];
   memset(output_buffer, 0, sizeof(output_buffer));
@@ -192,7 +192,7 @@ int main() {
   // Remaining edges: N1→N3, N2→DAC, N3→DAC
 
   printf("\n🔬 State before critical sequence:\n");
-  printf("   DAC indegree: %d\n", lg->indegree[lg->dac_node_id]);
+  printf("   DAC indegree: %d\n", lg->sched.indegree[lg->dac_node_id]);
 
   // Permutation 615: Disconnect N3→DAC, then N1→N3, then reconnect both
   // (backtrack)
@@ -205,7 +205,7 @@ int main() {
   }
   apply_graph_edits(lg->graphEditQueue, lg);
   printf("   DAC indegree after N3→DAC disconnect: %d\n",
-         lg->indegree[lg->dac_node_id]);
+         lg->sched.indegree[lg->dac_node_id]);
 
   printf("Perm 615: Disconnecting N1→N3...\n");
   success = graph_disconnect(lg, node1_id, 0, node3_id, 0);
@@ -215,7 +215,7 @@ int main() {
   }
   apply_graph_edits(lg->graphEditQueue, lg);
   printf("   DAC indegree after N1→N3 disconnect: %d\n",
-         lg->indegree[lg->dac_node_id]);
+         lg->sched.indegree[lg->dac_node_id]);
 
   // Backtrack: Reconnect N1→N3
   printf("Backtrack: Reconnecting N1→N3...\n");
@@ -226,7 +226,7 @@ int main() {
   }
   apply_graph_edits(lg->graphEditQueue, lg);
   printf("   DAC indegree after N1→N3 reconnect: %d\n",
-         lg->indegree[lg->dac_node_id]);
+         lg->sched.indegree[lg->dac_node_id]);
 
   // Backtrack: Reconnect N3→DAC
   printf("Backtrack: Reconnecting N3→DAC...\n");
@@ -237,7 +237,7 @@ int main() {
   }
   apply_graph_edits(lg->graphEditQueue, lg);
   printf("   DAC indegree after N3→DAC reconnect: %d\n",
-         lg->indegree[lg->dac_node_id]);
+         lg->sched.indegree[lg->dac_node_id]);
 
   // Permutation 616: Disconnect N3→DAC (and that's it - this sets up the final
   // bug state)
@@ -250,13 +250,13 @@ int main() {
   }
   apply_graph_edits(lg->graphEditQueue, lg);
   printf("   DAC indegree after final N3→DAC disconnect: %d\n",
-         lg->indegree[lg->dac_node_id]);
+         lg->sched.indegree[lg->dac_node_id]);
 
   // Now we should be in the exact state that causes the bug in Perm 617
   printf("\n--- PERM 617 VALIDATION (EXPECTING BUG HERE) ---\n");
 
   printf("\n🔍 FINAL STATE ANALYSIS:\n");
-  printf("   DAC indegree: %d\n", lg->indegree[lg->dac_node_id]);
+  printf("   DAC indegree: %d\n", lg->sched.indegree[lg->dac_node_id]);
 
   // Check which edges are still connected to DAC
   RTNode *dac = &lg->nodes[lg->dac_node_id];
@@ -288,7 +288,7 @@ int main() {
   printf("   Actual DAC output: %.3f\n", actual_output);
   printf("   Difference: %.6f\n", actual_output - expected_output);
 
-  bool bug_reproduced = (lg->indegree[lg->dac_node_id] == 0 &&
+  bool bug_reproduced = (lg->sched.indegree[lg->dac_node_id] == 0 &&
                          fabs(actual_output - expected_output) > 0.001f);
 
   if (bug_reproduced) {

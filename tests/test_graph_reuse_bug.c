@@ -120,7 +120,7 @@ static bool reset_to_full_topology() {
 
 // Helper function to check DAC state
 static void check_dac_state(const char* context) {
-    printf("🔍 %s - DAC indegree: %d\n", context, lg->indegree[lg->dac_node_id]);
+    printf("🔍 %s - DAC indegree: %d\n", context, lg->sched.indegree[lg->dac_node_id]);
     
     // Check DAC input connections
     RTNode *dac = &lg->nodes[lg->dac_node_id];
@@ -247,7 +247,7 @@ int main() {
                     }
                 }
                 
-                if (lg->indegree[lg->dac_node_id] == 0 && active_connections > 0) {
+                if (lg->sched.indegree[lg->dac_node_id] == 0 && active_connections > 0) {
                     printf("🐛 BUG REPRODUCED! DAC indegree=0 but has %d active connections!\n", active_connections);
                     
                     // Process audio to see if output is wrong

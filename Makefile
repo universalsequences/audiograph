@@ -19,7 +19,7 @@ LIB_OBJECTS = $(LIB_SOURCES:.c=.o)
 TEST_OBJS = graph_engine.o graph_nodes.o graph_api.o graph_edit.o ready_queue.o hot_swap.o
 
 # Header dependencies
-HEADERS = graph_types.h graph_nodes.h graph_engine.h graph_api.h graph_edit.h hot_swap.h
+HEADERS = graph_types.h mpmc_queue.h graph_nodes.h graph_engine.h graph_api.h graph_edit.h hot_swap.h
 
 # Default target
 all: $(TARGET) $(DYLIB_TARGET)

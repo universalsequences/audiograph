@@ -101,11 +101,11 @@ int main() {
     
     // Check indegrees
     printf("\n🔍 Indegree Analysis:\n");
-    printf("   Node 1 indegree: %d (expected: 0)\n", lg->indegree[node1_id]);
-    printf("   Node 2 indegree: %d (expected: 0)\n", lg->indegree[node2_id]);  
-    printf("   Node 3 indegree: %d (expected: 1, from N1)\n", lg->indegree[node3_id]);
-    printf("   Node 4 indegree: %d (expected: 0, disconnected)\n", lg->indegree[node4_id]);
-    printf("   DAC indegree: %d (expected: 1, from N2)\n", lg->indegree[lg->dac_node_id]);
+    printf("   Node 1 indegree: %d (expected: 0)\n", lg->sched.indegree[node1_id]);
+    printf("   Node 2 indegree: %d (expected: 0)\n", lg->sched.indegree[node2_id]);  
+    printf("   Node 3 indegree: %d (expected: 1, from N1)\n", lg->sched.indegree[node3_id]);
+    printf("   Node 4 indegree: %d (expected: 0, disconnected)\n", lg->sched.indegree[node4_id]);
+    printf("   DAC indegree: %d (expected: 1, from N2)\n", lg->sched.indegree[lg->dac_node_id]);
     
     // Verify if the bug is reproduced
     bool bug_reproduced = (fabs(output_buffer[0]) < 0.001f) && (output_buffer[0] != 2.0f);

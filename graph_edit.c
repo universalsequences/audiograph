@@ -3,12 +3,66 @@
 #include "hot_swap.h"
 #include <assert.h>
 
-// Forward declaration for internal function (defined later in file)
+// ===================== Port & Edge Allocation =====================
+
+bool ensure_port_arrays(RTNode *n) {
+  if (!n || n->nInputs < 0 || n->nOutputs < 0)
+    return false;
+
+  // Reject unreasonable values to guard against corruption
+  if (n->nInputs > 1000 || n->nOutputs > 1000)
+    return false;
+
+  if (!n->inEdgeId && n->nInputs > 0) {
+    n->inEdgeId = (int32_t *)malloc(sizeof(int32_t) * n->nInputs);
+    if (!n->inEdgeId)
+      return false;
+    for (int i = 0; i < n->nInputs; i++)
+      n->inEdgeId[i] = -1;
+  }
+
+  if (!n->outEdgeId && n->nOutputs > 0) {
+    n->outEdgeId = (int32_t *)malloc(sizeof(int32_t) * n->nOutputs);
+    if (!n->outEdgeId)
+      return false;
+    for (int i = 0; i < n->nOutputs; i++)
+      n->outEdgeId[i] = -1;
+  }
+
+  if (!n->fanin_sum_node_id && n->nInputs > 0) {
+    n->fanin_sum_node_id = (int32_t *)malloc(sizeof(int32_t) * n->nInputs);
+    if (!n->fanin_sum_node_id)
+      return false;
+    for (int i = 0; i < n->nInputs; i++)
+      n->fanin_sum_node_id[i] = -1;
+  }
+
+  return true;
+}
+
+int alloc_edge(LiveGraph *lg) {
+  int i = lg->edge_free_head;
+  if (i < 0)
+    return -1; // pool exhausted
+
+  lg->edge_free_head = lg->edges[i].next_free;
+  lg->edges[i].in_use = true;
+  lg->edges[i].refcount = 0;
+  lg->edges[i].src_node = -1;
+  lg->edges[i].src_port = -1;
+  lg->edges[i].next_free = -1;
+  if (!lg->edges[i].buf) {
+    lg->edges[i].buf = alloc_aligned(64, lg->block_size * sizeof(float));
+  }
+  memset(lg->edges[i].buf, 0, sizeof(float) * lg->block_size);
+  return i;
+}
+
+// ===================== Edge Retirement & Helpers =====================
 
 static void retire_edge(LiveGraph *lg, int eid) {
   if (eid < 0 || eid >= lg->edge_capacity)
     return;
-  // zero for hygiene (optional)
   if (lg->edges[eid].buf) {
     memset(lg->edges[eid].buf, 0, sizeof(float) * lg->block_size);
     free(lg->edges[eid].buf);
@@ -18,6 +72,9 @@ static void retire_edge(LiveGraph *lg, int eid) {
   lg->edges[eid].in_use = false;
   lg->edges[eid].src_node = -1;
   lg->edges[eid].src_port = -1;
+  // Push onto free list
+  lg->edges[eid].next_free = lg->edge_free_head;
+  lg->edge_free_head = eid;
 }
 
 static bool still_connected_S_to_D(LiveGraph *lg, int S_id, int D_id) {
@@ -112,7 +169,7 @@ static inline bool has_successor(const RTNode *src, int succ_id) {
 static inline void indegree_inc_on_first_pred(LiveGraph *lg, int src, int dst) {
   if (!has_successor(&lg->nodes[src], dst)) {
     add_successor_port(&lg->nodes[src], dst);
-    lg->indegree[dst]++; // count unique predecessor once
+    lg->sched.indegree[dst]++; // count unique predecessor once
   }
 }
 
@@ -122,8 +179,8 @@ static inline void indegree_dec_on_last_pred(LiveGraph *lg, int src, int dst) {
   // disconnected was the last connection, not just if connections still exist
   // after this disconnect operation completes
   if (!still_connected_S_to_D(lg, src, dst)) {
-    if (lg->indegree[dst] > 0)
-      lg->indegree[dst]--;
+    if (lg->sched.indegree[dst] > 0)
+      lg->sched.indegree[dst]--;
     remove_successor(&lg->nodes[src], dst);
   }
 }
@@ -139,28 +196,28 @@ static bool apply_add_watchlist_internal(LiveGraph *lg, int node_id) {
     return false;
   }
 
-  pthread_mutex_lock(&lg->watch_list_mutex);
+  pthread_mutex_lock(&lg->watch.mutex);
 
-  for (int i = 0; i < lg->watch_list_count; i++) {
-    if (lg->watch_list[i] == node_id) {
-      pthread_mutex_unlock(&lg->watch_list_mutex);
+  for (int i = 0; i < lg->watch.count; i++) {
+    if (lg->watch.list[i] == node_id) {
+      pthread_mutex_unlock(&lg->watch.mutex);
       return true;
     }
   }
 
-  if (lg->watch_list_count >= lg->watch_list_capacity) {
-    int new_cap = lg->watch_list_capacity ? lg->watch_list_capacity * 2 : 16;
-    int *new_list = realloc(lg->watch_list, new_cap * sizeof(int));
+  if (lg->watch.count >= lg->watch.capacity) {
+    int new_cap = lg->watch.capacity ? lg->watch.capacity * 2 : 16;
+    int *new_list = realloc(lg->watch.list, new_cap * sizeof(int));
     if (!new_list) {
-      pthread_mutex_unlock(&lg->watch_list_mutex);
+      pthread_mutex_unlock(&lg->watch.mutex);
       return false;
     }
-    lg->watch_list = new_list;
-    lg->watch_list_capacity = new_cap;
+    lg->watch.list = new_list;
+    lg->watch.capacity = new_cap;
   }
 
-  lg->watch_list[lg->watch_list_count++] = node_id;
-  pthread_mutex_unlock(&lg->watch_list_mutex);
+  lg->watch.list[lg->watch.count++] = node_id;
+  pthread_mutex_unlock(&lg->watch.mutex);
 
   return true;
 }
@@ -179,29 +236,29 @@ static bool apply_remove_watchlist_internal(LiveGraph *lg, int node_id) {
     return false;
   }
 
-  pthread_mutex_lock(&lg->watch_list_mutex);
+  pthread_mutex_lock(&lg->watch.mutex);
 
-  for (int i = 0; i < lg->watch_list_count; i++) {
-    if (lg->watch_list[i] == node_id) {
-      for (int j = i; j < lg->watch_list_count - 1; j++) {
-        lg->watch_list[j] = lg->watch_list[j + 1];
+  for (int i = 0; i < lg->watch.count; i++) {
+    if (lg->watch.list[i] == node_id) {
+      for (int j = i; j < lg->watch.count - 1; j++) {
+        lg->watch.list[j] = lg->watch.list[j + 1];
       }
-      lg->watch_list_count--;
+      lg->watch.count--;
 
-      pthread_rwlock_wrlock(&lg->state_store_lock);
-      if (node_id < lg->node_capacity && lg->state_snapshots[node_id]) {
-        free(lg->state_snapshots[node_id]);
-        lg->state_snapshots[node_id] = NULL;
-        lg->state_sizes[node_id] = 0;
+      pthread_rwlock_wrlock(&lg->watch.lock);
+      if (node_id < lg->node_capacity && lg->watch.snapshots[node_id]) {
+        free(lg->watch.snapshots[node_id]);
+        lg->watch.snapshots[node_id] = NULL;
+        lg->watch.sizes[node_id] = 0;
       }
-      pthread_rwlock_unlock(&lg->state_store_lock);
+      pthread_rwlock_unlock(&lg->watch.lock);
 
-      pthread_mutex_unlock(&lg->watch_list_mutex);
+      pthread_mutex_unlock(&lg->watch.mutex);
       return true;
     }
   }
 
-  pthread_mutex_unlock(&lg->watch_list_mutex);
+  pthread_mutex_unlock(&lg->watch.mutex);
   return false;
 }
 
@@ -218,7 +275,7 @@ static void mark_reachable_from_dac(LiveGraph *lg, int node_id, bool *visited) {
   if (node_id < 0 || node_id >= lg->node_count || visited[node_id])
     return;
   visited[node_id] = true;
-  lg->is_orphaned[node_id] = false;
+  lg->sched.is_orphaned[node_id] = false;
 
   RTNode *node = &lg->nodes[node_id];
   if (!node->inEdgeId)
@@ -237,7 +294,7 @@ static void mark_reachable_from_dac(LiveGraph *lg, int node_id, bool *visited) {
 // Update orphaned status for all nodes based on DAC reachability
 void update_orphaned_status(LiveGraph *lg) {
   // Mark scheduling cache as dirty - topology has changed
-  lg->scheduling_dirty = true;
+  lg->sched.dirty = true;
 
   // Invalidate IO caches for all nodes - topology has changed
   for (int i = 0; i < lg->node_count; i++) {
@@ -248,16 +305,16 @@ void update_orphaned_status(LiveGraph *lg) {
   for (int i = 0; i < lg->node_count; i++) {
     // Check if this node is in the watchlist
     bool is_watched = false;
-    pthread_mutex_lock(&lg->watch_list_mutex);
-    for (int w = 0; w < lg->watch_list_count; w++) {
-      if (lg->watch_list[w] == i) {
+    pthread_mutex_lock(&lg->watch.mutex);
+    for (int w = 0; w < lg->watch.count; w++) {
+      if (lg->watch.list[w] == i) {
         is_watched = true;
         break;
       }
     }
-    pthread_mutex_unlock(&lg->watch_list_mutex);
+    pthread_mutex_unlock(&lg->watch.mutex);
     // Watched nodes are never orphaned - they always stay active
-    lg->is_orphaned[i] = !is_watched;
+    lg->sched.is_orphaned[i] = !is_watched;
   }
 
   // NEW: Also treat all upstream dependencies of watched nodes as non-orphaned
@@ -265,18 +322,18 @@ void update_orphaned_status(LiveGraph *lg) {
   // even when not connected to the DAC.
   int watch_count = 0;
   int *watch_nodes = NULL;
-  pthread_mutex_lock(&lg->watch_list_mutex);
-  if (lg->watch_list_count > 0) {
-    watch_count = lg->watch_list_count;
+  pthread_mutex_lock(&lg->watch.mutex);
+  if (lg->watch.count > 0) {
+    watch_count = lg->watch.count;
     watch_nodes = (int *)malloc(sizeof(int) * watch_count);
     if (watch_nodes) {
-      memcpy(watch_nodes, lg->watch_list, sizeof(int) * watch_count);
+      memcpy(watch_nodes, lg->watch.list, sizeof(int) * watch_count);
     } else {
       // Allocation failed; fall back to using 0 count
       watch_count = 0;
     }
   }
-  pthread_mutex_unlock(&lg->watch_list_mutex);
+  pthread_mutex_unlock(&lg->watch.mutex);
 
   if (watch_count > 0 && watch_nodes) {
     bool *wvisited = calloc(lg->node_count, sizeof(bool));
@@ -585,11 +642,11 @@ bool apply_disconnect_internal(LiveGraph *lg, int src_node, int src_port,
 
     // Update successor list and indegree on the source node
     if (!still_connected_S_to_D(lg, src_node, dst_node)) {
-      lg->indegree[dst_node]--; // last S→D connection gone
+      lg->sched.indegree[dst_node]--; // last S→D connection gone
       remove_successor(S, dst_node);
     }
-    if (lg->indegree[dst_node] < 0)
-      lg->indegree[dst_node] = 0;
+    if (lg->sched.indegree[dst_node] < 0)
+      lg->sched.indegree[dst_node] = 0;
 
     // Edge refcount and retirement if last consumer
     LiveEdge *e = &lg->edges[eid_in];
@@ -752,8 +809,8 @@ bool apply_disconnect_internal(LiveGraph *lg, int src_node, int src_port,
           // SUM contributed 1 to dst_node's indegree, but remaining_src taking over
           // doesn't add a new unique predecessor. So we must decrement indegree
           // to account for SUM being removed.
-          if (lg->indegree[dst_node] > 0) {
-            lg->indegree[dst_node]--;
+          if (lg->sched.indegree[dst_node] > 0) {
+            lg->sched.indegree[dst_node]--;
           }
         }
         // Remove SUM from source's successors
@@ -1083,17 +1140,17 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
     }
   }
 
-  memcpy(new_indegree, lg->indegree, old_capacity * sizeof(int));
-  memcpy(new_orphaned, lg->is_orphaned, old_capacity * sizeof(bool));
-  if (lg->state_snapshots)
-    memcpy(new_state_snapshots, lg->state_snapshots,
+  memcpy(new_indegree, lg->sched.indegree, old_capacity * sizeof(int));
+  memcpy(new_orphaned, lg->sched.is_orphaned, old_capacity * sizeof(bool));
+  if (lg->watch.snapshots)
+    memcpy(new_state_snapshots, lg->watch.snapshots,
            old_capacity * sizeof(void *));
-  if (lg->state_sizes)
-    memcpy(new_state_sizes, lg->state_sizes, old_capacity * sizeof(size_t));
+  if (lg->watch.sizes)
+    memcpy(new_state_sizes, lg->watch.sizes, old_capacity * sizeof(size_t));
 
   // Copy existing atomic values
   for (int i = 0; i < old_capacity; i++) {
-    int old_val = atomic_load_explicit(&lg->pending[i], memory_order_relaxed);
+    int old_val = atomic_load_explicit(&lg->sched.pending[i], memory_order_relaxed);
     atomic_init(&new_pending[i], old_val);
   }
 
@@ -1127,21 +1184,21 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
       free(old_node->cached_outPtrs);
   }
   free(lg->nodes);
-  free(lg->pending);
-  free(lg->indegree);
-  free(lg->is_orphaned);
-  if (lg->state_snapshots)
-    free(lg->state_snapshots);
-  if (lg->state_sizes)
-    free(lg->state_sizes);
+  free(lg->sched.pending);
+  free(lg->sched.indegree);
+  free(lg->sched.is_orphaned);
+  if (lg->watch.snapshots)
+    free(lg->watch.snapshots);
+  if (lg->watch.sizes)
+    free(lg->watch.sizes);
 
   // Update pointers and capacity
   lg->nodes = new_nodes;
-  lg->pending = new_pending;
-  lg->indegree = new_indegree;
-  lg->is_orphaned = new_orphaned;
-  lg->state_snapshots = new_state_snapshots;
-  lg->state_sizes = new_state_sizes;
+  lg->sched.pending = new_pending;
+  lg->sched.indegree = new_indegree;
+  lg->sched.is_orphaned = new_orphaned;
+  lg->watch.snapshots = new_state_snapshots;
+  lg->watch.sizes = new_state_sizes;
   lg->node_capacity = new_capacity;
 
   return true;
@@ -1209,7 +1266,7 @@ int apply_add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
   // Initialize orphaned state - new nodes with no connections start as orphaned
   // They will be marked as non-orphaned when they get connected to the signal
   // path
-  lg->is_orphaned[node_id] = true;
+  lg->sched.is_orphaned[node_id] = true;
 
   // Update node_count to be highest allocated index + 1
   if (node_id >= lg->node_count) {
@@ -1277,7 +1334,7 @@ bool apply_connect_internal(LiveGraph *lg, int src_node, int src_port,
     D->inEdgeId[dst_port] = eid;
     lg->edges[eid].refcount++;
     if (!has_successor(S, dst_node)) { // first S→D connection
-      lg->indegree[dst_node]++;        // count unique predecessor S
+      lg->sched.indegree[dst_node]++;        // count unique predecessor S
       add_successor_port(S, dst_node);
     } else {
       // successor already recorded; do NOT increment indegree again
@@ -1324,8 +1381,8 @@ bool apply_connect_internal(LiveGraph *lg, int src_node, int src_port,
       // Only decrement indegree if old_src is no longer connected to dst_node
       // through any path
       if (!still_connected_S_to_D(lg, old_src, dst_node)) {
-        if (lg->indegree[dst_node] > 0)
-          lg->indegree[dst_node]--;
+        if (lg->sched.indegree[dst_node] > 0)
+          lg->sched.indegree[dst_node]--;
         // Remove dst_node from old_src's successor list since it's no longer a
         // direct successor
         remove_successor(&lg->nodes[old_src], dst_node);

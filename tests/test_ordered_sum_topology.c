@@ -38,7 +38,7 @@ void test_ordered_sum_topology() {
 
   apply_graph_edits(lg->graphEditQueue, lg);
 
-  printf("in degree of node3=%d\n", lg->indegree[node3]);
+  printf("in degree of node3=%d\n", lg->sched.indegree[node3]);
 
   printf("\n=== COMPLETE GRAPH STATE AFTER DISCONNECT ===\n");
 

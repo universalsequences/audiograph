@@ -85,15 +85,15 @@ int main() {
 
   int uniq_before = count_unique_preds(lg, dac);
   printf("Unique preds before disconnect = %d, indegree=%d\n", uniq_before,
-         lg->indegree[dac]);
-  assert(uniq_before == lg->indegree[dac]);
+         lg->sched.indegree[dac]);
+  assert(uniq_before == lg->sched.indegree[dac]);
 
   // Disconnect pass -> DAC[0], expect DAC unique preds becomes 1
   assert(apply_disconnect(lg, pass, 0, dac, 0));
   int uniq_after = count_unique_preds(lg, dac);
   printf("Unique preds after disconnect = %d, indegree=%d\n", uniq_after,
-         lg->indegree[dac]);
-  assert(uniq_after == lg->indegree[dac]);
+         lg->sched.indegree[dac]);
+  assert(uniq_after == lg->sched.indegree[dac]);
 
   // Process a block to ensure no scheduling deadlock (single-thread run)
   float out[128 * 2];

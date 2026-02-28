@@ -82,11 +82,11 @@ void test_sum_behavior() {
   printf("DEBUG: SUM inputs: [0]=%d, [1]=%d\n", sum_node->inEdgeId[0], sum_node->inEdgeId[1]);
   printf("DEBUG: SUM output: [0]=%d\n", sum_node->outEdgeId[0]);
   printf("DEBUG: Gain input after SUM: [0]=%d\n", lg->nodes[gain].inEdgeId[0]);
-  printf("DEBUG: SUM orphaned status: %s\n", lg->is_orphaned[sum_id] ? "ORPHANED" : "CONNECTED");
-  printf("DEBUG: SUM indegree: %d\n", lg->indegree[sum_id]);
+  printf("DEBUG: SUM orphaned status: %s\n", lg->sched.is_orphaned[sum_id] ? "ORPHANED" : "CONNECTED");
+  printf("DEBUG: SUM indegree: %d\n", lg->sched.indegree[sum_id]);
   printf("DEBUG: SUM vtable.process: %p\n", (void*)sum_node->vtable.process);
-  printf("DEBUG: Gain indegree after SUM: %d\n", lg->indegree[gain]);
-  printf("DEBUG: Gain orphaned status: %s\n", lg->is_orphaned[gain] ? "ORPHANED" : "CONNECTED");
+  printf("DEBUG: Gain indegree after SUM: %d\n", lg->sched.indegree[gain]);
+  printf("DEBUG: Gain orphaned status: %s\n", lg->sched.is_orphaned[gain] ? "ORPHANED" : "CONNECTED");
   printf("DEBUG: SUM succCount: %d\n", sum_node->succCount);
   if (sum_node->succCount > 0) {
     printf("DEBUG: SUM successor[0]: %d\n", sum_node->succ[0]);

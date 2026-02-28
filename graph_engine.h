@@ -10,8 +10,9 @@ typedef struct {
   float *buf;   // size = block_size
   int refcount; // number of input ports consuming this signal
   bool in_use;
-  int src_node; // who writes this edge
-  int src_port; // which output port
+  int src_node;  // who writes this edge
+  int src_port;  // which output port
+  int next_free; // free-list link (-1 = end of list; only valid when !in_use)
 } LiveEdge;
 
 typedef struct RTNode {
@@ -58,74 +59,64 @@ typedef struct RetireEntry {
 } RetireEntry;
 
 typedef struct LiveGraph {
+  // --- Node & edge storage ---
   RTNode *nodes;
   BufferDesc *buffers;
   int node_count, node_capacity, buffer_count, buffer_capacity;
-
-  // Dynamic edge pool (new port-based system)
-  LiveEdge *edges; // edge pool with refcounting
+  LiveEdge *edges;
   int edge_capacity;
+  int edge_free_head; // head of free-list threading through LiveEdge.next_free
   int block_size;
-
-  // Support buffers for port system
   float *silence_buf;  // zero buffer for unconnected inputs
   float *scratch_null; // throwaway buffer for unconnected outputs
 
-  // Orphaned nodes (have no inputs but aren't true sources)
-  bool *is_orphaned;
+  // --- DAG scheduling ---
+  struct {
+    atomic_int *pending;   // per-node remaining-predecessor count (reset each block)
+    int *indegree;         // maintained incrementally at edit time
+    bool *is_orphaned;     // nodes unreachable from DAC
+    ReadyQ *readyQueue;
+    _Atomic int jobsInFlight;
+    int32_t *source_nodes; // cached source node IDs (indegree=0, has outputs)
+    int source_count;
+    int source_capacity;
+    int cached_total_jobs;
+    bool has_cycle;
+    bool dirty;            // true when topology changed, triggers cache rebuild
+  } sched;
 
-  // Scheduling state (same as GraphState)
-  atomic_int *pending;
-  int *indegree;      // maintained incrementally at edits for port-based system
-  ReadyQ *readyQueue; // Ready queue with counting length and semaphore
-  _Atomic int jobsInFlight;
-
-  // Parameter mailbox
   ParamRing *params;
 
-  // DAC output sink - the final destination for all audio
-  int dac_node_id;  // -1 if no DAC connected
-  int num_channels; // Number of output channels (1=mono, 2=stereo, etc.)
-
+  int dac_node_id;
+  int num_channels;
   const char *label;
-
-  // Graph Edit Queue
   GraphEditQueue *graphEditQueue;
 
-  // one-block retire list (old states, optional wrappers)
-  RetireEntry *retire_list;
-  int retire_count;
-  int retire_capacity;
+  // --- Deferred cleanup (drained once per block) ---
+  struct {
+    RetireEntry *list;
+    int count;
+    int capacity;
+  } retire;
 
-  // Failed operation tracking
-  uint64_t *failed_ids;    // Array of node IDs that failed to create
-  int failed_ids_count;    // Number of failed IDs
-  int failed_ids_capacity; // Capacity of failed_ids array
+  // --- Failed operation tracking ---
+  uint64_t *failed_ids;
+  int failed_ids_count;
+  int failed_ids_capacity;
 
-  // Atomic node ID allocation
-  _Atomic int next_node_id; // Next node ID to allocate (thread-safe)
+  _Atomic int next_node_id;
+  _Atomic int next_buffer_id;
 
-  _Atomic int next_buffer_id; // Next buffer ID to allocate (thread-safe)
-
-  // Watch list system for state monitoring
-  int *watch_list;                  // Array of node IDs being watched
-  int watch_list_count;             // Current number of watched nodes
-  int watch_list_capacity;          // Allocated capacity for watch list
-  pthread_mutex_t watch_list_mutex; // Protects watch_list modifications
-
-  // Thread-safe state store for watched nodes
-  void **state_snapshots;            // Array of state copies indexed by node_id
-  size_t *state_sizes;               // Array of state sizes indexed by node_id
-  pthread_rwlock_t state_store_lock; // Reader-writer lock for state access
-
-  // === OPTIMIZATION: Cached scheduling metadata ===
-  // These are rebuilt only on topology changes, not every block
-  int32_t *source_nodes;    // Array of source node IDs (indegree=0, has outputs)
-  int source_count;         // Number of source nodes
-  int source_capacity;      // Allocated capacity for source_nodes
-  int cached_total_jobs;    // Pre-computed job count for the block
-  bool has_cycle;           // Cached cycle detection result
-  bool scheduling_dirty;    // True if topology changed, needs rebuild
+  // --- Watch list & state monitoring ---
+  struct {
+    int *list;
+    int count;
+    int capacity;
+    pthread_mutex_t mutex;
+    void **snapshots;        // state copies indexed by node_id
+    size_t *sizes;           // state sizes indexed by node_id
+    pthread_rwlock_t lock;
+  } watch;
 
 } LiveGraph;
 
@@ -251,70 +242,10 @@ int hot_swap_buffer(LiveGraph *lg, int buffer_id, const float *source_data,
 extern Engine g_engine;
 void initialize_engine(int block_size, int sample_rate);
 
-static bool ensure_port_arrays(RTNode *n) {
-  // Validate node before attempting memory allocation
-  if (!n || n->nInputs < 0 || n->nOutputs < 0) {
-    // Invalid node state - return failure
-    return false;
-  }
+// Allocate port arrays (inEdgeId, outEdgeId, fanin_sum_node_id) if not yet allocated.
+bool ensure_port_arrays(RTNode *n);
 
-  // Check for reasonable limits to prevent corruption-induced huge allocations
-  if (n->nInputs > 1000 || n->nOutputs > 1000) {
-    // Likely corrupted node - return failure
-    return false;
-  }
-
-  if (!n->inEdgeId && n->nInputs > 0) {
-    n->inEdgeId = (int32_t *)malloc(sizeof(int32_t) * n->nInputs);
-    if (!n->inEdgeId) {
-      // Malloc failed - this indicates deeper problems
-      return false;
-    }
-    for (int i = 0; i < n->nInputs; i++)
-      n->inEdgeId[i] = -1;
-  }
-
-  if (!n->outEdgeId && n->nOutputs > 0) {
-    n->outEdgeId = (int32_t *)malloc(sizeof(int32_t) * n->nOutputs);
-    if (!n->outEdgeId) {
-      // Malloc failed - this indicates deeper problems
-      return false;
-    }
-    for (int i = 0; i < n->nOutputs; i++)
-      n->outEdgeId[i] = -1;
-  }
-
-  if (!n->fanin_sum_node_id && n->nInputs > 0) {
-    n->fanin_sum_node_id = (int32_t *)malloc(sizeof(int32_t) * n->nInputs);
-    if (!n->fanin_sum_node_id) {
-      // Malloc failed - this is less critical but still indicates problems
-      return false;
-    }
-    for (int i = 0; i < n->nInputs; i++)
-      n->fanin_sum_node_id[i] = -1;
-  }
-
-  return true;
-}
-
-// Allocate (or reuse from pool) an edge buffer; returns edge id or -1
-static int alloc_edge(LiveGraph *lg) {
-  for (int i = 0; i < lg->edge_capacity; i++) {
-    if (!lg->edges[i].in_use) {
-      lg->edges[i].in_use = true;
-      lg->edges[i].refcount = 0;
-      lg->edges[i].src_node = -1;
-      lg->edges[i].src_port = -1;
-      // Allocate buffer if it was freed during retire_edge
-      if (!lg->edges[i].buf) {
-        lg->edges[i].buf = alloc_aligned(64, lg->block_size * sizeof(float));
-      }
-      // Zero buffer for safety
-      memset(lg->edges[i].buf, 0, sizeof(float) * lg->block_size);
-      return i;
-    }
-  }
-  return -1; // pool exhausted; grow in apply_graph_edits if you want
-}
+// Allocate (or reuse from pool) an edge buffer; returns edge id or -1.
+int alloc_edge(LiveGraph *lg);
 
 #endif // GRAPH_ENGINE_H

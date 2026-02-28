@@ -120,10 +120,10 @@ int main() {
   assert(apply_connect(lg, dup22, 0, dac, 0)); // creates auto-SUM on DAC:0
 
   // Validate orphan status pre-disconnect (none orphaned)
-  assert(!lg->is_orphaned[dac]);
-  assert(!lg->is_orphaned[src]);
-  assert(!lg->is_orphaned[pass]);
-  assert(!lg->is_orphaned[dup22]);
+  assert(!lg->sched.is_orphaned[dac]);
+  assert(!lg->sched.is_orphaned[src]);
+  assert(!lg->sched.is_orphaned[pass]);
+  assert(!lg->sched.is_orphaned[dup22]);
   printf("✓ Pre-disconnect: all nodes connected (no orphans)\n");
 
   // Process a block and verify with current wiring:
@@ -151,10 +151,10 @@ int main() {
   assert(apply_disconnect(lg, pass, 0, dac, 0));
 
   // After disconnect, orphaning should update automatically
-  assert(!lg->is_orphaned[dac]);
-  assert(!lg->is_orphaned[src]);
-  assert(!lg->is_orphaned[dup22]);
-  assert(lg->is_orphaned[pass]);
+  assert(!lg->sched.is_orphaned[dac]);
+  assert(!lg->sched.is_orphaned[src]);
+  assert(!lg->sched.is_orphaned[dup22]);
+  assert(lg->sched.is_orphaned[pass]);
   printf(
       "✓ Post-disconnect orphaning OK: pass is orphaned, others connected\n");
 

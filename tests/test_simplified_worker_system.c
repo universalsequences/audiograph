@@ -114,12 +114,12 @@ static int run_processing_test(LiveGraph *lg) {
 static int test_readyq_synchronization(LiveGraph *lg) {
     printf("\nTesting ReadyQ semaphore synchronization...\n");
     
-    if (!lg || !lg->readyQueue) {
+    if (!lg || !lg->sched.readyQueue) {
         printf("No ReadyQ available for testing\n");
         return -1;
     }
     
-    ReadyQ *rq = lg->readyQueue;
+    ReadyQ *rq = lg->sched.readyQueue;
     
     // Test 1: Empty queue should have length 0
     int qlen = atomic_load_explicit(&rq->qlen, memory_order_acquire);
@@ -181,8 +181,8 @@ static int test_job_processing_races(LiveGraph *lg) {
     
     for (int block = 0; block < 50; block++) {
         // Reset counters
-        int jobs_before = atomic_load_explicit(&lg->jobsInFlight, memory_order_acquire);
-        int queue_len_before = atomic_load_explicit(&lg->readyQueue->qlen, memory_order_acquire);
+        int jobs_before = atomic_load_explicit(&lg->sched.jobsInFlight, memory_order_acquire);
+        int queue_len_before = atomic_load_explicit(&lg->sched.readyQueue->qlen, memory_order_acquire);
         
         if (jobs_before != 0) {
             printf("WARNING: Block %d started with %d jobs in flight\n", block, jobs_before);
@@ -198,8 +198,8 @@ static int test_job_processing_races(LiveGraph *lg) {
         process_live_block(lg, TEST_BLOCK_SIZE);
         
         // Check final state
-        int jobs_after = atomic_load_explicit(&lg->jobsInFlight, memory_order_acquire);
-        int queue_len_after = atomic_load_explicit(&lg->readyQueue->qlen, memory_order_acquire);
+        int jobs_after = atomic_load_explicit(&lg->sched.jobsInFlight, memory_order_acquire);
+        int queue_len_after = atomic_load_explicit(&lg->sched.readyQueue->qlen, memory_order_acquire);
         
         if (jobs_after != 0) {
             printf("ERROR: Block %d ended with %d jobs in flight\n", block, jobs_after);

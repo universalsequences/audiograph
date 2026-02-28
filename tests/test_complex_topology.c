@@ -111,10 +111,10 @@ void test_complex_topology() {
 
   // Check initial indegrees
   printf("\nInitial indegrees:\n");
-  printf("Node 1 indegree: %d (expected: 0)\n", lg->indegree[node1]);
-  printf("Node 2 indegree: %d (expected: 0)\n", lg->indegree[node2]);
-  printf("Node 3 indegree: %d (expected: 0)\n", lg->indegree[node3]);
-  printf("DAC indegree: %d (expected: 0)\n", lg->indegree[lg->dac_node_id]);
+  printf("Node 1 indegree: %d (expected: 0)\n", lg->sched.indegree[node1]);
+  printf("Node 2 indegree: %d (expected: 0)\n", lg->sched.indegree[node2]);
+  printf("Node 3 indegree: %d (expected: 0)\n", lg->sched.indegree[node3]);
+  printf("DAC indegree: %d (expected: 0)\n", lg->sched.indegree[lg->dac_node_id]);
 
   printf("\n=== Phase 4: Creating Connections ===\n");
 
@@ -165,19 +165,19 @@ void test_complex_topology() {
 
   // Check final indegrees
   printf("Final indegrees:\n");
-  printf("Node 1 indegree: %d (expected: 0)\n", lg->indegree[node1]);
-  printf("Node 2 indegree: %d (expected: 1)\n", lg->indegree[node2]);
+  printf("Node 1 indegree: %d (expected: 0)\n", lg->sched.indegree[node1]);
+  printf("Node 2 indegree: %d (expected: 1)\n", lg->sched.indegree[node2]);
   printf("Node 3 indegree: %d (expected: 1 with auto-sum)\n",
-         lg->indegree[node3]);
+         lg->sched.indegree[node3]);
   printf("DAC indegree: %d (expected: 1 with auto-sum)\n",
-         lg->indegree[lg->dac_node_id]);
+         lg->sched.indegree[lg->dac_node_id]);
 
   // With auto-summing, destination nodes have indegree=1 (connected to SUM
   // node) The SUM nodes themselves have the multi-input indegrees
-  assert(lg->indegree[node1] == 0);
-  assert(lg->indegree[node2] == 1);
-  assert(lg->indegree[node3] == 1); // Connected to auto-generated SUM node
-  assert(lg->indegree[lg->dac_node_id] ==
+  assert(lg->sched.indegree[node1] == 0);
+  assert(lg->sched.indegree[node2] == 1);
+  assert(lg->sched.indegree[node3] == 1); // Connected to auto-generated SUM node
+  assert(lg->sched.indegree[lg->dac_node_id] ==
          1); // Connected to auto-generated SUM node
   printf("✓ All indegrees are correct (accounting for auto-sum behavior)\n");
 
@@ -208,10 +208,10 @@ void test_complex_topology() {
     printf("  ✓ SUM node %d created for Node 3 multi-input\n", sum_node);
     printf("  SUM node inputs: %d, outputs: %d\n", lg->nodes[sum_node].nInputs,
            lg->nodes[sum_node].nOutputs);
-    printf("  SUM node indegree: %d (should be 2)\n", lg->indegree[sum_node]);
+    printf("  SUM node indegree: %d (should be 2)\n", lg->sched.indegree[sum_node]);
 
     // Verify the SUM node has the correct indegree
-    assert(lg->indegree[sum_node] == 2);
+    assert(lg->sched.indegree[sum_node] == 2);
     printf("  ✓ SUM node indegree is correct\n");
   } else {
     printf("  ❌ No SUM node created - this is a bug!\n");
@@ -227,10 +227,10 @@ void test_complex_topology() {
     printf("  ✓ SUM node %d created for DAC multi-input\n", sum_node);
     printf("  SUM node inputs: %d, outputs: %d\n", lg->nodes[sum_node].nInputs,
            lg->nodes[sum_node].nOutputs);
-    printf("  SUM node indegree: %d (should be 2)\n", lg->indegree[sum_node]);
+    printf("  SUM node indegree: %d (should be 2)\n", lg->sched.indegree[sum_node]);
 
     // Verify the SUM node has the correct indegree
-    assert(lg->indegree[sum_node] == 2);
+    assert(lg->sched.indegree[sum_node] == 2);
     printf("  ✓ SUM node indegree is correct\n");
   } else {
     printf("  ❌ No SUM node created - this is a bug!\n");
@@ -276,16 +276,16 @@ void test_complex_topology() {
 
   // Check that no nodes are marked as orphaned (since all contribute to DAC)
   printf("Orphan status check:\n");
-  printf("Node 1 orphaned: %s\n", lg->is_orphaned[node1] ? "YES" : "NO");
-  printf("Node 2 orphaned: %s\n", lg->is_orphaned[node2] ? "YES" : "NO");
-  printf("Node 3 orphaned: %s\n", lg->is_orphaned[node3] ? "YES" : "NO");
-  printf("DAC orphaned: %s\n", lg->is_orphaned[lg->dac_node_id] ? "YES" : "NO");
+  printf("Node 1 orphaned: %s\n", lg->sched.is_orphaned[node1] ? "YES" : "NO");
+  printf("Node 2 orphaned: %s\n", lg->sched.is_orphaned[node2] ? "YES" : "NO");
+  printf("Node 3 orphaned: %s\n", lg->sched.is_orphaned[node3] ? "YES" : "NO");
+  printf("DAC orphaned: %s\n", lg->sched.is_orphaned[lg->dac_node_id] ? "YES" : "NO");
 
   // None should be orphaned since they all contribute to DAC output
-  assert(!lg->is_orphaned[node1]);
-  assert(!lg->is_orphaned[node2]);
-  assert(!lg->is_orphaned[node3]);
-  assert(!lg->is_orphaned[lg->dac_node_id]);
+  assert(!lg->sched.is_orphaned[node1]);
+  assert(!lg->sched.is_orphaned[node2]);
+  assert(!lg->sched.is_orphaned[node3]);
+  assert(!lg->sched.is_orphaned[lg->dac_node_id]);
   printf("✓ No nodes incorrectly marked as orphaned\n");
 
   // Check edge capacity (we don't have a count field, but can check capacity)
@@ -342,13 +342,13 @@ void test_complex_topology() {
     printf("  SUM node %d still exists\n", sum_node);
     printf("  SUM node inputs: %d, outputs: %d\n", lg->nodes[sum_node].nInputs,
            lg->nodes[sum_node].nOutputs);
-    printf("  SUM node indegree: %d\n", lg->indegree[sum_node]);
+    printf("  SUM node indegree: %d\n", lg->sched.indegree[sum_node]);
 
     // Check if SUM node should be removed (only 1 input remaining)
-    if (lg->indegree[sum_node] <= 1) {
+    if (lg->sched.indegree[sum_node] <= 1) {
       printf("  ⚠️  SUM node should potentially be removed (only %d input "
              "remaining)\n",
-             lg->indegree[sum_node]);
+             lg->sched.indegree[sum_node]);
     }
   } else {
     printf("  SUM node has been removed (fanin_sum_node_id = -1)\n");

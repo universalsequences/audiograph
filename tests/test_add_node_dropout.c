@@ -65,9 +65,9 @@ int main() {
     printf("\nInitial Graph State:\n");
     printf("  DAC node ID: %d\n", lg->dac_node_id);
     printf("  Node count: %d\n", lg->node_count);
-    printf("  num1 orphaned: %s\n", lg->is_orphaned[num1_id] ? "YES" : "NO");
-    printf("  num2 orphaned: %s\n", lg->is_orphaned[num2_id] ? "YES" : "NO");
-    printf("  DAC orphaned: %s\n", lg->is_orphaned[lg->dac_node_id] ? "YES" : "NO");
+    printf("  num1 orphaned: %s\n", lg->sched.is_orphaned[num1_id] ? "YES" : "NO");
+    printf("  num2 orphaned: %s\n", lg->sched.is_orphaned[num2_id] ? "YES" : "NO");
+    printf("  DAC orphaned: %s\n", lg->sched.is_orphaned[lg->dac_node_id] ? "YES" : "NO");
 
     // 3. Run process_next_block a few times and verify output
     float output_buffer[256];
@@ -163,10 +163,10 @@ int main() {
     
     printf("Graph state after adding unconnected node:\n");
     printf("  Node count: %d\n", lg->node_count);
-    printf("  num1 orphaned: %s\n", lg->is_orphaned[num1_id] ? "YES" : "NO");
-    printf("  num2 orphaned: %s\n", lg->is_orphaned[num2_id] ? "YES" : "NO");
-    printf("  num3 orphaned: %s (expected: YES)\n", lg->is_orphaned[num3_id] ? "YES" : "NO");
-    printf("  DAC orphaned: %s\n", lg->is_orphaned[lg->dac_node_id] ? "YES" : "NO");
+    printf("  num1 orphaned: %s\n", lg->sched.is_orphaned[num1_id] ? "YES" : "NO");
+    printf("  num2 orphaned: %s\n", lg->sched.is_orphaned[num2_id] ? "YES" : "NO");
+    printf("  num3 orphaned: %s (expected: YES)\n", lg->sched.is_orphaned[num3_id] ? "YES" : "NO");
+    printf("  DAC orphaned: %s\n", lg->sched.is_orphaned[lg->dac_node_id] ? "YES" : "NO");
 
     // 5. Run process_next_block and confirm output is still correct
     printf("\n=== Testing Audio After Adding Unconnected Node ===\n");
@@ -220,10 +220,10 @@ int main() {
     printf("✓ Called update_orphaned_status()\n");
     
     printf("Graph state after update_orphaned_status:\n");
-    printf("  num1 orphaned: %s\n", lg->is_orphaned[num1_id] ? "YES" : "NO");
-    printf("  num2 orphaned: %s\n", lg->is_orphaned[num2_id] ? "YES" : "NO");
-    printf("  num3 orphaned: %s (expected: YES)\n", lg->is_orphaned[num3_id] ? "YES" : "NO");
-    printf("  DAC orphaned: %s\n", lg->is_orphaned[lg->dac_node_id] ? "YES" : "NO");
+    printf("  num1 orphaned: %s\n", lg->sched.is_orphaned[num1_id] ? "YES" : "NO");
+    printf("  num2 orphaned: %s\n", lg->sched.is_orphaned[num2_id] ? "YES" : "NO");
+    printf("  num3 orphaned: %s (expected: YES)\n", lg->sched.is_orphaned[num3_id] ? "YES" : "NO");
+    printf("  DAC orphaned: %s\n", lg->sched.is_orphaned[lg->dac_node_id] ? "YES" : "NO");
     
     for (int block = 0; block < 2; block++) {
         memset(output_buffer, 0, sizeof(output_buffer));

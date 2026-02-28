@@ -246,7 +246,7 @@ bool apply_replace_keep_edges_internal(LiveGraph *lg, GEReplaceKeepEdges *p) {
     }
   }
   free(seen);
-  lg->indegree[id] = actual_unique_preds;
+  lg->sched.indegree[id] = actual_unique_preds;
 
   return true;
 }

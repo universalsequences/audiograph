@@ -27,130 +27,19 @@
 // ===================== Forward Declarations =====================
 
 void bind_and_run_live(LiveGraph *lg, int nid, int nframes);
-static bool ensure_port_arrays(RTNode *n);
 static void init_pending_and_seed(LiveGraph *lg);
-static int alloc_edge(LiveGraph *lg);
 void process_live_block(LiveGraph *lg, int nframes);
 static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes);
 static void wait_for_block_start_or_shutdown(void);
 
 // ===================== Global Engine Instance =====================
 
-Engine g_engine; // single global for demo
+Engine g_engine;
 
 // ===================== SUM Node Input Count Tracking =====================
 
 // Thread-local storage for current node being processed
 static __thread RTNode *g_current_processing_node = NULL;
-
-// Thread-local storage for per-node IO binding
-static __thread float **tls_node_inputs = NULL;
-static __thread float **tls_node_outputs = NULL;
-static __thread int tls_io_capacity = 0;
-
-// Thread-local scratch buffers for disconnected outputs (grow-on-demand)
-static __thread float **tls_out_scratch = NULL;
-static __thread size_t *tls_out_scratch_sizes = NULL;
-static __thread int tls_scratch_ports = 0;
-
-static bool ensure_tls_io_capacity(int needed_inputs, int needed_outputs) {
-  int required =
-      needed_inputs > needed_outputs ? needed_inputs : needed_outputs;
-  if (required <= tls_io_capacity)
-    return true;
-  if (required <= 0)
-    return true;
-
-  int new_cap = tls_io_capacity ? tls_io_capacity : MAX_IO;
-  while (new_cap < required) {
-    new_cap *= 2;
-  }
-  if (new_cap <= 0)
-    new_cap = required;
-
-  float **new_inputs = malloc((size_t)new_cap * sizeof(float *));
-  float **new_outputs = malloc((size_t)new_cap * sizeof(float *));
-  if (!new_inputs || !new_outputs) {
-    if (new_inputs)
-      free(new_inputs);
-    if (new_outputs)
-      free(new_outputs);
-    return false;
-  }
-
-  if (tls_node_inputs) {
-    memcpy(new_inputs, tls_node_inputs,
-           (size_t)tls_io_capacity * sizeof(float *));
-    free(tls_node_inputs);
-  }
-  if (tls_node_outputs) {
-    memcpy(new_outputs, tls_node_outputs,
-           (size_t)tls_io_capacity * sizeof(float *));
-    free(tls_node_outputs);
-  }
-  for (int i = tls_io_capacity; i < new_cap; ++i) {
-    new_inputs[i] = NULL;
-    new_outputs[i] = NULL;
-  }
-
-  tls_node_inputs = new_inputs;
-  tls_node_outputs = new_outputs;
-  tls_io_capacity = new_cap;
-  return true;
-}
-
-static inline float *get_tls_out_scratch(LiveGraph *lg, int port, int nframes) {
-  if (port < 0)
-    return lg ? lg->scratch_null : NULL;
-
-  if (port >= tls_scratch_ports) {
-    int new_ports = tls_scratch_ports ? tls_scratch_ports : MAX_IO;
-    while (new_ports <= port)
-      new_ports *= 2;
-
-    float **new_buffers = calloc((size_t)new_ports, sizeof(float *));
-    size_t *new_sizes = calloc((size_t)new_ports, sizeof(size_t));
-    if (!new_buffers || !new_sizes) {
-      if (new_buffers)
-        free(new_buffers);
-      if (new_sizes)
-        free(new_sizes);
-      return lg ? lg->scratch_null : NULL;
-    }
-
-    if (tls_out_scratch) {
-      memcpy(new_buffers, tls_out_scratch,
-             (size_t)tls_scratch_ports * sizeof(float *));
-      free(tls_out_scratch);
-    }
-    if (tls_out_scratch_sizes) {
-      memcpy(new_sizes, tls_out_scratch_sizes,
-             (size_t)tls_scratch_ports * sizeof(size_t));
-      free(tls_out_scratch_sizes);
-    }
-
-    tls_out_scratch = new_buffers;
-    tls_out_scratch_sizes = new_sizes;
-    tls_scratch_ports = new_ports;
-  }
-
-  if ((size_t)nframes > tls_out_scratch_sizes[port]) {
-    float *new_buf = aligned_alloc(64, (size_t)nframes * sizeof(float));
-    if (!new_buf) {
-      new_buf = malloc((size_t)nframes * sizeof(float));
-      if (!new_buf)
-        return lg ? lg->scratch_null : NULL;
-    }
-    if (tls_out_scratch[port]) {
-      free(tls_out_scratch[port]);
-    }
-    memset(new_buf, 0, (size_t)nframes * sizeof(float));
-    tls_out_scratch[port] = new_buf;
-    tls_out_scratch_sizes[port] = (size_t)nframes;
-  }
-
-  return tls_out_scratch[port];
-}
 
 int ap_current_node_ninputs(void) {
   if (g_current_processing_node) {
@@ -206,7 +95,7 @@ static void wait_for_block_start_or_shutdown(void) {
       break;
     LiveGraph *lg =
         atomic_load_explicit(&g_engine.workSession, memory_order_acquire);
-    if (lg && atomic_load_explicit(&lg->jobsInFlight, memory_order_acquire) > 0)
+    if (lg && atomic_load_explicit(&lg->sched.jobsInFlight, memory_order_acquire) > 0)
       break;
     pthread_cond_wait(&g_engine.sess_cv, &g_engine.sess_mtx);
   }
@@ -336,7 +225,7 @@ static void *worker_main(void *arg) {
           atomic_load_explicit(&g_engine.workSession, memory_order_acquire);
       if (cur != lg)
         break;
-      if (atomic_load_explicit(&lg->jobsInFlight, memory_order_acquire) == 0)
+      if (atomic_load_explicit(&lg->sched.jobsInFlight, memory_order_acquire) == 0)
         break;
 
       int32_t nid;
@@ -344,13 +233,13 @@ static void *worker_main(void *arg) {
       // Tiny spin to catch bursts without kernel call, then short timed wait
       bool got = false;
       for (int s = 0; s < 64; s++) {
-        if ((got = rq_try_pop(lg->readyQueue, &nid)))
+        if ((got = rq_try_pop(lg->sched.readyQueue, &nid)))
           break;
         cpu_relax(); // brief pause
       }
       if (!got) {
         // Queue appears empty; wait a very short time for a wake signal
-        (void)rq_wait_nonempty(lg->readyQueue, /*timeout_us=*/10);
+        (void)rq_wait_nonempty(lg->sched.readyQueue, /*timeout_us=*/10);
         continue;
       }
 
@@ -566,7 +455,7 @@ void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
   // treat deleted nodes as: no process fn AND no ports
   if (node->vtable.process == NULL && node->nInputs == 0 && node->nOutputs == 0)
     return;
-  if (lg->is_orphaned[nid]) // Node is orphaned
+  if (lg->sched.is_orphaned[nid]) // Node is orphaned
     return;
   if (node->nInputs < 0 || node->nOutputs < 0) // Invalid port counts
     return;
@@ -624,18 +513,18 @@ static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes) {
       if (succ < 0 || succ >= lg->node_count) {
         continue;
       }
-      if (lg->is_orphaned[succ]) {
+      if (lg->sched.is_orphaned[succ]) {
         continue;
       }
       // Use release on decrement to ensure buffer writes are visible to successor
-      if (atomic_fetch_sub_explicit(&lg->pending[succ], 1, memory_order_release) == 1) {
-        rq_push_or_spin(lg->readyQueue, succ);
+      if (atomic_fetch_sub_explicit(&lg->sched.pending[succ], 1, memory_order_release) == 1) {
+        rq_push_or_spin(lg->sched.readyQueue, succ);
       }
     }
   }
 
   // Relaxed is fine here - just a counter
-  atomic_fetch_sub_explicit(&lg->jobsInFlight, 1, memory_order_relaxed);
+  atomic_fetch_sub_explicit(&lg->sched.jobsInFlight, 1, memory_order_relaxed);
 }
 
 // Check if a node has any connected outputs (for scheduling)
@@ -663,64 +552,64 @@ static void rebuild_scheduling_cache(LiveGraph *lg) {
   for (int i = 0; i < lg->node_count; i++) {
     bool deleted = (lg->nodes[i].vtable.process == NULL &&
                     lg->nodes[i].nInputs == 0 && lg->nodes[i].nOutputs == 0);
-    if (deleted || lg->is_orphaned[i])
+    if (deleted || lg->sched.is_orphaned[i])
       continue;
 
     bool hasOut = node_has_any_output_connected(lg, i);
-    bool isSink = !hasOut && lg->indegree[i] > 0;
+    bool isSink = !hasOut && lg->sched.indegree[i] > 0;
 
     if (hasOut || isSink) {
       totalJobs++;
-      if (lg->indegree[i] == 0 && hasOut) {
+      if (lg->sched.indegree[i] == 0 && hasOut) {
         sourceCount++;
       }
     }
   }
 
   // Grow source_nodes array if needed
-  if (sourceCount > lg->source_capacity) {
-    int new_cap = lg->source_capacity;
+  if (sourceCount > lg->sched.source_capacity) {
+    int new_cap = lg->sched.source_capacity;
     while (new_cap < sourceCount)
       new_cap *= 2;
-    int32_t *new_sources = realloc(lg->source_nodes, new_cap * sizeof(int32_t));
+    int32_t *new_sources = realloc(lg->sched.source_nodes, new_cap * sizeof(int32_t));
     if (new_sources) {
-      lg->source_nodes = new_sources;
-      lg->source_capacity = new_cap;
+      lg->sched.source_nodes = new_sources;
+      lg->sched.source_capacity = new_cap;
     }
   }
 
   // Build source list
-  lg->source_count = 0;
+  lg->sched.source_count = 0;
   for (int i = 0; i < lg->node_count; i++) {
     bool deleted = (lg->nodes[i].vtable.process == NULL &&
                     lg->nodes[i].nInputs == 0 && lg->nodes[i].nOutputs == 0);
-    if (deleted || lg->is_orphaned[i])
+    if (deleted || lg->sched.is_orphaned[i])
       continue;
 
-    if (lg->indegree[i] == 0 && node_has_any_output_connected(lg, i)) {
-      if (lg->source_count < lg->source_capacity) {
-        lg->source_nodes[lg->source_count++] = i;
+    if (lg->sched.indegree[i] == 0 && node_has_any_output_connected(lg, i)) {
+      if (lg->sched.source_count < lg->sched.source_capacity) {
+        lg->sched.source_nodes[lg->sched.source_count++] = i;
       }
     }
   }
 
   // Detect cycles at topology-change time (not every block!)
-  lg->has_cycle = (totalJobs > 0 && lg->source_count == 0);
+  lg->sched.has_cycle = (totalJobs > 0 && lg->sched.source_count == 0);
 
-  lg->cached_total_jobs = totalJobs;
-  lg->scheduling_dirty = false;
+  lg->sched.cached_total_jobs = totalJobs;
+  lg->sched.dirty = false;
 }
 
 static void init_pending_and_seed(LiveGraph *lg) {
   // Rebuild cache if topology changed
-  if (lg->scheduling_dirty) {
+  if (lg->sched.dirty) {
     rebuild_scheduling_cache(lg);
   }
 
   // CRITICAL FIX: Properly reset/drain the ready queue to prevent stale node
   // IDs. Only drain if there might be stale items.
   int32_t dummy;
-  while (rq_try_pop(lg->readyQueue, &dummy)) {
+  while (rq_try_pop(lg->sched.readyQueue, &dummy)) {
     // Discard any stale items
   }
 
@@ -730,10 +619,10 @@ static void init_pending_and_seed(LiveGraph *lg) {
   for (int i = 0; i < lg->node_count; i++) {
     bool deleted = (lg->nodes[i].vtable.process == NULL &&
                     lg->nodes[i].nInputs == 0 && lg->nodes[i].nOutputs == 0);
-    if (deleted || lg->is_orphaned[i]) {
-      atomic_store_explicit(&lg->pending[i], -1, memory_order_relaxed);
+    if (deleted || lg->sched.is_orphaned[i]) {
+      atomic_store_explicit(&lg->sched.pending[i], -1, memory_order_relaxed);
     } else {
-      atomic_store_explicit(&lg->pending[i], lg->indegree[i], memory_order_relaxed);
+      atomic_store_explicit(&lg->sched.pending[i], lg->sched.indegree[i], memory_order_relaxed);
     }
   }
 
@@ -742,24 +631,24 @@ static void init_pending_and_seed(LiveGraph *lg) {
 
   // Seed ready queue from cached source list - O(sources) instead of O(n)
   // Use batch push to reduce semaphore signals from O(sources) to O(1)
-  rq_push_batch(lg->readyQueue, lg->source_nodes, lg->source_count);
+  rq_push_batch(lg->sched.readyQueue, lg->sched.source_nodes, lg->sched.source_count);
 
-  atomic_store_explicit(&lg->jobsInFlight, lg->cached_total_jobs,
+  atomic_store_explicit(&lg->sched.jobsInFlight, lg->sched.cached_total_jobs,
                         memory_order_release);
 }
 
 bool detect_cycle(LiveGraph *lg) {
   // Use cached result if available
-  if (!lg->scheduling_dirty) {
-    return lg->has_cycle;
+  if (!lg->sched.dirty) {
+    return lg->sched.has_cycle;
   }
   // Fallback to full computation (shouldn't happen in hot path)
   int reachable = 0, zero_in = 0;
   for (int i = 0; i < lg->node_count; i++) {
-    if (atomic_load_explicit(&lg->pending[i], memory_order_relaxed) < 0)
+    if (atomic_load_explicit(&lg->sched.pending[i], memory_order_relaxed) < 0)
       continue; // orphan/deleted
     reachable++;
-    if (lg->indegree[i] == 0 && node_has_any_output_connected(lg, i))
+    if (lg->sched.indegree[i] == 0 && node_has_any_output_connected(lg, i))
       zero_in++;
   }
   return (reachable > 0 && zero_in == 0);
@@ -767,10 +656,10 @@ bool detect_cycle(LiveGraph *lg) {
 
 // Call at the end of process_live_block (after all work done)
 static void drain_retire_list(LiveGraph *lg) {
-  for (int i = 0; i < lg->retire_count; i++) {
-    lg->retire_list[i].deleter(lg->retire_list[i].ptr);
+  for (int i = 0; i < lg->retire.count; i++) {
+    lg->retire.list[i].deleter(lg->retire.list[i].ptr);
   }
-  lg->retire_count = 0;
+  lg->retire.count = 0;
 }
 
 static void update_watched_node_states(LiveGraph *lg);
@@ -794,7 +683,7 @@ void process_live_block(LiveGraph *lg, int nframes) {
   }
 
   // check if no work to be done
-  if (atomic_load_explicit(&lg->jobsInFlight, memory_order_acquire) <= 0) {
+  if (atomic_load_explicit(&lg->sched.jobsInFlight, memory_order_acquire) <= 0) {
     update_watched_node_states(lg);
     return;
   }
@@ -813,14 +702,14 @@ void process_live_block(LiveGraph *lg, int nframes) {
     // Audio thread helps do some work
     int32_t nid;
     int empty_spins = 0;
-    while (atomic_load_explicit(&lg->jobsInFlight, memory_order_acquire) > 0) {
-      if (rq_try_pop(lg->readyQueue, &nid)) {
+    while (atomic_load_explicit(&lg->sched.jobsInFlight, memory_order_acquire) > 0) {
+      if (rq_try_pop(lg->sched.readyQueue, &nid)) {
         execute_and_fanout(lg, nid, nframes);
         empty_spins = 0; // Reset on successful work
       } else {
         // Queue empty but work in flight - workers processing
         // Check again if work completed (avoids unnecessary spins)
-        if (atomic_load_explicit(&lg->jobsInFlight, memory_order_acquire) == 0)
+        if (atomic_load_explicit(&lg->sched.jobsInFlight, memory_order_acquire) == 0)
           break;
         cpu_relax();
         // After many empty spins, yield to reduce CPU burn
@@ -836,7 +725,7 @@ void process_live_block(LiveGraph *lg, int nframes) {
   } else {
     // Single-thread fallback
     int32_t nid;
-    while (rq_try_pop(lg->readyQueue, &nid)) {
+    while (rq_try_pop(lg->sched.readyQueue, &nid)) {
       execute_and_fanout(lg, nid, nframes);
     }
   }
@@ -927,23 +816,23 @@ void process_next_block(LiveGraph *lg, float *output_buffer, int nframes) {
 }
 
 static void update_watched_node_states(LiveGraph *lg) {
-  if (!lg || lg->watch_list_count == 0) {
+  if (!lg || lg->watch.count == 0) {
     return;
   }
 
   // Atomically fetch current watchlist
-  pthread_mutex_lock(&lg->watch_list_mutex);
-  int watch_count = lg->watch_list_count;
+  pthread_mutex_lock(&lg->watch.mutex);
+  int watch_count = lg->watch.count;
   int *watch_nodes = malloc(watch_count * sizeof(int));
   if (!watch_nodes) {
-    pthread_mutex_unlock(&lg->watch_list_mutex);
+    pthread_mutex_unlock(&lg->watch.mutex);
     return;
   }
-  memcpy(watch_nodes, lg->watch_list, watch_count * sizeof(int));
-  pthread_mutex_unlock(&lg->watch_list_mutex);
+  memcpy(watch_nodes, lg->watch.list, watch_count * sizeof(int));
+  pthread_mutex_unlock(&lg->watch.mutex);
 
   // Update state snapshots for watched nodes
-  pthread_rwlock_wrlock(&lg->state_store_lock);
+  pthread_rwlock_wrlock(&lg->watch.lock);
 
   for (int i = 0; i < watch_count; i++) {
     int node_id = watch_nodes[i];
@@ -960,25 +849,25 @@ static void update_watched_node_states(LiveGraph *lg) {
 
     // Reuse existing snapshot buffer if size matches; avoid per-block
     // malloc/free
-    if (lg->state_snapshots[node_id] &&
-        lg->state_sizes[node_id] == node->state_size) {
-      memcpy(lg->state_snapshots[node_id], node->state, node->state_size);
+    if (lg->watch.snapshots[node_id] &&
+        lg->watch.sizes[node_id] == node->state_size) {
+      memcpy(lg->watch.snapshots[node_id], node->state, node->state_size);
     } else {
       // Size changed or no buffer yet; (re)allocate
-      if (lg->state_snapshots[node_id]) {
-        free(lg->state_snapshots[node_id]);
-        lg->state_snapshots[node_id] = NULL;
-        lg->state_sizes[node_id] = 0;
+      if (lg->watch.snapshots[node_id]) {
+        free(lg->watch.snapshots[node_id]);
+        lg->watch.snapshots[node_id] = NULL;
+        lg->watch.sizes[node_id] = 0;
       }
       void *snapshot = malloc(node->state_size);
       if (snapshot) {
         memcpy(snapshot, node->state, node->state_size);
-        lg->state_snapshots[node_id] = snapshot;
-        lg->state_sizes[node_id] = node->state_size;
+        lg->watch.snapshots[node_id] = snapshot;
+        lg->watch.sizes[node_id] = node->state_size;
       }
     }
   }
 
-  pthread_rwlock_unlock(&lg->state_store_lock);
+  pthread_rwlock_unlock(&lg->watch.lock);
   free(watch_nodes);
 }
