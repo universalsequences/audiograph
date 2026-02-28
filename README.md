@@ -310,4 +310,4 @@ The test suite includes 29 test binaries covering:
 
 ## License
 
-GPL v3 — see [COPYING](COPYING).
+MIT — see [COPYING](COPYING).
