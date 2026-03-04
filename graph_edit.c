@@ -1380,22 +1380,20 @@ bool apply_connect_internal(LiveGraph *lg, int src_node, int src_port,
     // Case 2 or 3: Already has a producer → use/create SUM(D, dst_port)
     int sum_id = D->fanin_sum_node_id[dst_port];
     if (sum_id == -1) {
-      // Case 2: Create SUM with 2 inputs - find a free node slot (only in used
-      // range)
-      int free_id = -1;
-      for (int i = 0; i < lg->node_count; i++) {
-        if (lg->nodes[i].vtable.process == NULL && lg->nodes[i].nInputs == 0 &&
-            lg->nodes[i].nOutputs == 0) {
-          free_id = i;
-          break;
-        }
-      }
-      if (free_id == -1) {
-        free_id = atomic_fetch_add(&lg->next_node_id, 1);
-      }
+      // Case 2: Create SUM with 2 inputs - allocate a fresh node ID.
+      // NOTE: We must NOT scan for "free" slots in the existing node array,
+      // because queued GE_ADD_NODE commands may have pre-allocated IDs for
+      // slots that appear empty (zeroed by calloc) but are about to be
+      // populated. Reusing such a slot would cause the SUM to be overwritten
+      // when the queued add_node is processed later in the same drain.
+      int free_id = atomic_fetch_add(&lg->next_node_id, 1);
       sum_id = apply_add_node(lg, SUM_VTABLE, 0, free_id, "SUM", 2, 1, NULL);
       if (sum_id < 0)
         return false;
+      // Re-derive S, D after apply_add_node: it may call grow_node_capacity
+      // which reallocates lg->nodes, invalidating earlier pointers.
+      S = &lg->nodes[src_node];
+      D = &lg->nodes[dst_node];
       RTNode *SUM = &lg->nodes[sum_id];
       if (!is_node_valid(lg, sum_id) || !ensure_port_arrays(SUM)) {
         return false;
