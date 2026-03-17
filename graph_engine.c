@@ -31,10 +31,19 @@ static void init_pending_and_seed(LiveGraph *lg);
 void process_live_block(LiveGraph *lg, int nframes);
 static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes);
 static void wait_for_block_start_or_shutdown(void);
+static void rebuild_invalid_io_caches(LiveGraph *lg, int nframes);
 
 // ===================== Global Engine Instance =====================
 
 Engine g_engine;
+
+static bool using_inline_in_cache(const RTNode *node) {
+  return node->cached_inPtrs == (float **)node->cached_inInline;
+}
+
+static bool using_inline_out_cache(const RTNode *node) {
+  return node->cached_outPtrs == (float **)node->cached_outInline;
+}
 
 // ===================== SUM Node Input Count Tracking =====================
 
@@ -62,6 +71,19 @@ void initialize_engine(int block_Size, int sample_rate) {
 
 // ===================== Parameter Application =====================
 
+#define DGEN_HEADER_SLOTS 4
+#define DGEN_CANARY_INDEX 2
+#define DGEN_HEADER_CANARY_BITS 0x4cd35a1dU
+#define DGEN_STATE_REDZONE_SLOTS 256
+
+static inline bool has_dgen_header_canary(const float *memory) {
+  union {
+    float f;
+    uint32_t u;
+  } bits = {.f = memory[DGEN_CANARY_INDEX]};
+  return bits.u == DGEN_HEADER_CANARY_BITS;
+}
+
 void apply_params(LiveGraph *g) {
   if (!g || !g->params)
     return;
@@ -75,6 +97,17 @@ void apply_params(LiveGraph *g) {
       if (node->state && node->logical_id == m.logical_id) {
         float *memory = (float *)node->state;
         memory[m.idx] = m.fvalue;
+        if (m.idx >= DGEN_HEADER_SLOTS && has_dgen_header_canary(memory)) {
+          int total_slots = (int)memory[1];
+          if (total_slots > 0) {
+            int write_base = DGEN_HEADER_SLOTS + total_slots + DGEN_STATE_REDZONE_SLOTS;
+            int mirrored_idx = write_base + (m.idx - DGEN_HEADER_SLOTS);
+            int state_slots = (int)(node->state_size / sizeof(float));
+            if (mirrored_idx >= 0 && mirrored_idx < state_slots) {
+              memory[mirrored_idx] = m.fvalue;
+            }
+          }
+        }
       }
     }
   }
@@ -410,16 +443,24 @@ static void rebuild_node_io_cache(LiveGraph *lg, RTNode *node, int nframes) {
   // Reallocate cached pointer arrays if size changed
   // This handles cases where SUM nodes grow their input count
   if (node->nInputs > 0) {
-    if (node->cached_inPtrs) {
+    if (node->cached_inPtrs && !using_inline_in_cache(node)) {
       free(node->cached_inPtrs);
     }
-    node->cached_inPtrs = malloc(node->nInputs * sizeof(float *));
+    if (node->nInputs <= MAX_IO) {
+      node->cached_inPtrs = (float **)node->cached_inInline;
+    } else {
+      node->cached_inPtrs = malloc(node->nInputs * sizeof(float *));
+    }
   }
   if (node->nOutputs > 0) {
-    if (node->cached_outPtrs) {
+    if (node->cached_outPtrs && !using_inline_out_cache(node)) {
       free(node->cached_outPtrs);
     }
-    node->cached_outPtrs = malloc(node->nOutputs * sizeof(float *));
+    if (node->nOutputs <= MAX_IO) {
+      node->cached_outPtrs = (float **)node->cached_outInline;
+    } else {
+      node->cached_outPtrs = malloc(node->nOutputs * sizeof(float *));
+    }
   }
 
   // Resolve input pointers
@@ -449,6 +490,19 @@ static void rebuild_node_io_cache(LiveGraph *lg, RTNode *node, int nframes) {
   node->io_cache_valid = true;
 }
 
+static void rebuild_invalid_io_caches(LiveGraph *lg, int nframes) {
+  for (int i = 0; i < lg->node_count; i++) {
+    RTNode *node = &lg->nodes[i];
+    bool deleted = (node->vtable.process == NULL && node->nInputs == 0 &&
+                    node->nOutputs == 0);
+    if (deleted)
+      continue;
+    if (!node->io_cache_valid) {
+      rebuild_node_io_cache(lg, node, nframes);
+    }
+  }
+}
+
 void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
   RTNode *node = &lg->nodes[nid];
 
@@ -462,23 +516,48 @@ void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
 
   // Set thread-local context for SUM nodes to access input count
   g_current_processing_node = node;
+  float *in_stack[32];
+  float *out_stack[32];
+  float **inPtrs = NULL;
+  float **outPtrs = NULL;
+  bool free_inPtrs = false;
+  bool free_outPtrs = false;
 
-  // === OPTIMIZATION: Use pre-cached IO pointers ===
-  // Only rebuild if cache is invalid (topology changed)
-  if (!node->io_cache_valid) {
-    rebuild_node_io_cache(lg, node, nframes);
+  if (node->nInputs > 0) {
+    if (node->nInputs <= 32) {
+      inPtrs = in_stack;
+    } else {
+      inPtrs = malloc(node->nInputs * sizeof(float *));
+      if (!inPtrs) {
+        g_current_processing_node = NULL;
+        return;
+      }
+      free_inPtrs = true;
+    }
+    for (int i = 0; i < node->nInputs; i++) {
+      inPtrs[i] = node->cached_inPtrs[i];
+    }
   }
 
-  // Use cached pointers directly - no per-block loops!
-  float **inPtrs = node->cached_inPtrs;
-  float **outPtrs = node->cached_outPtrs;
-
-  // Fallback to silence/scratch if no cached pointers (shouldn't happen)
-  if (!inPtrs && node->nInputs > 0) {
-    inPtrs = &lg->silence_buf;  // Single pointer fallback
-  }
-  if (!outPtrs && node->nOutputs > 0) {
-    outPtrs = &lg->scratch_null;
+  if (node->nOutputs > 0) {
+    if (node->nOutputs <= 32) {
+      outPtrs = out_stack;
+    } else {
+      outPtrs = malloc(node->nOutputs * sizeof(float *));
+      if (!outPtrs) {
+        g_current_processing_node = NULL;
+        return;
+      }
+      free_outPtrs = true;
+    }
+    for (int i = 0; i < node->nOutputs; i++) {
+      int eid = node->outEdgeId ? node->outEdgeId[i] : -1;
+      if (eid >= 0 && eid < lg->edge_capacity && lg->edges[eid].buf) {
+        outPtrs[i] = lg->edges[eid].buf;
+      } else {
+        outPtrs[i] = lg->scratch_null;
+      }
+    }
   }
 
   if (node->vtable.process) {
@@ -488,6 +567,12 @@ void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
 
   // Clear thread-local context
   g_current_processing_node = NULL;
+  if (free_inPtrs) {
+    free(inPtrs);
+  }
+  if (free_outPtrs) {
+    free(outPtrs);
+  }
 }
 
 
@@ -523,8 +608,10 @@ static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes) {
     }
   }
 
-  // Relaxed is fine here - just a counter
-  atomic_fetch_sub_explicit(&lg->sched.jobsInFlight, 1, memory_order_relaxed);
+  // Publish this node's output writes before signaling global block completion.
+  // The audio thread waits on jobsInFlight with acquire loads, so the final
+  // transition to zero must carry release semantics.
+  atomic_fetch_sub_explicit(&lg->sched.jobsInFlight, 1, memory_order_release);
 }
 
 // Check if a node has any connected outputs (for scheduling)
@@ -720,6 +807,11 @@ void process_live_block(LiveGraph *lg, int nframes) {
       }
     }
 
+    // Paired with the release decrement in execute_and_fanout so downstream
+    // consumers (DAC copy, watch snapshots, retire list) see completed node
+    // writes from all worker threads.
+    atomic_thread_fence(memory_order_acquire);
+
     // Clear session
     atomic_store_explicit(&g_engine.workSession, NULL, memory_order_release);
   } else {
@@ -752,7 +844,12 @@ void process_next_block(LiveGraph *lg, float *output_buffer, int nframes) {
     return;
   }
 
-  apply_graph_edits(lg->graphEditQueue, lg);
+  if (atomic_load_explicit(&lg->edit_batch_depth, memory_order_acquire) == 0) {
+    apply_graph_edits(lg->graphEditQueue, lg);
+    if (lg->sched.dirty) {
+      rebuild_invalid_io_caches(lg, lg->block_size);
+    }
+  }
 
   apply_params(lg);
 

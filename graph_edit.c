@@ -3,6 +3,16 @@
 #include "hot_swap.h"
 #include <assert.h>
 
+#define EDGE_BUFFER_PAD_FLOATS 64
+
+static bool using_inline_in_cache(const RTNode *node) {
+  return node->cached_inPtrs == (float **)node->cached_inInline;
+}
+
+static bool using_inline_out_cache(const RTNode *node) {
+  return node->cached_outPtrs == (float **)node->cached_outInline;
+}
+
 // ===================== Port & Edge Allocation =====================
 
 bool ensure_port_arrays(RTNode *n) {
@@ -52,9 +62,11 @@ int alloc_edge(LiveGraph *lg) {
   lg->edges[i].src_port = -1;
   lg->edges[i].next_free = -1;
   if (!lg->edges[i].buf) {
-    lg->edges[i].buf = alloc_aligned(64, lg->block_size * sizeof(float));
+    lg->edges[i].buf = alloc_aligned(
+        64, (lg->block_size + EDGE_BUFFER_PAD_FLOATS) * sizeof(float));
   }
-  memset(lg->edges[i].buf, 0, sizeof(float) * lg->block_size);
+  memset(lg->edges[i].buf, 0,
+         sizeof(float) * (lg->block_size + EDGE_BUFFER_PAD_FLOATS));
   return i;
 }
 
@@ -64,7 +76,8 @@ static void retire_edge(LiveGraph *lg, int eid) {
   if (eid < 0 || eid >= lg->edge_capacity)
     return;
   if (lg->edges[eid].buf) {
-    memset(lg->edges[eid].buf, 0, sizeof(float) * lg->block_size);
+    memset(lg->edges[eid].buf, 0,
+           sizeof(float) * (lg->block_size + EDGE_BUFFER_PAD_FLOATS));
     free(lg->edges[eid].buf);
     lg->edges[eid].buf = NULL;
   }
@@ -189,6 +202,7 @@ static inline void indegree_dec_on_last_pred(LiveGraph *lg, int src, int dst) {
 bool apply_delete_node_internal(LiveGraph *lg, int node_id);
 static bool apply_add_watchlist(LiveGraph *lg, int node_id);
 static bool apply_remove_watchlist(LiveGraph *lg, int node_id);
+static bool grow_node_capacity(LiveGraph *lg, int required_capacity);
 
 // Internal version that skips update_orphaned_status for batched operations
 static bool apply_add_watchlist_internal(LiveGraph *lg, int node_id) {
@@ -496,11 +510,31 @@ bool apply_hotswap_buffer(LiveGraph *lg, int buffer_id, int new_size,
 // to be called from block-boundary (i.e. before each block is executed)
 bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
   GraphEditCmd cmd;
+  GraphEditCmd next_cmd;
 
   bool all_ok = true;
   bool needs_orphan_update = false;
+  int reserved_node_id =
+      atomic_load_explicit(&lg->next_node_id, memory_order_acquire) - 1;
 
-  while (geq_pop(r, &cmd)) {
+  if (reserved_node_id >= lg->node_capacity &&
+      !grow_node_capacity(lg, reserved_node_id)) {
+    return false;
+  }
+
+  while (true) {
+    uint64_t committed_batch_serial = atomic_load_explicit(
+        &lg->committed_edit_batch_serial, memory_order_acquire);
+    if (!geq_peek(r, &next_cmd)) {
+      break;
+    }
+    if (next_cmd.batch_serial != 0 &&
+        next_cmd.batch_serial > committed_batch_serial) {
+      break;
+    }
+    if (!geq_pop(r, &cmd)) {
+      break;
+    }
     bool ok = true;
     bool topology_changed = false;
 
@@ -513,6 +547,7 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
                                cmd.u.add_node.nInputs, cmd.u.add_node.nOutputs,
                                cmd.u.add_node.initial_state);
       ok = nid >= 0;
+      topology_changed = ok;
       if (!ok) {
         // Track the failed logical ID
         add_failed_id(lg, cmd.u.add_node.logical_id);
@@ -739,12 +774,6 @@ bool apply_disconnect_internal(LiveGraph *lg, int src_node, int src_port,
       D->fanin_sum_node_id[dst_port] = -1;
       indegree_dec_on_last_pred(lg, sum_id, dst_node);
 
-      // Retire SUM's output edge
-      int sum_out = SUM->outEdgeId[0];
-      if (sum_out >= 0) {
-        retire_edge(lg, sum_out);
-      }
-
       // Delete the SUM node (use internal to avoid nested orphan updates)
       apply_delete_node_internal(lg, sum_id);
     } else if (SUM->nInputs == 1) {
@@ -769,11 +798,14 @@ bool apply_disconnect_internal(LiveGraph *lg, int src_node, int src_port,
       // Ensure buffer is allocated and valid
       if (!lg->edges[direct_eid].buf) {
         lg->edges[direct_eid].buf =
-            alloc_aligned(64, lg->block_size * sizeof(float));
+            alloc_aligned(64, (lg->block_size + EDGE_BUFFER_PAD_FLOATS) *
+                                  sizeof(float));
         if (!lg->edges[direct_eid].buf) {
           retire_edge(lg, direct_eid);
           return false;
         }
+        memset(lg->edges[direct_eid].buf, 0,
+               sizeof(float) * (lg->block_size + EDGE_BUFFER_PAD_FLOATS));
       }
 
       // Connect destination to new edge
@@ -958,6 +990,8 @@ bool apply_delete_node_internal(LiveGraph *lg, int node_id) {
       if (edge_id < 0)
         continue; // Port not connected
 
+      int cleared_consumers = 0;
+
       // Find and clear destination nodes' input ports that consume this output
       for (int dst_node = 0; dst_node < lg->node_count; dst_node++) {
         if (dst_node == node_id)
@@ -970,16 +1004,19 @@ bool apply_delete_node_internal(LiveGraph *lg, int node_id) {
           if (dst->inEdgeId[dst_port] == edge_id) {
             // Clear the destination's input port
             dst->inEdgeId[dst_port] = -1;
+            cleared_consumers++;
             // Mark this destination as touched (don't decrement yet)
             touched[dst_node] = true;
           }
         }
       }
 
-      // Decrease edge refcount and retire if zero
+      // Decrease edge refcount once per cleared consumer and retire if zero
       LiveEdge *e = &lg->edges[edge_id];
-      if (e->refcount > 0)
+      while (cleared_consumers > 0 && e->refcount > 0) {
         e->refcount--;
+        cleared_consumers--;
+      }
       if (e->refcount == 0) {
         retire_edge(lg, edge_id);
       }
@@ -1031,11 +1068,15 @@ bool apply_delete_node_internal(LiveGraph *lg, int node_id) {
 
   // Free cached IO pointers
   if (node->cached_inPtrs) {
-    free(node->cached_inPtrs);
+    if (!using_inline_in_cache(node)) {
+      free(node->cached_inPtrs);
+    }
     node->cached_inPtrs = NULL;
   }
   if (node->cached_outPtrs) {
-    free(node->cached_outPtrs);
+    if (!using_inline_out_cache(node)) {
+      free(node->cached_outPtrs);
+    }
     node->cached_outPtrs = NULL;
   }
   node->io_cache_valid = false;
@@ -1067,20 +1108,22 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
   }
 
   int old_capacity = lg->node_capacity;
+  int new_source_capacity = lg->sched.source_capacity;
+  while (new_source_capacity < new_capacity) {
+    new_source_capacity *= 2;
+  }
 
   // Allocate new arrays (don't use realloc to avoid partial corruption)
   RTNode *new_nodes = malloc(new_capacity * sizeof(RTNode));
-
   int *new_indegree = malloc(new_capacity * sizeof(int));
-
   bool *new_orphaned = malloc(new_capacity * sizeof(bool));
-
   atomic_int *new_pending = calloc(new_capacity, sizeof(atomic_int));
   void **new_state_snapshots = calloc(new_capacity, sizeof(void *));
   size_t *new_state_sizes = calloc(new_capacity, sizeof(size_t));
+  int32_t *new_source_nodes = malloc(new_source_capacity * sizeof(int32_t));
 
   if (!new_nodes || !new_pending || !new_indegree || !new_orphaned ||
-      !new_state_snapshots || !new_state_sizes) {
+      !new_state_snapshots || !new_state_sizes || !new_source_nodes) {
     // Clean up any successful allocations
     if (new_nodes)
       free(new_nodes);
@@ -1094,6 +1137,8 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
       free(new_state_snapshots);
     if (new_state_sizes)
       free(new_state_sizes);
+    if (new_source_nodes)
+      free(new_source_nodes);
     return false;
   }
 
@@ -1117,26 +1162,35 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
     RTNode *new_node = &new_nodes[i];
 
     if (old_node->nInputs > 0 && old_node->inEdgeId) {
-      new_node->inEdgeId = malloc(old_node->nInputs * sizeof(int));
+      new_node->inEdgeId = malloc(old_node->nInputs * sizeof(int32_t));
+      if (!new_node->inEdgeId)
+        goto fail;
       memcpy(new_node->inEdgeId, old_node->inEdgeId,
-             old_node->nInputs * sizeof(int));
+             old_node->nInputs * sizeof(int32_t));
     }
 
     if (old_node->nOutputs > 0 && old_node->outEdgeId) {
-      new_node->outEdgeId = malloc(old_node->nOutputs * sizeof(int));
+      new_node->outEdgeId = malloc(old_node->nOutputs * sizeof(int32_t));
+      if (!new_node->outEdgeId)
+        goto fail;
       memcpy(new_node->outEdgeId, old_node->outEdgeId,
-             old_node->nOutputs * sizeof(int));
+             old_node->nOutputs * sizeof(int32_t));
     }
 
     if (old_node->nInputs > 0 && old_node->fanin_sum_node_id) {
-      new_node->fanin_sum_node_id = malloc(old_node->nInputs * sizeof(int));
+      new_node->fanin_sum_node_id = malloc(old_node->nInputs * sizeof(int32_t));
+      if (!new_node->fanin_sum_node_id)
+        goto fail;
       memcpy(new_node->fanin_sum_node_id, old_node->fanin_sum_node_id,
-             old_node->nInputs * sizeof(int));
+             old_node->nInputs * sizeof(int32_t));
     }
 
     if (old_node->succCount > 0 && old_node->succ) {
-      new_node->succ = malloc(old_node->succCount * sizeof(int));
-      memcpy(new_node->succ, old_node->succ, old_node->succCount * sizeof(int));
+      new_node->succ = malloc(old_node->succCount * sizeof(int32_t));
+      if (!new_node->succ)
+        goto fail;
+      memcpy(new_node->succ, old_node->succ,
+             old_node->succCount * sizeof(int32_t));
     }
   }
 
@@ -1147,6 +1201,10 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
            old_capacity * sizeof(void *));
   if (lg->watch.sizes)
     memcpy(new_state_sizes, lg->watch.sizes, old_capacity * sizeof(size_t));
+  if (lg->sched.source_nodes && lg->sched.source_count > 0) {
+    memcpy(new_source_nodes, lg->sched.source_nodes,
+           lg->sched.source_count * sizeof(int32_t));
+  }
 
   // Copy existing atomic values
   for (int i = 0; i < old_capacity; i++) {
@@ -1178,9 +1236,9 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
       free(old_node->fanin_sum_node_id);
     if (old_node->succ)
       free(old_node->succ);
-    if (old_node->cached_inPtrs)
+    if (old_node->cached_inPtrs && !using_inline_in_cache(old_node))
       free(old_node->cached_inPtrs);
-    if (old_node->cached_outPtrs)
+    if (old_node->cached_outPtrs && !using_inline_out_cache(old_node))
       free(old_node->cached_outPtrs);
   }
   free(lg->nodes);
@@ -1199,9 +1257,29 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
   lg->sched.is_orphaned = new_orphaned;
   lg->watch.snapshots = new_state_snapshots;
   lg->watch.sizes = new_state_sizes;
+  free(lg->sched.source_nodes);
+  lg->sched.source_nodes = new_source_nodes;
+  lg->sched.source_capacity = new_source_capacity;
   lg->node_capacity = new_capacity;
+  lg->sched.dirty = true;
 
   return true;
+
+fail:
+  for (int i = 0; i < old_capacity; i++) {
+    free(new_nodes[i].inEdgeId);
+    free(new_nodes[i].outEdgeId);
+    free(new_nodes[i].fanin_sum_node_id);
+    free(new_nodes[i].succ);
+  }
+  free(new_nodes);
+  free(new_indegree);
+  free(new_orphaned);
+  free(new_pending);
+  free(new_state_snapshots);
+  free(new_state_sizes);
+  free(new_source_nodes);
+  return false;
 }
 
 int apply_add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
@@ -1390,8 +1468,9 @@ bool apply_connect_internal(LiveGraph *lg, int src_node, int src_port,
       sum_id = apply_add_node(lg, SUM_VTABLE, 0, free_id, "SUM", 2, 1, NULL);
       if (sum_id < 0)
         return false;
-      // Re-derive S, D after apply_add_node: it may call grow_node_capacity
-      // which reallocates lg->nodes, invalidating earlier pointers.
+      // Re-derive S and D: apply_add_node may have triggered
+      // grow_node_capacity which reallocates lg->nodes, invalidating
+      // the pointers captured at the top of this function.
       S = &lg->nodes[src_node];
       D = &lg->nodes[dst_node];
       RTNode *SUM = &lg->nodes[sum_id];

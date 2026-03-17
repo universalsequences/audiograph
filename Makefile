@@ -254,6 +254,10 @@ tests/test_buffer_api: tests/test_buffer_api.c $(HEADERS) $(TEST_OBJS)
 tests/test_cycle_prevention: tests/test_cycle_prevention.c $(HEADERS) $(TEST_OBJS)
 	$(CC) $(CFLAGS) -I. -o tests/test_cycle_prevention tests/test_cycle_prevention.c $(TEST_OBJS)
 
+# Build FM synthesis threading benchmark
+tests/test_fm_benchmark: tests/test_fm_benchmark.c $(HEADERS) $(TEST_OBJS)
+	$(CC) $(CFLAGS) -O3 -I. -o tests/test_fm_benchmark tests/test_fm_benchmark.c $(TEST_OBJS)
+
 # Clean up test artifacts
 clean: clean_tests
 

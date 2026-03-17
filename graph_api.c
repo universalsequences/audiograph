@@ -2,6 +2,14 @@
 #include "graph_edit.h"
 #include "graph_nodes.h"
 
+static bool using_inline_in_cache(const RTNode *node) {
+  return node->cached_inPtrs == (float **)node->cached_inInline;
+}
+
+static bool using_inline_out_cache(const RTNode *node) {
+  return node->cached_outPtrs == (float **)node->cached_outInline;
+}
+
 LiveGraph *create_live_graph(int initial_capacity, int block_size,
                              const char *label, int num_channels) {
   LiveGraph *lg = calloc(1, sizeof(LiveGraph));
@@ -78,6 +86,10 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   // at 0)
   atomic_init(&lg->next_node_id, 1);
   atomic_init(&lg->next_buffer_id, 0);
+  atomic_init(&lg->edit_batch_depth, 0);
+  atomic_init(&lg->active_edit_batch_serial, 0);
+  atomic_init(&lg->next_edit_batch_serial, 1);
+  atomic_init(&lg->committed_edit_batch_serial, 0);
 
   // Initialize watch list system
   lg->watch.capacity = 16;
@@ -164,10 +176,14 @@ void destroy_live_graph(LiveGraph *lg) {
       }
       // Free cached IO pointers
       if (node->cached_inPtrs) {
-        free(node->cached_inPtrs);
+        if (!using_inline_in_cache(node)) {
+          free(node->cached_inPtrs);
+        }
       }
       if (node->cached_outPtrs) {
-        free(node->cached_outPtrs);
+        if (!using_inline_out_cache(node)) {
+          free(node->cached_outPtrs);
+        }
       }
     }
     free(lg->nodes);
@@ -304,6 +320,10 @@ int live_add_sum(LiveGraph *lg, const char *name, int nInputs) {
   return finalize_live_add(lg, node_id, SUM_VTABLE, 0, name, nInputs, 1, NULL);
 }
 
+static inline uint64_t current_batch_serial(LiveGraph *lg) {
+  return atomic_load_explicit(&lg->active_edit_batch_serial, memory_order_acquire);
+}
+
 int add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
              const char *name, int nInputs, int nOutputs,
              const void *initial_state, size_t initial_state_size) {
@@ -322,6 +342,7 @@ int add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
   // Create the command
   GraphEditCmd cmd = {
       .op = GE_ADD_NODE,
+      .batch_serial = current_batch_serial(lg),
       .u.add_node = {
           .vt = vtable,
           .state_size = state_size,
@@ -347,6 +368,33 @@ int add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
   return node_id;
 }
 
+void begin_graph_edit_batch(LiveGraph *lg) {
+  if (!lg)
+    return;
+  int old_depth = atomic_fetch_add_explicit(&lg->edit_batch_depth, 1, memory_order_acq_rel);
+  if (old_depth == 0) {
+    uint64_t serial =
+        atomic_fetch_add_explicit(&lg->next_edit_batch_serial, 1, memory_order_acq_rel);
+    atomic_store_explicit(&lg->active_edit_batch_serial, serial, memory_order_release);
+  }
+}
+
+void end_graph_edit_batch(LiveGraph *lg) {
+  if (!lg)
+    return;
+  int old_depth =
+      atomic_fetch_sub_explicit(&lg->edit_batch_depth, 1, memory_order_acq_rel);
+  if (old_depth == 1) {
+    uint64_t serial =
+        atomic_load_explicit(&lg->active_edit_batch_serial, memory_order_acquire);
+    atomic_store_explicit(&lg->committed_edit_batch_serial, serial, memory_order_release);
+    atomic_store_explicit(&lg->active_edit_batch_serial, 0, memory_order_release);
+  } else if (old_depth <= 0) {
+    atomic_store_explicit(&lg->edit_batch_depth, 0, memory_order_release);
+    atomic_store_explicit(&lg->active_edit_batch_serial, 0, memory_order_release);
+  }
+}
+
 int create_buffer(LiveGraph *lg, int size, int channel_count,
                   const float *source_data) {
   int buffer_id = atomic_fetch_add(&lg->next_buffer_id, 1);
@@ -363,6 +411,7 @@ int create_buffer(LiveGraph *lg, int size, int channel_count,
   }
 
   GraphEditCmd cmd = {.op = GE_CREATE_BUFFER,
+                      .batch_serial = current_batch_serial(lg),
                       .u.create_buffer = {.buffer_id = buffer_id,
                                           .size = size,
                                           .channel_count = channel_count,
@@ -392,6 +441,7 @@ int hot_swap_buffer(LiveGraph *lg, int buffer_id, const float *source_data,
   memcpy(source_copy, source_data, source_size);
 
   GraphEditCmd cmd = {.op = GE_HOTSWAP_BUFFER,
+                      .batch_serial = current_batch_serial(lg),
                       .u.hotswap_buffer = {.buffer_id = buffer_id,
                                            .size = size,
                                            .channel_count = channel_count,
@@ -419,6 +469,7 @@ bool is_failed_node(LiveGraph *lg, int logical_id) {
 
 bool delete_node(LiveGraph *lg, int node_id) {
   GraphEditCmd cmd = {.op = GE_REMOVE_NODE,
+                      .batch_serial = current_batch_serial(lg),
                       .u.remove_node = {.node_id = node_id}};
 
   return geq_push(lg->graphEditQueue, &cmd);
@@ -432,6 +483,7 @@ bool graph_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
   }
 
   GraphEditCmd cmd = {.op = GE_CONNECT,
+                      .batch_serial = current_batch_serial(lg),
                       .u.connect = {.src_id = src_node,
                                     .src_port = src_port,
                                     .dst_id = dst_node,
@@ -443,6 +495,7 @@ bool graph_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
 bool graph_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
                       int dst_port) {
   GraphEditCmd cmd = {.op = GE_DISCONNECT,
+                      .batch_serial = current_batch_serial(lg),
                       .u.disconnect = {.src_id = src_node,
                                        .src_port = src_port,
                                        .dst_id = dst_node,
@@ -471,6 +524,7 @@ bool hot_swap_node(LiveGraph *lg, int node_id, NodeVTable vt, size_t state_size,
   }
 
   GraphEditCmd cmd = {.op = GE_HOT_SWAP_NODE,
+                      .batch_serial = current_batch_serial(lg),
                       .u.hot_swap_node =
                           {
                               .vt = vt,
@@ -509,6 +563,7 @@ bool replace_keep_edges(LiveGraph *lg, int node_id, NodeVTable vt,
   }
 
   GraphEditCmd cmd = {.op = GE_REPLACE_KEEP_EDGES,
+                      .batch_serial = current_batch_serial(lg),
                       .u.replace_keep_edges = {
                           .vt = vt,
                           .state_size = state_size,
@@ -550,7 +605,9 @@ void retire_later(LiveGraph *lg, void *ptr, void (*deleter)(void *)) {
 bool add_node_to_watchlist(LiveGraph *lg, int node_id) {
   if (!lg || node_id < 0)
     return false;
-  GraphEditCmd cmd = {.op = GE_ADD_WATCH, .u.add_watch = {.node_id = node_id}};
+  GraphEditCmd cmd = {.op = GE_ADD_WATCH,
+                      .batch_serial = current_batch_serial(lg),
+                      .u.add_watch = {.node_id = node_id}};
   return geq_push(lg->graphEditQueue, &cmd);
 }
 
@@ -558,6 +615,7 @@ bool remove_node_from_watchlist(LiveGraph *lg, int node_id) {
   if (!lg || node_id < 0)
     return false;
   GraphEditCmd cmd = {.op = GE_REMOVE_WATCH,
+                      .batch_serial = current_batch_serial(lg),
                       .u.remove_watch = {.node_id = node_id}};
   return geq_push(lg->graphEditQueue, &cmd);
 }
@@ -587,4 +645,50 @@ void *get_node_state(LiveGraph *lg, int node_id, size_t *state_size) {
   if (state_size)
     *state_size = size;
   return result;
+}
+
+// Debug: dump graph topology to stderr
+void debug_dump_graph(LiveGraph *lg) {
+  if (!lg) return;
+  fprintf(stderr, "\n=== GRAPH DUMP (node_count=%d) ===\n", lg->node_count);
+  fprintf(stderr, "  scratch_null=%p\n", (void*)lg->scratch_null);
+  for (int i = 0; i < lg->node_count; i++) {
+    RTNode *n = &lg->nodes[i];
+    if (n->vtable.process == NULL && n->nInputs == 0 && n->nOutputs == 0)
+      continue;
+    fprintf(stderr, "  Node %d: nIn=%d nOut=%d orphaned=%d cache_valid=%d\n",
+            i, n->nInputs, n->nOutputs,
+            lg->sched.is_orphaned[i], n->io_cache_valid);
+    if (n->inEdgeId) {
+      for (int p = 0; p < n->nInputs; p++) {
+        int eid = n->inEdgeId[p];
+        if (eid >= 0) {
+          fprintf(stderr, "    in[%d] edge=%d src_node=%d src_port=%d buf=%p\n",
+                  p, eid, lg->edges[eid].src_node, lg->edges[eid].src_port,
+                  (void*)lg->edges[eid].buf);
+        } else {
+          fprintf(stderr, "    in[%d] UNCONNECTED\n", p);
+        }
+      }
+    }
+    if (n->outEdgeId) {
+      for (int p = 0; p < n->nOutputs; p++) {
+        int eid = n->outEdgeId[p];
+        if (eid >= 0) {
+          fprintf(stderr, "    out[%d] edge=%d buf=%p\n",
+                  p, eid, (void*)lg->edges[eid].buf);
+        } else {
+          fprintf(stderr, "    out[%d] UNCONNECTED\n", p);
+        }
+      }
+    }
+    if (n->cached_outPtrs) {
+      for (int p = 0; p < n->nOutputs; p++) {
+        fprintf(stderr, "    cached_out[%d]=%p%s\n",
+                p, (void*)n->cached_outPtrs[p],
+                n->cached_outPtrs[p] == lg->scratch_null ? " (SCRATCH_NULL!)" : "");
+      }
+    }
+  }
+  fprintf(stderr, "=== END DUMP ===\n\n");
 }

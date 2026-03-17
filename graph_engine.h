@@ -38,6 +38,8 @@ typedef struct RTNode {
   // Eliminates per-block input/output loops in bind_and_run_live
   float **cached_inPtrs;   // Pre-resolved input buffer pointers
   float **cached_outPtrs;  // Pre-resolved output buffer pointers
+  float *cached_inInline[MAX_IO];
+  float *cached_outInline[MAX_IO];
   bool io_cache_valid;     // False if topology changed, needs rebuild
 
   // scheduling
@@ -106,6 +108,10 @@ typedef struct LiveGraph {
 
   _Atomic int next_node_id;
   _Atomic int next_buffer_id;
+  _Atomic int edit_batch_depth;
+  _Atomic uint64_t active_edit_batch_serial;
+  _Atomic uint64_t next_edit_batch_serial;
+  _Atomic uint64_t committed_edit_batch_serial;
 
   // --- Watch list & state monitoring ---
   struct {
@@ -193,6 +199,8 @@ int add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
 bool delete_node(LiveGraph *lg, int node_id);
 bool graph_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
                    int dst_port);
+void begin_graph_edit_batch(LiveGraph *lg);
+void end_graph_edit_batch(LiveGraph *lg);
 bool graph_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
                       int dst_port);
 

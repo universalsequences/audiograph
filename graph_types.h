@@ -160,6 +160,7 @@ typedef struct {
 
 typedef struct {
   GraphEditOp op;
+  uint64_t batch_serial;
   union {
     struct {
       NodeVTable vt;

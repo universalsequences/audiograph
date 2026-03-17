@@ -33,7 +33,7 @@ static inline void geq_deinit(GraphEditQueue *q) {
 static inline bool geq_push(GraphEditQueue *r, const GraphEditCmd *cmd) {
   // get sequence numbers
   uint32_t head = atomic_load_explicit(&r->head, memory_order_relaxed);
-  uint32_t tail = atomic_load_explicit(&r->tail, memory_order_relaxed);
+  uint32_t tail = atomic_load_explicit(&r->tail, memory_order_acquire);
   uint32_t next = head + 1;
 
   if ((next & r->mask) == (tail & r->mask)) {
@@ -45,12 +45,12 @@ static inline bool geq_push(GraphEditQueue *r, const GraphEditCmd *cmd) {
   // publish the "next" (not masked so we can keep track of the unwrapped value
   // and do proper head - tail calculations)
   // Note: this avoid ambiguity when next % cap == tail % cap
-  atomic_store_explicit(&r->head, next, memory_order_relaxed);
+  atomic_store_explicit(&r->head, next, memory_order_release);
   return true;
 }
 
 static inline bool geq_pop(GraphEditQueue *r, GraphEditCmd *cmd) {
-  uint32_t head = atomic_load_explicit(&r->head, memory_order_relaxed);
+  uint32_t head = atomic_load_explicit(&r->head, memory_order_acquire);
   uint32_t tail = atomic_load_explicit(&r->tail, memory_order_relaxed);
 
   if ((tail & r->mask) == (head & r->mask)) {
@@ -60,7 +60,19 @@ static inline bool geq_pop(GraphEditQueue *r, GraphEditCmd *cmd) {
 
   *cmd = r->buf[tail & r->mask];
 
-  atomic_store_explicit(&r->tail, tail + 1, memory_order_relaxed);
+  atomic_store_explicit(&r->tail, tail + 1, memory_order_release);
+  return true;
+}
+
+static inline bool geq_peek(GraphEditQueue *r, GraphEditCmd *cmd) {
+  uint32_t head = atomic_load_explicit(&r->head, memory_order_acquire);
+  uint32_t tail = atomic_load_explicit(&r->tail, memory_order_relaxed);
+
+  if ((tail & r->mask) == (head & r->mask)) {
+    return false;
+  }
+
+  *cmd = r->buf[tail & r->mask];
   return true;
 }
 
