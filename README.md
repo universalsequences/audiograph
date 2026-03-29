@@ -207,23 +207,29 @@ The `process` function must be **real-time safe**: no allocations, no locks, no 
 
 AudioGraph uses a **worker pool with Mach real-time scheduling** to parallelize DAG processing across cores.
 
-The problem: **standard POSIX threads are worse than useless for parallel audio**. Under time-sharing scheduling, context switches and variable wakeup latency dominate. A graph that processes in 0.5ms on one RT thread can take 1.2ms on four normal threads:
+The problem: **standard POSIX threads are worse than useless for parallel audio**. Under time-sharing scheduling, context switches and variable wakeup latency dominate — and in audio, it's the **worst-case** block time that matters, not the average. A single block that exceeds the deadline causes an audible glitch.
 
-| Configuration | Processing Time | Speedup |
-|---|---|---|
-| 1 RT thread | 0.48ms | 1.0x (baseline) |
-| 4 normal threads | 1.15ms | 0.42x (slower!) |
-| 4 RT threads | 0.18ms | 2.67x |
-| 4 RT threads + OS Workgroup | 0.14ms | 3.43x |
-| 8 RT threads + OS Workgroup | 0.09ms | 5.33x |
+| Configuration | Median | P95 | Speedup |
+|---|---|---|---|
+| Single-threaded (audio thread only) | 3.06ms | 3.33ms | 1.00x |
+| 1 RT worker | 1.50ms | 1.53ms | 2.04x |
+| 2 RT workers | 1.09ms | 1.58ms | 2.82x |
+| 4 RT workers | 1.11ms | 2.58ms | 2.77x |
+| 4 RT workers + OS Workgroup | 0.90ms | 1.84ms | 3.41x |
+| 6 RT workers | 0.98ms | 1.79ms | 3.14x |
+| **6 RT workers + OS Workgroup** | **0.74ms** | **0.79ms** | **4.13x** |
+| 8 RT workers | 0.99ms | 2.18ms | 3.09x |
+| 8 RT workers + OS Workgroup | 0.99ms | 1.39ms | 3.11x |
 
-*Measured on M1, 64-node graph, 512-sample blocks @ 48kHz.*
+*Measured on Apple M1 Max, 1000 independent oscillators → DAC (maximally parallel — all source nodes execute concurrently), 512-sample blocks @ 44.1kHz, via real CoreAudio callback. Best of 3 runs, 470 blocks per run.*
+
+The P95 column is the one that matters for audio — it determines whether you get glitches. Without OS Workgroup, the P95 is 2–3x the median because the kernel can preempt or migrate worker threads mid-block. With OS Workgroup at 6 workers, the P95 drops to **1.07x the median** — nearly jitter-free. Adding workers beyond 6 shows diminishing returns due to MPMC queue contention.
 
 The solution is three-layered:
 
 1. **QoS hints** (`QOS_CLASS_USER_INTERACTIVE`) — always active on macOS, tells the scheduler this work is latency-sensitive
 2. **Mach time-constraint policy** — promotes workers to hard real-time with a computation budget of 75% of the audio block period and a hard deadline at 100%. The OS guarantees no preemption within the budget.
-3. **OS Workgroups** (macOS 11+) — workers join a shared workgroup so the kernel co-schedules them on separate cores, minimizes migration, and can boost/throttle the group as a unit
+3. **OS Workgroups** (macOS 11+) — workers join a shared workgroup so the kernel co-schedules them on separate cores, minimizes migration, and can boost/throttle the group as a unit. The primary benefit is not raw throughput but **consistency** — workgroup eliminates the scheduling jitter that causes P95 spikes and audio glitches
 
 Workers park on a `pthread_cond_t` between blocks. When `process_next_block` is called, it broadcasts a wake, and all workers enter a spin-then-wait loop pulling nodes from the ready queue. The audio thread participates as a worker too — it doesn't just dispatch and wait.
 

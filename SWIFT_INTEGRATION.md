@@ -548,7 +548,7 @@ Add this to your target's "Runpath Search Paths":
 import Foundation
 
 class AudioGraphManager {
-    private var liveGraph: OpaquePointer?
+    private var liveGraph: UnsafeMutablePointer<LiveGraph>?
     private let blockSize: Int32 = 128
     private let sampleRate: Int32 = 48000
     
@@ -635,7 +635,7 @@ AudioGraph supports flexible channel configurations (mono, stereo, or more chann
 import AudioGraph
 
 class StereoAudioGraphManager {
-    private var liveGraph: OpaquePointer?
+    private var liveGraph: UnsafeMutablePointer<LiveGraph>?
     private let blockSize: Int32 = 128
 
     init() {
@@ -728,92 +728,28 @@ func setupStereoAudio() {
 }
 ```
 
-## Real-time Audio Integration
+## Thread Safety
 
-### With AVAudioEngine
+Graph edit operations (`add_node`, `graph_connect`, `graph_disconnect`, `delete_node`, `hot_swap_node`) are **safe to call from any thread**. They are queued via a lock-free SPSC ring buffer and applied atomically at the next block boundary. You do not need to dispatch them to a specific thread.
+
+- `process_next_block()` — call from the audio thread only (your render callback)
+- `params_push()` — lock-free, safe from any thread
+- `graph_connect()`, `add_node()`, etc. — queued, safe from any thread
+- `engine_start_workers()` / `engine_stop_workers()` — call once at startup/shutdown, not during processing
+
+### Lifecycle
 ```swift
-import AVFoundation
+// Startup
+initialize_engine(blockSize, sampleRate)
+engine_enable_rt_time_constraint(1)
+engine_start_workers(6)
+let lg = create_live_graph(capacity, blockSize, "my_graph", 2)
 
-class AudioGraphAVEngine {
-    private let audioGraphManager = AudioGraphManager()
-    private let audioEngine = AVAudioEngine()
-    
-    func startAudio() throws {
-        let mainMixer = audioEngine.mainMixerNode
-        let outputNode = audioEngine.outputNode
-        let format = outputNode.inputFormat(forBus: 0)
-        
-        // Install a tap to process audio with audiograph
-        mainMixer.installTap(onBus: 0, bufferSize: 128, format: format) { buffer, time in
-            let audioBuffer = self.audioGraphManager.processAudioBlock()
-            
-            // Copy audiograph output to AVAudioPCMBuffer
-            let frameLength = buffer.frameLength
-            if let channelData = buffer.floatChannelData {
-                for frame in 0..<Int(frameLength) {
-                    if frame < audioBuffer.count {
-                        channelData[0][frame] = audioBuffer[frame]
-                    }
-                }
-            }
-        }
-        
-        try audioEngine.start()
-    }
-    
-    func stopAudio() {
-        audioEngine.stop()
-    }
-}
-```
+// ... use the graph ...
 
-### With Audio Unit
-For lower-level integration, you can use the audiograph in an Audio Unit render callback:
-
-```swift
-let renderCallback: AURenderCallback = { (inRefCon, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ioData) -> OSStatus in
-    
-    guard let audioGraphManager = inRefCon?.assumingMemoryBound(to: AudioGraphManager.self).pointee else {
-        return noErr
-    }
-    
-    let audioBuffer = audioGraphManager.processAudioBlock()
-    
-    // Copy to output buffer
-    guard let ioData = ioData,
-          let buffers = ioData.pointee.mBuffers.mData?.assumingMemoryBound(to: Float.self) else {
-        return noErr
-    }
-    
-    for i in 0..<min(Int(inNumberFrames), audioBuffer.count) {
-        buffers[i] = audioBuffer[i]
-    }
-    
-    return noErr
-}
-```
-
-## Memory Management Notes
-
-### Important Considerations:
-1. **Thread Safety**: Only `process_next_block()` and `params_push()` are real-time safe
-2. **Memory Allocation**: All graph edits (`add_node`, `connect`, etc.) should be done from the main thread
-3. **Lifecycle**: Always call `engine_stop_workers()` before destroying the live graph
-4. **Parameter Updates**: Use the parameter ring buffer for real-time safe parameter changes
-
-### Recommended Pattern:
-```swift
-// Main thread: Setup and graph editing
-let oscId = audioGraphManager.createOscillator(frequency: 440.0, name: "A4")
-let gainId = audioGraphManager.createGain(value: 0.5, name: "volume")
-_ = audioGraphManager.connect(sourceNode: oscId, sourcePort: 0, 
-                             destNode: gainId, destPort: 0)
-
-// Audio thread: Only process audio
-let samples = audioGraphManager.processAudioBlock()
-
-// Any thread: Parameter updates (lock-free)
-audioGraphManager.updateParameter(nodeId: gainId, paramIndex: 0, value: 0.8)
+// Shutdown (order matters)
+engine_stop_workers()
+destroy_live_graph(lg)
 ```
 
 ## Building for Distribution
@@ -884,21 +820,41 @@ swift build --verbose
 ```
 
 ## OS Workgroup (Apple)
-On iOS 15+/macOS 12+, co-schedule helper threads with the I/O thread by joining the Audio Unit's `os_workgroup_t`. This keeps multi-threaded processing aligned to the audio deadline.
 
-1) Fetch the OS workgroup from the output AudioUnit and pass it to the engine:
+On macOS 11+ / iOS 15+, joining the Audio Unit's `os_workgroup_t` tells the kernel to co-schedule all worker threads on separate cores, aligned to the audio deadline. The primary benefit is not raw throughput but **consistency** — workgroup eliminates the scheduling jitter that causes worst-case spikes.
+
+In audio, it's the P95/max block time that determines whether you get glitches, not the median. Without workgroup, the kernel may preempt or migrate worker threads mid-block, causing sporadic spikes 2–3x the median. With workgroup, the P95 drops to near the median:
+
+| Configuration | Median | P95 |
+|---|---|---|
+| 6 RT workers | 0.98ms | 1.79ms |
+| 6 RT workers + OS Workgroup | 0.74ms | 0.79ms |
+
+*1000 independent oscillators → DAC (maximally parallel), 512 samples @ 44.1kHz, Apple M1 Max.*
+
+### Setup
+
+1) Enable real-time time-constraint scheduling and start workers **before** binding the workgroup:
+
+```swift
+engine_enable_rt_time_constraint(1)
+engine_start_workers(6) // 4–6 workers is the sweet spot for most graphs
+```
+
+2) After starting audio, fetch the OS workgroup from the AudioUnit and pass it to the engine. Workers will join the workgroup on their next wake cycle:
 
 ```swift
 import AVFAudio
 import os
 
-func bindOSWorkgroupFromAudioUnit(engine: AVAudioEngine) {
+func bindOSWorkgroup(from engine: AVAudioEngine) {
     guard let au: AudioUnit = engine.outputNode.audioUnit else { return }
     var wg: os_workgroup_t? = nil
-    var size: UInt32 = UInt32(MemoryLayout<os_workgroup_t?>.size)
-    let kAudioOutputUnitProperty_OSWorkgroup: AudioUnitPropertyID = 2015
+    var size = UInt32(MemoryLayout<os_workgroup_t?>.size)
+    let kOSWorkgroupProperty: AudioUnitPropertyID = 2015
+
     let status = AudioUnitGetProperty(
-        au, kAudioOutputUnitProperty_OSWorkgroup,
+        au, kOSWorkgroupProperty,
         kAudioUnitScope_Global, 0,
         &wg, &size
     )
@@ -908,9 +864,47 @@ func bindOSWorkgroupFromAudioUnit(engine: AVAudioEngine) {
 }
 ```
 
-2) Optional (recommended): enable real-time time-constraint scheduling before starting workers:
+**Important**: The `os_workgroup_t` must stay alive for as long as workers are joined. Retain it (e.g., store in a property) to prevent deallocation.
+
+3) On audio device changes, clear and rebind the workgroup — each device has its own workgroup token:
 
 ```swift
-engine_enable_rt_time_constraint(1)
-engine_start_workers(2) // tune 2–3 based on graph width
+engine_clear_os_workgroup()
+// ... switch device ...
+bindOSWorkgroup(from: engine)
+```
+
+### Fallback: HAL Workgroup
+
+If you don't have an AudioUnit reference (e.g., in a test harness), you can get the workgroup directly from the default output device via CoreAudio HAL:
+
+```swift
+import AudioToolbox
+
+func getWorkgroupFromHAL() -> os_workgroup_t? {
+    var propAddr = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var deviceID: AudioDeviceID = 0
+    var sz = UInt32(MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject),
+        &propAddr, 0, nil, &sz, &deviceID
+    ) == noErr, deviceID != 0 else { return nil }
+
+    var wg: os_workgroup_t? = nil
+    var wgSz = UInt32(MemoryLayout<os_workgroup_t?>.size)
+    var wgAddr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyIOThreadOSWorkgroup,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    guard AudioObjectGetPropertyData(
+        deviceID, &wgAddr, 0, nil, &wgSz, &wg
+    ) == noErr else { return nil }
+
+    return wg
+}
 ```
