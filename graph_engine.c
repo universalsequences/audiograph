@@ -516,48 +516,28 @@ void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
 
   // Set thread-local context for SUM nodes to access input count
   g_current_processing_node = node;
-  float *in_stack[32];
-  float *out_stack[32];
-  float **inPtrs = NULL;
-  float **outPtrs = NULL;
-  bool free_inPtrs = false;
-  bool free_outPtrs = false;
 
-  if (node->nInputs > 0) {
-    if (node->nInputs <= 32) {
-      inPtrs = in_stack;
-    } else {
-      inPtrs = malloc(node->nInputs * sizeof(float *));
-      if (!inPtrs) {
-        g_current_processing_node = NULL;
-        return;
-      }
-      free_inPtrs = true;
-    }
-    for (int i = 0; i < node->nInputs; i++) {
-      inPtrs[i] = node->cached_inPtrs[i];
-    }
+  // === Use pre-cached IO pointers ===
+  // Rebuild lazily if cache is invalid (topology changed). This is the
+  // per-node guarantee; process_next_block also does an eager full-graph
+  // pass, but we keep the lazy check here so any entry point (tests,
+  // direct process_live_block calls, etc.) stays correct.
+  if (!node->io_cache_valid) {
+    rebuild_node_io_cache(lg, node, nframes);
   }
 
-  if (node->nOutputs > 0) {
-    if (node->nOutputs <= 32) {
-      outPtrs = out_stack;
-    } else {
-      outPtrs = malloc(node->nOutputs * sizeof(float *));
-      if (!outPtrs) {
-        g_current_processing_node = NULL;
-        return;
-      }
-      free_outPtrs = true;
-    }
-    for (int i = 0; i < node->nOutputs; i++) {
-      int eid = node->outEdgeId ? node->outEdgeId[i] : -1;
-      if (eid >= 0 && eid < lg->edge_capacity && lg->edges[eid].buf) {
-        outPtrs[i] = lg->edges[eid].buf;
-      } else {
-        outPtrs[i] = lg->scratch_null;
-      }
-    }
+  // Pass the cached pointer arrays straight to the kernel — same contract
+  // the kernels were written against pre-e44d655. No stack copy, no live
+  // output re-resolution: the kernel sees exactly what the cache says.
+  float **inPtrs = node->cached_inPtrs;
+  float **outPtrs = node->cached_outPtrs;
+
+  // Fallback to silence/scratch if no cached pointers (shouldn't happen)
+  if (!inPtrs && node->nInputs > 0) {
+    inPtrs = &lg->silence_buf; // Single pointer fallback
+  }
+  if (!outPtrs && node->nOutputs > 0) {
+    outPtrs = &lg->scratch_null;
   }
 
   if (node->vtable.process) {
@@ -567,12 +547,6 @@ void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
 
   // Clear thread-local context
   g_current_processing_node = NULL;
-  if (free_inPtrs) {
-    free(inPtrs);
-  }
-  if (free_outPtrs) {
-    free(outPtrs);
-  }
 }
 
 
