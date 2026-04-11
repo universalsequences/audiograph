@@ -125,6 +125,7 @@ bool apply_hot_swap(LiveGraph *lg, GEHotSwapNode *p) {
   void *old_state = n->state;
 
   n->state = new_state;
+  n->state_size = p->state_size;
   n->vtable = p->vt;
 
   retire_later(lg, old_state, free);
@@ -221,6 +222,7 @@ bool apply_replace_keep_edges_internal(LiveGraph *lg, GEReplaceKeepEdges *p) {
   void *old_state = n->state;
 
   n->state = new_state;
+  n->state_size = p->state_size;
   n->vtable = p->vt;
 
   retire_later(lg, old_state, free);

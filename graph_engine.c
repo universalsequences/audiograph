@@ -96,13 +96,13 @@ void apply_params(LiveGraph *g) {
       // Verify logical_id matches (safety check for deleted/reused slots)
       if (node->state && node->logical_id == m.logical_id) {
         float *memory = (float *)node->state;
+        int state_slots = (int)(node->state_size / sizeof(float));
         memory[m.idx] = m.fvalue;
         if (m.idx >= DGEN_HEADER_SLOTS && has_dgen_header_canary(memory)) {
           int total_slots = (int)memory[1];
           if (total_slots > 0) {
             int write_base = DGEN_HEADER_SLOTS + total_slots + DGEN_STATE_REDZONE_SLOTS;
             int mirrored_idx = write_base + (m.idx - DGEN_HEADER_SLOTS);
-            int state_slots = (int)(node->state_size / sizeof(float));
             if (mirrored_idx >= 0 && mirrored_idx < state_slots) {
               memory[mirrored_idx] = m.fvalue;
             }
