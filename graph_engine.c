@@ -37,6 +37,28 @@ static void rebuild_invalid_io_caches(LiveGraph *lg, int nframes);
 
 Engine g_engine;
 
+// Worker threads should be less aggressive than the audio callback thread.
+// The audio thread still actively helps drain the graph in process_live_block_internal(),
+// but idle helper workers back off quickly instead of burning CPU polling an empty
+// ready queue while another thread is processing the graph's current critical path.
+#ifndef AUDIOGRAPH_WORKER_EMPTY_SPINS
+#define AUDIOGRAPH_WORKER_EMPTY_SPINS 8
+#endif
+
+#ifndef AUDIOGRAPH_WORKER_WAIT_TIMEOUT_US
+#define AUDIOGRAPH_WORKER_WAIT_TIMEOUT_US 50
+#endif
+
+// Watchlist snapshots are used by UI-ish polling operators (transport, meters,
+// scopes, displays), but copying all watched node state every audio callback is
+// expensive. Throttle process_next_block() snapshots; direct process_live_block()
+// callers still update every call.
+#ifndef AUDIOGRAPH_WATCH_UPDATE_INTERVAL
+#define AUDIOGRAPH_WATCH_UPDATE_INTERVAL 4
+#endif
+
+static _Atomic uint32_t g_watch_update_counter = 0;
+
 static bool using_inline_in_cache(const RTNode *node) {
   return node->cached_inPtrs == (float **)node->cached_inInline;
 }
@@ -263,16 +285,20 @@ static void *worker_main(void *arg) {
 
       int32_t nid;
 
-      // Tiny spin to catch bursts without kernel call, then short timed wait
+      // Workers use a modest spin then park briefly. The audio callback thread
+      // remains the aggressive waiter/helper, so this reduces aggregate CPU from
+      // idle workers without forcing the realtime thread to block.
       bool got = false;
-      for (int s = 0; s < 64; s++) {
+      for (int s = 0; s < AUDIOGRAPH_WORKER_EMPTY_SPINS; s++) {
         if ((got = rq_try_pop(lg->sched.readyQueue, &nid)))
           break;
         cpu_relax(); // brief pause
       }
       if (!got) {
-        // Queue appears empty; wait a very short time for a wake signal
-        (void)rq_wait_nonempty(lg->sched.readyQueue, /*timeout_us=*/10);
+        // Queue appears empty while work is in flight; wait briefly for a wake
+        // signal instead of repeatedly polling the MPMC queue.
+        (void)rq_wait_nonempty(lg->sched.readyQueue,
+                               /*timeout_us=*/AUDIOGRAPH_WORKER_WAIT_TIMEOUT_US);
         continue;
       }
 
@@ -541,8 +567,13 @@ void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
   }
 
   if (node->vtable.process) {
+    ProcessContext ctx = {
+        .buffers = lg->buffers,
+        .telemetry = lg->telemetry,
+        .telemetry_count = lg->telemetry_count,
+    };
     node->vtable.process((float *const *)inPtrs, (float *const *)outPtrs,
-                         nframes, node->state, lg->buffers);
+                         nframes, node->state, &ctx);
   }
 
   // Clear thread-local context
@@ -725,7 +756,7 @@ static void drain_retire_list(LiveGraph *lg) {
 
 static void update_watched_node_states(LiveGraph *lg);
 
-void process_live_block(LiveGraph *lg, int nframes) {
+static void process_live_block_internal(LiveGraph *lg, int nframes, bool update_watch) {
   // Initialize pending counts and seed ready queue
   init_pending_and_seed(lg);
 
@@ -739,13 +770,15 @@ void process_live_block(LiveGraph *lg, int nframes) {
         memset(lg->edges[master_edge_id].buf, 0, nframes * sizeof(float));
       }
     }
-    update_watched_node_states(lg);
+    if (update_watch)
+      update_watched_node_states(lg);
     return;
   }
 
   // check if no work to be done
   if (atomic_load_explicit(&lg->sched.jobsInFlight, memory_order_acquire) <= 0) {
-    update_watched_node_states(lg);
+    if (update_watch)
+      update_watched_node_states(lg);
     return;
   }
 
@@ -798,9 +831,15 @@ void process_live_block(LiveGraph *lg, int nframes) {
 
   drain_retire_list(lg);
 
-  // Update watched node states after processing this block (covers both
-  // direct process_live_block callers and the process_next_block wrapper).
-  update_watched_node_states(lg);
+  // Update watched node states for direct process_live_block callers.
+  // process_next_block processes in internal slices and snapshots once after
+  // all slices complete, avoiding duplicate large state copies per callback.
+  if (update_watch)
+    update_watched_node_states(lg);
+}
+
+void process_live_block(LiveGraph *lg, int nframes) {
+  process_live_block_internal(lg, nframes, true);
 }
 
 int find_live_output(LiveGraph *lg) {
@@ -835,7 +874,7 @@ void process_next_block(LiveGraph *lg, float *output_buffer, int nframes) {
     if (slice > lg->block_size)
       slice = lg->block_size;
 
-    process_live_block(lg, slice);
+    process_live_block_internal(lg, slice, false);
 
     // Get the DAC node (final output)
     int output_node = find_live_output(lg);
@@ -882,8 +921,18 @@ void process_next_block(LiveGraph *lg, float *output_buffer, int nframes) {
     out_offset += slice;
   }
 
-  // Update watched node states after processing
+  // Throttle watchlist snapshots in the audio render path. A full snapshot can
+  // be expensive when many UI/polling operators are watched, and most consumers
+  // don't need audio-block-rate state updates.
+#if AUDIOGRAPH_WATCH_UPDATE_INTERVAL <= 1
   update_watched_node_states(lg);
+#else
+  uint32_t watch_tick = atomic_fetch_add_explicit(&g_watch_update_counter, 1,
+                                                  memory_order_relaxed);
+  if ((watch_tick % AUDIOGRAPH_WATCH_UPDATE_INTERVAL) == 0) {
+    update_watched_node_states(lg);
+  }
+#endif
 }
 
 static void update_watched_node_states(LiveGraph *lg) {

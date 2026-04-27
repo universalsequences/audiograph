@@ -26,6 +26,11 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   lg->buffers = calloc(lg->buffer_capacity, sizeof(BufferDesc));
   lg->buffer_count = 0;
 
+  // Telemetry storage (graph-owned atomic slots for realtime -> control)
+  lg->telemetry_capacity = initial_capacity;
+  lg->telemetry = calloc(lg->telemetry_capacity, sizeof(TelemetryDesc));
+  lg->telemetry_count = 0;
+
   // Edge pool (start with generous capacity)
   lg->edge_capacity = initial_capacity * 32;
   lg->block_size = block_size;
@@ -188,6 +193,10 @@ void destroy_live_graph(LiveGraph *lg) {
     }
     free(lg->nodes);
   }
+
+  // Free telemetry storage
+  if (lg->telemetry)
+    free(lg->telemetry);
 
   // Free scheduling arrays
   if (lg->sched.pending)
@@ -453,6 +462,85 @@ int hot_swap_buffer(LiveGraph *lg, int buffer_id, const float *source_data,
     return false;
   }
   return true;
+}
+
+int create_telemetry(LiveGraph *lg, int slot_count) {
+  if (!lg || slot_count <= 0)
+    return -1;
+  if (slot_count > TELEMETRY_MAX_SLOTS)
+    slot_count = TELEMETRY_MAX_SLOTS;
+
+  if (lg->telemetry_count >= lg->telemetry_capacity) {
+    int new_capacity = lg->telemetry_capacity > 0 ? lg->telemetry_capacity * 2 : 16;
+    TelemetryDesc *new_telemetry = realloc(
+        lg->telemetry, (size_t)new_capacity * sizeof(TelemetryDesc));
+    if (!new_telemetry)
+      return -1;
+    memset(new_telemetry + lg->telemetry_capacity, 0,
+           (size_t)(new_capacity - lg->telemetry_capacity) * sizeof(TelemetryDesc));
+    lg->telemetry = new_telemetry;
+    lg->telemetry_capacity = new_capacity;
+  }
+
+  int telemetry_id = lg->telemetry_count++;
+  TelemetryDesc *td = &lg->telemetry[telemetry_id];
+  td->slot_count = slot_count;
+  td->in_use = true;
+  for (int i = 0; i < TELEMETRY_MAX_SLOTS; i++) {
+    atomic_store_explicit(&td->slots[i], 0, memory_order_relaxed);
+  }
+  return telemetry_id;
+}
+
+bool telemetry_read_u32(LiveGraph *lg, int telemetry_id, int slot, uint32_t *out) {
+  if (!lg || !out || telemetry_id < 0 || telemetry_id >= lg->telemetry_count)
+    return false;
+  TelemetryDesc *td = &lg->telemetry[telemetry_id];
+  if (!td->in_use || slot < 0 || slot >= td->slot_count)
+    return false;
+  *out = atomic_load_explicit(&td->slots[slot], memory_order_acquire);
+  return true;
+}
+
+bool telemetry_read_i32(LiveGraph *lg, int telemetry_id, int slot, int32_t *out) {
+  uint32_t bits = 0;
+  if (!telemetry_read_u32(lg, telemetry_id, slot, &bits))
+    return false;
+  *out = (int32_t)bits;
+  return true;
+}
+
+bool telemetry_read_f32(LiveGraph *lg, int telemetry_id, int slot, float *out) {
+  uint32_t bits = 0;
+  if (!telemetry_read_u32(lg, telemetry_id, slot, &bits))
+    return false;
+  union {
+    uint32_t u;
+    float f;
+  } v = {.u = bits};
+  *out = v.f;
+  return true;
+}
+
+void telemetry_store_u32(ProcessContext *ctx, int telemetry_id, int slot, uint32_t value) {
+  if (!ctx || !ctx->telemetry || telemetry_id < 0 || telemetry_id >= ctx->telemetry_count)
+    return;
+  TelemetryDesc *td = &ctx->telemetry[telemetry_id];
+  if (!td->in_use || slot < 0 || slot >= td->slot_count)
+    return;
+  atomic_store_explicit(&td->slots[slot], value, memory_order_release);
+}
+
+void telemetry_store_i32(ProcessContext *ctx, int telemetry_id, int slot, int32_t value) {
+  telemetry_store_u32(ctx, telemetry_id, slot, (uint32_t)value);
+}
+
+void telemetry_store_f32(ProcessContext *ctx, int telemetry_id, int slot, float value) {
+  union {
+    float f;
+    uint32_t u;
+  } v = {.f = value};
+  telemetry_store_u32(ctx, telemetry_id, slot, v.u);
 }
 
 bool is_failed_node(LiveGraph *lg, int logical_id) {

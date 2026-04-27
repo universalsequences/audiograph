@@ -163,6 +163,16 @@ int create_buffer(LiveGraph *lg, int size, int channel_count,
 int hot_swap_buffer(LiveGraph *lg, int buffer_id, const float *source_data,
                     int size, int channel_count);
 
+// ===================== Telemetry API =====================
+
+int create_telemetry(LiveGraph *lg, int slot_count);
+bool telemetry_read_u32(LiveGraph *lg, int telemetry_id, int slot, uint32_t *out);
+bool telemetry_read_i32(LiveGraph *lg, int telemetry_id, int slot, int32_t *out);
+bool telemetry_read_f32(LiveGraph *lg, int telemetry_id, int slot, float *out);
+void telemetry_store_u32(ProcessContext *ctx, int telemetry_id, int slot, uint32_t value);
+void telemetry_store_i32(ProcessContext *ctx, int telemetry_id, int slot, int32_t value);
+void telemetry_store_f32(ProcessContext *ctx, int telemetry_id, int slot, float value);
+
 // ===================== Node VTables for Custom Nodes =====================
 
 extern const NodeVTable OSC_VTABLE;

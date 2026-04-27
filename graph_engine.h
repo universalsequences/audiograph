@@ -53,6 +53,24 @@ typedef struct {
   int channel_count;
 } BufferDesc;
 
+#define TELEMETRY_MAX_SLOTS 16
+
+typedef struct TelemetryDesc {
+  _Atomic uint32_t slots[TELEMETRY_MAX_SLOTS];
+  int slot_count;
+  bool in_use;
+} TelemetryDesc;
+
+// Per-process-call context passed as the final NodeVTable.process argument.
+// Historically this argument was BufferDesc*. Keep buffers here, and add future
+// graph-owned realtime resources (telemetry/event queues) without expanding the
+// process function ABI again.
+typedef struct ProcessContext {
+  BufferDesc *buffers;
+  TelemetryDesc *telemetry;
+  int telemetry_count;
+} ProcessContext;
+
 // ===================== Live Editing System =====================
 
 typedef struct RetireEntry {
@@ -64,7 +82,9 @@ typedef struct LiveGraph {
   // --- Node & edge storage ---
   RTNode *nodes;
   BufferDesc *buffers;
+  TelemetryDesc *telemetry;
   int node_count, node_capacity, buffer_count, buffer_capacity;
+  int telemetry_count, telemetry_capacity;
   LiveEdge *edges;
   int edge_capacity;
   int edge_free_head; // head of free-list threading through LiveEdge.next_free
@@ -242,6 +262,17 @@ int create_buffer(LiveGraph *lg, int size, int channel_count,
 // Returns true on success, false if buffer doesn't exist or on failure.
 int hot_swap_buffer(LiveGraph *lg, int buffer_id, const float *source_data,
                     int size, int channel_count);
+
+// ===================== Telemetry API =====================
+// Graph-owned, small atomic slots for realtime-to-control communication.
+// Kernels write via ProcessContext; Swift/control code reads via LiveGraph.
+int create_telemetry(LiveGraph *lg, int slot_count);
+bool telemetry_read_u32(LiveGraph *lg, int telemetry_id, int slot, uint32_t *out);
+bool telemetry_read_i32(LiveGraph *lg, int telemetry_id, int slot, int32_t *out);
+bool telemetry_read_f32(LiveGraph *lg, int telemetry_id, int slot, float *out);
+void telemetry_store_u32(ProcessContext *ctx, int telemetry_id, int slot, uint32_t value);
+void telemetry_store_i32(ProcessContext *ctx, int telemetry_id, int slot, int32_t value);
+void telemetry_store_f32(ProcessContext *ctx, int telemetry_id, int slot, float value);
 
 // ===================== VTable Creation Functions =====================
 

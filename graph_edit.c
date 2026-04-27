@@ -939,6 +939,11 @@ bool apply_delete_node_internal(LiveGraph *lg, int node_id) {
 
   RTNode *node = &lg->nodes[node_id];
 
+  // Remove from watchlist before freeing node state. Otherwise deleted watched
+  // nodes leave stale IDs/snapshots behind, which can accumulate in dynamic
+  // patches/presets and keep adding watchlist scan/snapshot overhead.
+  apply_remove_watchlist_internal(lg, node_id);
+
   // Special handling for DAC node
   if (lg->dac_node_id == node_id) {
     lg->dac_node_id = -1; // Clear DAC reference
