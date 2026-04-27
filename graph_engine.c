@@ -32,6 +32,7 @@ void process_live_block(LiveGraph *lg, int nframes);
 static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes);
 static void wait_for_block_start_or_shutdown(void);
 static void rebuild_invalid_io_caches(LiveGraph *lg, int nframes);
+static int choose_active_worker_count(LiveGraph *lg);
 
 // ===================== Global Engine Instance =====================
 
@@ -87,6 +88,7 @@ void initialize_engine(int block_Size, int sample_rate) {
   atomic_store_explicit(&g_engine.oswg_join_remaining, 0, memory_order_relaxed);
   atomic_store_explicit(&g_engine.oswg_version, 0, memory_order_relaxed);
   atomic_store_explicit(&g_engine.rt_time_constraint, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_engine.activeWorkerLimit, 0, memory_order_relaxed);
 }
 
 // ===================== Graph Management =====================
@@ -158,7 +160,7 @@ static void wait_for_block_start_or_shutdown(void) {
 }
 
 static void *worker_main(void *arg) {
-  (void)arg;
+  int worker_index = (int)(intptr_t)arg;
   // Elevate worker thread QoS on Apple platforms for better scheduling.
 #ifdef __APPLE__
 #ifdef QOS_CLASS_USER_INTERACTIVE
@@ -273,6 +275,26 @@ static void *worker_main(void *arg) {
     if (!lg)
       continue; // spurious wake or no work - but workgroup joining is done
 
+    // Adaptive worker limit: workers above the per-block limit stay out of the
+    // ready queue. This lets hosts keep a high max worker count for complex
+    // graphs while avoiding wake/steal jitter on tiny or mostly-serial graphs.
+    int active_limit = atomic_load_explicit(&g_engine.activeWorkerLimit,
+                                            memory_order_acquire);
+    if (worker_index >= active_limit) {
+      // Do not spin aggressively: this worker is intentionally inactive for the
+      // current audio block. Wait briefly until the session finishes or changes.
+      while (atomic_load_explicit(&g_engine.runFlag, memory_order_acquire)) {
+        LiveGraph *cur =
+            atomic_load_explicit(&g_engine.workSession, memory_order_acquire);
+        if (cur != lg)
+          break;
+        if (atomic_load_explicit(&lg->sched.jobsInFlight, memory_order_acquire) == 0)
+          break;
+        usleep(50);
+      }
+      continue;
+    }
+
     // Hot loop: run until this block is complete
     for (;;) {
       // If the session ended or graph pointer changed, exit the hot loop.
@@ -352,7 +374,7 @@ void engine_start_workers(int workers) {
     (void)pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
 #endif
-    pthread_create(&g_engine.threads[i], &attr, worker_main, NULL);
+    pthread_create(&g_engine.threads[i], &attr, worker_main, (void *)(intptr_t)i);
     pthread_attr_destroy(&attr);
   }
 }
@@ -692,6 +714,31 @@ static void rebuild_scheduling_cache(LiveGraph *lg) {
   lg->sched.dirty = false;
 }
 
+static int choose_active_worker_count(LiveGraph *lg) {
+  int max_workers = g_engine.workerCount;
+  if (max_workers <= 0 || !lg)
+    return 0;
+
+  int jobs = lg->sched.cached_total_jobs;
+  int sources = lg->sched.source_count;
+
+  // Worker wake/sync overhead dominates tiny and mostly-serial graphs. Keep
+  // those single-threaded even when the host configured a high max worker count.
+  if (jobs < 24)
+    return 0;
+
+  // Scale up conservatively with available work. Initial source width is only a
+  // soft cap: many useful audio graphs start at one source and fan out later.
+  int active = jobs / 24;      // 24..47 jobs => 1 worker, 48..71 => 2, ...
+  if (sources >= 2 && active > sources)
+    active = sources;
+  if (active < 1)
+    active = 1;
+  if (active > max_workers)
+    active = max_workers;
+  return active;
+}
+
 static void init_pending_and_seed(LiveGraph *lg) {
   // Rebuild cache if topology changed
   if (lg->sched.dirty) {
@@ -782,7 +829,11 @@ static void process_live_block_internal(LiveGraph *lg, int nframes, bool update_
     return;
   }
 
-  if (g_engine.workerCount > 0) {
+  int active_workers = choose_active_worker_count(lg);
+  atomic_store_explicit(&g_engine.activeWorkerLimit, active_workers,
+                        memory_order_release);
+
+  if (active_workers > 0) {
     // Publish session frames and graph
     atomic_store_explicit(&g_engine.sessionFrames, nframes,
                           memory_order_release);
@@ -940,22 +991,34 @@ static void update_watched_node_states(LiveGraph *lg) {
     return;
   }
 
-  // Atomically fetch current watchlist
-  pthread_mutex_lock(&lg->watch.mutex);
+  // This function is called from process_next_block(), so never block the audio
+  // thread behind UI watchlist readers/writers and avoid per-callback mallocs.
+  // If the UI is changing/reading watch state right now, skip this snapshot; the
+  // next throttled audio callback will publish a fresh one.
+  enum { WATCH_STACK_CAP = 64 };
+  int watch_nodes_stack[WATCH_STACK_CAP];
+
+  if (pthread_mutex_trylock(&lg->watch.mutex) != 0) {
+    return;
+  }
+
   int watch_count = lg->watch.count;
-  int *watch_nodes = malloc(watch_count * sizeof(int));
-  if (!watch_nodes) {
+  if (watch_count > WATCH_STACK_CAP) {
+    // Avoid heap allocation on the realtime path. Large watchlists should be
+    // handled by a non-RT snapshot path; for now, skip rather than glitch.
     pthread_mutex_unlock(&lg->watch.mutex);
     return;
   }
-  memcpy(watch_nodes, lg->watch.list, watch_count * sizeof(int));
+
+  memcpy(watch_nodes_stack, lg->watch.list, watch_count * sizeof(int));
   pthread_mutex_unlock(&lg->watch.mutex);
 
-  // Update state snapshots for watched nodes
-  pthread_rwlock_wrlock(&lg->watch.lock);
+  if (pthread_rwlock_trywrlock(&lg->watch.lock) != 0) {
+    return;
+  }
 
   for (int i = 0; i < watch_count; i++) {
-    int node_id = watch_nodes[i];
+    int node_id = watch_nodes_stack[i];
 
     // Validate node_id and check if node exists
     if (node_id < 0 || node_id >= lg->node_count) {
@@ -967,13 +1030,13 @@ static void update_watched_node_states(LiveGraph *lg) {
       continue; // No state to copy
     }
 
-    // Reuse existing snapshot buffer if size matches; avoid per-block
-    // malloc/free
+    // Reuse existing snapshot buffer if size matches; this is the common
+    // steady-state path for scope~/live.meter~ polling. Allocation only happens
+    // when a watch is first added or a hot-swap changes state size.
     if (lg->watch.snapshots[node_id] &&
         lg->watch.sizes[node_id] == node->state_size) {
       memcpy(lg->watch.snapshots[node_id], node->state, node->state_size);
     } else {
-      // Size changed or no buffer yet; (re)allocate
       if (lg->watch.snapshots[node_id]) {
         free(lg->watch.snapshots[node_id]);
         lg->watch.snapshots[node_id] = NULL;
@@ -989,5 +1052,4 @@ static void update_watched_node_states(LiveGraph *lg) {
   }
 
   pthread_rwlock_unlock(&lg->watch.lock);
-  free(watch_nodes);
 }
