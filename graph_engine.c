@@ -852,14 +852,16 @@ static void process_live_block_internal(LiveGraph *lg, int nframes, bool update_
         execute_and_fanout(lg, nid, nframes);
         empty_spins = 0; // Reset on successful work
       } else {
-        // Queue empty but work in flight - workers processing
-        // Check again if work completed (avoids unnecessary spins)
+        // Queue empty but work is still in flight, so a worker owns something
+        // on the current dependency frontier. This is the realtime callback
+        // thread; never call sched_yield() here. In optimized builds this loop
+        // can hit a yield very quickly, handing the audio deadline to the OS and
+        // causing rare multi-ms tail latency. Keep the callback runnable and
+        // poll lightly until workers publish more ready jobs or finish.
         if (atomic_load_explicit(&lg->sched.jobsInFlight, memory_order_acquire) == 0)
           break;
         cpu_relax();
-        // After many empty spins, yield to reduce CPU burn
-        if (++empty_spins > 64) {
-          sched_yield();
+        if (++empty_spins > 4096) {
           empty_spins = 0;
         }
       }
