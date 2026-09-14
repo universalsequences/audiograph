@@ -1,12 +1,13 @@
 // WatchListDemo.swift - Example usage of watch list API from Swift
 
+import AudioGraph
 import Foundation
 
 // Example of how to use the watchlist API from Swift
 // Note: This assumes the audiograph_swift.h header is included in a bridging header
 
 class WatchListDemo {
-    private var liveGraph: OpaquePointer?
+    private var liveGraph: UnsafeMutablePointer<LiveGraph>?
     
     init() {
         // Initialize the engine (typically done once at app startup)
