@@ -79,7 +79,7 @@ Provision a development or manually installed host with:
 
 ```sh
 sudo groupadd --system --force realtime
-sudo install -Dm644 crates/sequencer/audiograph/packaging/eseq-realtime.conf \
+sudo install -Dm644 packaging/eseq-realtime.conf \
   /etc/security/limits.d/95-eseq-realtime.conf
 sudo usermod -aG realtime "$USER"
 ```
