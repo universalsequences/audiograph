@@ -3,6 +3,9 @@
 
 #include "graph_types.h"
 
+extern _Atomic uint64_t g_param_push_count;
+extern _Atomic uint64_t g_param_push_fail_count;
+
 // ===================== Runtime Graph Types =====================
 
 // Live graph edge buffer
@@ -17,6 +20,7 @@ typedef struct {
 
 typedef struct RTNode {
   uint64_t logical_id; // stable ID for migration/params
+  char *debug_name;
   NodeVTable vtable;
   void *state;       // aligned, preallocated
   size_t state_size; // size of allocated state for watch list copying
@@ -53,24 +57,6 @@ typedef struct {
   int channel_count;
 } BufferDesc;
 
-#define TELEMETRY_MAX_SLOTS 16
-
-typedef struct TelemetryDesc {
-  _Atomic uint32_t slots[TELEMETRY_MAX_SLOTS];
-  int slot_count;
-  bool in_use;
-} TelemetryDesc;
-
-// Per-process-call context passed as the final NodeVTable.process argument.
-// Historically this argument was BufferDesc*. Keep buffers here, and add future
-// graph-owned realtime resources (telemetry/event queues) without expanding the
-// process function ABI again.
-typedef struct ProcessContext {
-  BufferDesc *buffers;
-  TelemetryDesc *telemetry;
-  int telemetry_count;
-} ProcessContext;
-
 // ===================== Live Editing System =====================
 
 typedef struct RetireEntry {
@@ -82,9 +68,7 @@ typedef struct LiveGraph {
   // --- Node & edge storage ---
   RTNode *nodes;
   BufferDesc *buffers;
-  TelemetryDesc *telemetry;
   int node_count, node_capacity, buffer_count, buffer_capacity;
-  int telemetry_count, telemetry_capacity;
   LiveEdge *edges;
   int edge_capacity;
   int edge_free_head; // head of free-list threading through LiveEdge.next_free
@@ -105,6 +89,7 @@ typedef struct LiveGraph {
     int cached_total_jobs;
     bool has_cycle;
     bool dirty;            // true when topology changed, triggers cache rebuild
+    bool *completed_this_block; // per-node flag: set at completion site, cleared at block start
   } sched;
 
   ParamRing *params;
@@ -171,6 +156,7 @@ typedef struct Engine {
   _Atomic int oswg_join_remaining; // count of workers that need to see the flag
   _Atomic int oswg_version;      // incremented on each workgroup change for re-join detection
   _Atomic int rt_log; // enable lightweight debug prints from workers
+  _Atomic int graph_log; // enable per-block audiograph scheduler/output trace
   _Atomic int rt_time_constraint; // apply Mach RT time-constraint policy
 } Engine;
 
@@ -186,6 +172,7 @@ void engine_clear_os_workgroup(void);
 
 // Enable or disable minimal worker join logging (off by default).
 void engine_enable_rt_logging(int enable);
+void engine_enable_graph_logging(int enable);
 
 // Enable/disable Mach time-constraint scheduling for workers (Apple only).
 void engine_enable_rt_time_constraint(int enable);
@@ -249,6 +236,8 @@ void retire_later(LiveGraph *lg, void *ptr, void (*deleter)(void *));
 bool add_node_to_watchlist(LiveGraph *lg, int node_id);
 bool remove_node_from_watchlist(LiveGraph *lg, int node_id);
 void *get_node_state(LiveGraph *lg, int node_id, size_t *state_size);
+bool get_node_state_into(LiveGraph *lg, int node_id, void *out,
+                         size_t out_capacity, size_t *state_size);
 
 void update_orphaned_status(LiveGraph *lg);
 
@@ -263,17 +252,6 @@ int create_buffer(LiveGraph *lg, int size, int channel_count,
 // Returns true on success, false if buffer doesn't exist or on failure.
 int hot_swap_buffer(LiveGraph *lg, int buffer_id, const float *source_data,
                     int size, int channel_count);
-
-// ===================== Telemetry API =====================
-// Graph-owned, small atomic slots for realtime-to-control communication.
-// Kernels write via ProcessContext; Swift/control code reads via LiveGraph.
-int create_telemetry(LiveGraph *lg, int slot_count);
-bool telemetry_read_u32(LiveGraph *lg, int telemetry_id, int slot, uint32_t *out);
-bool telemetry_read_i32(LiveGraph *lg, int telemetry_id, int slot, int32_t *out);
-bool telemetry_read_f32(LiveGraph *lg, int telemetry_id, int slot, float *out);
-void telemetry_store_u32(ProcessContext *ctx, int telemetry_id, int slot, uint32_t value);
-void telemetry_store_i32(ProcessContext *ctx, int telemetry_id, int slot, int32_t value);
-void telemetry_store_f32(ProcessContext *ctx, int telemetry_id, int slot, float value);
 
 // ===================== VTable Creation Functions =====================
 

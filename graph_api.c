@@ -20,16 +20,12 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   lg->sched.pending = calloc(lg->node_capacity, sizeof(atomic_int));
   lg->sched.indegree = calloc(lg->node_capacity, sizeof(int));
   lg->sched.is_orphaned = calloc(lg->node_capacity, sizeof(bool));
+  lg->sched.completed_this_block = calloc(lg->node_capacity, sizeof(bool));
 
   // Buffer storage
   lg->buffer_capacity = initial_capacity;
   lg->buffers = calloc(lg->buffer_capacity, sizeof(BufferDesc));
   lg->buffer_count = 0;
-
-  // Telemetry storage (graph-owned atomic slots for realtime -> control)
-  lg->telemetry_capacity = initial_capacity;
-  lg->telemetry = calloc(lg->telemetry_capacity, sizeof(TelemetryDesc));
-  lg->telemetry_count = 0;
 
   // Edge pool (start with generous capacity)
   lg->edge_capacity = initial_capacity * 32;
@@ -72,6 +68,7 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
     free(lg->sched.pending);
     free(lg->sched.indegree);
     free(lg->sched.is_orphaned);
+    free(lg->sched.completed_this_block);
     free(lg);
     return NULL;
   }
@@ -167,6 +164,9 @@ void destroy_live_graph(LiveGraph *lg) {
       if (node->state) {
         free(node->state);
       }
+      if (node->debug_name) {
+        free(node->debug_name);
+      }
       if (node->inEdgeId) {
         free(node->inEdgeId);
       }
@@ -194,10 +194,6 @@ void destroy_live_graph(LiveGraph *lg) {
     free(lg->nodes);
   }
 
-  // Free telemetry storage
-  if (lg->telemetry)
-    free(lg->telemetry);
-
   // Free scheduling arrays
   if (lg->sched.pending)
     free(lg->sched.pending);
@@ -205,6 +201,8 @@ void destroy_live_graph(LiveGraph *lg) {
     free(lg->sched.indegree);
   if (lg->sched.is_orphaned)
     free(lg->sched.is_orphaned);
+  if (lg->sched.completed_this_block)
+    free(lg->sched.completed_this_block);
 
   // Free support buffers
   if (lg->silence_buf)
@@ -341,10 +339,21 @@ int add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
 
   // Create a copy of initial_state if provided
   void *initial_state_copy = NULL;
+  char *name_copy = NULL;
   if (initial_state && initial_state_size > 0) {
     initial_state_copy = malloc(initial_state_size);
     if (initial_state_copy) {
       memcpy(initial_state_copy, initial_state, initial_state_size);
+    }
+  }
+  if (name) {
+    name_copy = strdup(name);
+    if (!name_copy) {
+      if (initial_state_copy) {
+        free(initial_state_copy);
+      }
+      add_failed_id(lg, node_id);
+      return -1;
     }
   }
 
@@ -357,7 +366,7 @@ int add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
           .state_size = state_size,
           .logical_id =
               node_id, // Use node_id as the logical_id (they're the same)
-          .name = (char *)name,
+          .name = name_copy,
           .nInputs = nInputs,
           .nOutputs = nOutputs,
           .initial_state = initial_state_copy,
@@ -368,6 +377,9 @@ int add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
     // Queue full - consider this a failure
     if (initial_state_copy) {
       free(initial_state_copy);
+    }
+    if (name_copy) {
+      free(name_copy);
     }
     add_failed_id(lg, node_id);
     return -1;
@@ -462,85 +474,6 @@ int hot_swap_buffer(LiveGraph *lg, int buffer_id, const float *source_data,
     return false;
   }
   return true;
-}
-
-int create_telemetry(LiveGraph *lg, int slot_count) {
-  if (!lg || slot_count <= 0)
-    return -1;
-  if (slot_count > TELEMETRY_MAX_SLOTS)
-    slot_count = TELEMETRY_MAX_SLOTS;
-
-  if (lg->telemetry_count >= lg->telemetry_capacity) {
-    int new_capacity = lg->telemetry_capacity > 0 ? lg->telemetry_capacity * 2 : 16;
-    TelemetryDesc *new_telemetry = realloc(
-        lg->telemetry, (size_t)new_capacity * sizeof(TelemetryDesc));
-    if (!new_telemetry)
-      return -1;
-    memset(new_telemetry + lg->telemetry_capacity, 0,
-           (size_t)(new_capacity - lg->telemetry_capacity) * sizeof(TelemetryDesc));
-    lg->telemetry = new_telemetry;
-    lg->telemetry_capacity = new_capacity;
-  }
-
-  int telemetry_id = lg->telemetry_count++;
-  TelemetryDesc *td = &lg->telemetry[telemetry_id];
-  td->slot_count = slot_count;
-  td->in_use = true;
-  for (int i = 0; i < TELEMETRY_MAX_SLOTS; i++) {
-    atomic_store_explicit(&td->slots[i], 0, memory_order_relaxed);
-  }
-  return telemetry_id;
-}
-
-bool telemetry_read_u32(LiveGraph *lg, int telemetry_id, int slot, uint32_t *out) {
-  if (!lg || !out || telemetry_id < 0 || telemetry_id >= lg->telemetry_count)
-    return false;
-  TelemetryDesc *td = &lg->telemetry[telemetry_id];
-  if (!td->in_use || slot < 0 || slot >= td->slot_count)
-    return false;
-  *out = atomic_load_explicit(&td->slots[slot], memory_order_acquire);
-  return true;
-}
-
-bool telemetry_read_i32(LiveGraph *lg, int telemetry_id, int slot, int32_t *out) {
-  uint32_t bits = 0;
-  if (!telemetry_read_u32(lg, telemetry_id, slot, &bits))
-    return false;
-  *out = (int32_t)bits;
-  return true;
-}
-
-bool telemetry_read_f32(LiveGraph *lg, int telemetry_id, int slot, float *out) {
-  uint32_t bits = 0;
-  if (!telemetry_read_u32(lg, telemetry_id, slot, &bits))
-    return false;
-  union {
-    uint32_t u;
-    float f;
-  } v = {.u = bits};
-  *out = v.f;
-  return true;
-}
-
-void telemetry_store_u32(ProcessContext *ctx, int telemetry_id, int slot, uint32_t value) {
-  if (!ctx || !ctx->telemetry || telemetry_id < 0 || telemetry_id >= ctx->telemetry_count)
-    return;
-  TelemetryDesc *td = &ctx->telemetry[telemetry_id];
-  if (!td->in_use || slot < 0 || slot >= td->slot_count)
-    return;
-  atomic_store_explicit(&td->slots[slot], value, memory_order_release);
-}
-
-void telemetry_store_i32(ProcessContext *ctx, int telemetry_id, int slot, int32_t value) {
-  telemetry_store_u32(ctx, telemetry_id, slot, (uint32_t)value);
-}
-
-void telemetry_store_f32(ProcessContext *ctx, int telemetry_id, int slot, float value) {
-  union {
-    float f;
-    uint32_t u;
-  } v = {.f = value};
-  telemetry_store_u32(ctx, telemetry_id, slot, v.u);
 }
 
 bool is_failed_node(LiveGraph *lg, int logical_id) {
@@ -733,6 +666,31 @@ void *get_node_state(LiveGraph *lg, int node_id, size_t *state_size) {
   if (state_size)
     *state_size = size;
   return result;
+}
+
+bool get_node_state_into(LiveGraph *lg, int node_id, void *out,
+                         size_t out_capacity, size_t *state_size) {
+  if (state_size)
+    *state_size = 0;
+  if (!lg || !out || node_id < 0 || node_id >= lg->node_capacity) {
+    return false;
+  }
+
+  pthread_rwlock_rdlock(&lg->watch.lock);
+
+  bool copied = false;
+  if (lg->watch.snapshots[node_id] && lg->watch.sizes[node_id] > 0) {
+    size_t size = lg->watch.sizes[node_id];
+    if (state_size)
+      *state_size = size;
+    if (size <= out_capacity) {
+      memcpy(out, lg->watch.snapshots[node_id], size);
+      copied = true;
+    }
+  }
+
+  pthread_rwlock_unlock(&lg->watch.lock);
+  return copied;
 }
 
 // Debug: dump graph topology to stderr

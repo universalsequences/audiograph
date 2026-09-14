@@ -135,6 +135,8 @@ bool remove_node_from_watchlist(LiveGraph *lg, int node_id);
 // Returns NULL if node is not watched or doesn't exist
 // If state_size is not NULL, it will be set to the size of the returned state
 void *get_node_state(LiveGraph *lg, int node_id, size_t *state_size);
+bool get_node_state_into(LiveGraph *lg, int node_id, void *out,
+                         size_t out_capacity, size_t *state_size);
 
 // ===================== Buffer API =====================
 
@@ -162,16 +164,6 @@ int create_buffer(LiveGraph *lg, int size, int channel_count,
 // Note: source_data is copied - caller can free it immediately after this call
 int hot_swap_buffer(LiveGraph *lg, int buffer_id, const float *source_data,
                     int size, int channel_count);
-
-// ===================== Telemetry API =====================
-
-int create_telemetry(LiveGraph *lg, int slot_count);
-bool telemetry_read_u32(LiveGraph *lg, int telemetry_id, int slot, uint32_t *out);
-bool telemetry_read_i32(LiveGraph *lg, int telemetry_id, int slot, int32_t *out);
-bool telemetry_read_f32(LiveGraph *lg, int telemetry_id, int slot, float *out);
-void telemetry_store_u32(ProcessContext *ctx, int telemetry_id, int slot, uint32_t value);
-void telemetry_store_i32(ProcessContext *ctx, int telemetry_id, int slot, int32_t value);
-void telemetry_store_f32(ProcessContext *ctx, int telemetry_id, int slot, float value);
 
 // ===================== Node VTables for Custom Nodes =====================
 
