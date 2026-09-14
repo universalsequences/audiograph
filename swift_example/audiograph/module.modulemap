@@ -1,0 +1,5 @@
+module AudioGraph {
+    header "audiograph_swift.h"
+    link "audiograph"
+    export *
+}
