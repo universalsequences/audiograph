@@ -2,6 +2,14 @@
 #include "graph_edit.h"
 #include "graph_nodes.h"
 
+static bool submit_graph_edit(LiveGraph *lg, const GraphEditCmd *cmd) {
+  if (geq_push(lg->graphEditQueue, cmd))
+    return true;
+  atomic_fetch_add_explicit(&lg->control_submission_failures, 1,
+                            memory_order_relaxed);
+  return false;
+}
+
 static bool using_inline_in_cache(const RTNode *node) {
   return node->cached_inPtrs == (float **)node->cached_inInline;
 }
@@ -20,16 +28,12 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   lg->sched.pending = calloc(lg->node_capacity, sizeof(atomic_int));
   lg->sched.indegree = calloc(lg->node_capacity, sizeof(int));
   lg->sched.is_orphaned = calloc(lg->node_capacity, sizeof(bool));
+  lg->sched.completed_this_block = calloc(lg->node_capacity, sizeof(bool));
 
   // Buffer storage
   lg->buffer_capacity = initial_capacity;
   lg->buffers = calloc(lg->buffer_capacity, sizeof(BufferDesc));
   lg->buffer_count = 0;
-
-  // Telemetry storage (graph-owned atomic slots for realtime -> control)
-  lg->telemetry_capacity = initial_capacity;
-  lg->telemetry = calloc(lg->telemetry_capacity, sizeof(TelemetryDesc));
-  lg->telemetry_count = 0;
 
   // Edge pool (start with generous capacity)
   lg->edge_capacity = initial_capacity * 32;
@@ -72,12 +76,24 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
     free(lg->sched.pending);
     free(lg->sched.indegree);
     free(lg->sched.is_orphaned);
+    free(lg->sched.completed_this_block);
     free(lg);
     return NULL;
   }
 
   // Parameter mailbox
   lg->params = calloc(1, sizeof(ParamRing));
+  lg->block_events = calloc(1, sizeof(BlockEventRing));
+  lg->block_event_scratch_capacity = BLOCK_EVENT_RING_CAP;
+  lg->block_event_scratch =
+      calloc((size_t)lg->block_event_scratch_capacity, sizeof(GraphBlockEvent));
+  lg->block_event_sort_scratch =
+      calloc((size_t)lg->block_event_scratch_capacity, sizeof(GraphBlockEvent));
+  lg->block_event_scratch_count = 0;
+  atomic_init(&lg->block_event_serial, 1);
+  atomic_init(&lg->block_event_delivery_failures, 0);
+  atomic_init(&lg->control_submission_failures, 0);
+  atomic_init(&lg->graph_edit_delivery_failures, 0);
 
   lg->graphEditQueue = calloc(1, sizeof(GraphEditQueue));
   geq_init(lg->graphEditQueue, 8192 * 16);
@@ -95,11 +111,13 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   atomic_init(&lg->active_edit_batch_serial, 0);
   atomic_init(&lg->next_edit_batch_serial, 1);
   atomic_init(&lg->committed_edit_batch_serial, 0);
+  atomic_init(&lg->applied_edit_batch_serial, 0);
 
   // Initialize watch list system
   lg->watch.capacity = 16;
   lg->watch.list = calloc(lg->watch.capacity, sizeof(int));
   lg->watch.count = 0;
+  atomic_init(&lg->watch.update_counter, 0);
   pthread_mutex_init(&lg->watch.mutex, NULL);
 
   // Initialize state store arrays (indexed by node_id)
@@ -167,6 +185,9 @@ void destroy_live_graph(LiveGraph *lg) {
       if (node->state) {
         free(node->state);
       }
+      if (node->debug_name) {
+        free(node->debug_name);
+      }
       if (node->inEdgeId) {
         free(node->inEdgeId);
       }
@@ -194,10 +215,6 @@ void destroy_live_graph(LiveGraph *lg) {
     free(lg->nodes);
   }
 
-  // Free telemetry storage
-  if (lg->telemetry)
-    free(lg->telemetry);
-
   // Free scheduling arrays
   if (lg->sched.pending)
     free(lg->sched.pending);
@@ -205,6 +222,8 @@ void destroy_live_graph(LiveGraph *lg) {
     free(lg->sched.indegree);
   if (lg->sched.is_orphaned)
     free(lg->sched.is_orphaned);
+  if (lg->sched.completed_this_block)
+    free(lg->sched.completed_this_block);
 
   // Free support buffers
   if (lg->silence_buf)
@@ -217,6 +236,12 @@ void destroy_live_graph(LiveGraph *lg) {
     rq_destroy(lg->sched.readyQueue);
   if (lg->params)
     free(lg->params);
+  if (lg->block_events)
+    free(lg->block_events);
+  if (lg->block_event_scratch)
+    free(lg->block_event_scratch);
+  if (lg->block_event_sort_scratch)
+    free(lg->block_event_sort_scratch);
   if (lg->graphEditQueue) {
     geq_deinit(lg->graphEditQueue);
     free(lg->graphEditQueue);
@@ -341,10 +366,23 @@ int add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
 
   // Create a copy of initial_state if provided
   void *initial_state_copy = NULL;
+  char *name_copy = NULL;
   if (initial_state && initial_state_size > 0) {
     initial_state_copy = malloc(initial_state_size);
-    if (initial_state_copy) {
-      memcpy(initial_state_copy, initial_state, initial_state_size);
+    if (!initial_state_copy) {
+      add_failed_id(lg, node_id);
+      return -1;
+    }
+    memcpy(initial_state_copy, initial_state, initial_state_size);
+  }
+  if (name) {
+    name_copy = strdup(name);
+    if (!name_copy) {
+      if (initial_state_copy) {
+        free(initial_state_copy);
+      }
+      add_failed_id(lg, node_id);
+      return -1;
     }
   }
 
@@ -357,17 +395,20 @@ int add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
           .state_size = state_size,
           .logical_id =
               node_id, // Use node_id as the logical_id (they're the same)
-          .name = (char *)name,
+          .name = name_copy,
           .nInputs = nInputs,
           .nOutputs = nOutputs,
           .initial_state = initial_state_copy,
           .initial_state_size = initial_state_size}};
 
   // Queue the command
-  if (!geq_push(lg->graphEditQueue, &cmd)) {
+  if (!submit_graph_edit(lg, &cmd)) {
     // Queue full - consider this a failure
     if (initial_state_copy) {
       free(initial_state_copy);
+    }
+    if (name_copy) {
+      free(name_copy);
     }
     add_failed_id(lg, node_id);
     return -1;
@@ -375,6 +416,16 @@ int add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
 
   // Return the pre-allocated node ID (which is both logical_id and array index)
   return node_id;
+}
+
+int add_gain_node(LiveGraph *lg, float gain_value, const char *name) {
+  if (!lg)
+    return -1;
+
+  float init_state[1];
+  init_state[0] = gain_value;
+  return add_node(lg, GAIN_VTABLE, GAIN_MEMORY_SIZE * sizeof(float), name, 2,
+                  1, init_state, sizeof(init_state));
 }
 
 void begin_graph_edit_batch(LiveGraph *lg) {
@@ -404,6 +455,31 @@ void end_graph_edit_batch(LiveGraph *lg) {
   }
 }
 
+uint32_t graph_edit_queue_available(const LiveGraph *lg) {
+  if (!lg || !lg->graphEditQueue)
+    return 0;
+  const GraphEditQueue *queue = lg->graphEditQueue;
+  uint32_t head = atomic_load_explicit(&queue->head, memory_order_acquire);
+  uint32_t tail = atomic_load_explicit(&queue->tail, memory_order_acquire);
+  uint32_t used = head - tail;
+  uint32_t usable_capacity = queue->cap - 1;
+  return used < usable_capacity ? usable_capacity - used : 0;
+}
+
+uint64_t graph_edit_current_batch_serial(const LiveGraph *lg) {
+  if (!lg)
+    return 0;
+  return atomic_load_explicit(&lg->active_edit_batch_serial,
+                              memory_order_acquire);
+}
+
+uint64_t graph_edit_applied_batch_serial(const LiveGraph *lg) {
+  if (!lg)
+    return 0;
+  return atomic_load_explicit(&lg->applied_edit_batch_serial,
+                              memory_order_acquire);
+}
+
 int create_buffer(LiveGraph *lg, int size, int channel_count,
                   const float *source_data) {
   int buffer_id = atomic_fetch_add(&lg->next_buffer_id, 1);
@@ -427,7 +503,7 @@ int create_buffer(LiveGraph *lg, int size, int channel_count,
                                           .source_data = source_copy,
                                           .source_data_size = source_size}};
 
-  if (!geq_push(lg->graphEditQueue, &cmd)) {
+  if (!submit_graph_edit(lg, &cmd)) {
     if (source_copy)
       free(source_copy);
     return -1;
@@ -457,90 +533,39 @@ int hot_swap_buffer(LiveGraph *lg, int buffer_id, const float *source_data,
                                            .source_data = source_copy,
                                            .source_data_size = source_size}};
 
-  if (!geq_push(lg->graphEditQueue, &cmd)) {
+  if (!submit_graph_edit(lg, &cmd)) {
     free(source_copy);
     return false;
   }
   return true;
 }
 
-int create_telemetry(LiveGraph *lg, int slot_count) {
-  if (!lg || slot_count <= 0)
-    return -1;
-  if (slot_count > TELEMETRY_MAX_SLOTS)
-    slot_count = TELEMETRY_MAX_SLOTS;
-
-  if (lg->telemetry_count >= lg->telemetry_capacity) {
-    int new_capacity = lg->telemetry_capacity > 0 ? lg->telemetry_capacity * 2 : 16;
-    TelemetryDesc *new_telemetry = realloc(
-        lg->telemetry, (size_t)new_capacity * sizeof(TelemetryDesc));
-    if (!new_telemetry)
-      return -1;
-    memset(new_telemetry + lg->telemetry_capacity, 0,
-           (size_t)(new_capacity - lg->telemetry_capacity) * sizeof(TelemetryDesc));
-    lg->telemetry = new_telemetry;
-    lg->telemetry_capacity = new_capacity;
+bool write_node_state(LiveGraph *lg, int node_id, size_t dest_offset,
+                      const float *source_data, size_t count) {
+  if (!lg || node_id < 0 || !source_data || count == 0) {
+    return false;
   }
 
-  int telemetry_id = lg->telemetry_count++;
-  TelemetryDesc *td = &lg->telemetry[telemetry_id];
-  td->slot_count = slot_count;
-  td->in_use = true;
-  for (int i = 0; i < TELEMETRY_MAX_SLOTS; i++) {
-    atomic_store_explicit(&td->slots[i], 0, memory_order_relaxed);
+  // Copy source data (so caller can free their copy); freed after apply.
+  size_t source_bytes = count * sizeof(float);
+  float *source_copy = malloc(source_bytes);
+  if (!source_copy) {
+    return false;
   }
-  return telemetry_id;
-}
+  memcpy(source_copy, source_data, source_bytes);
 
-bool telemetry_read_u32(LiveGraph *lg, int telemetry_id, int slot, uint32_t *out) {
-  if (!lg || !out || telemetry_id < 0 || telemetry_id >= lg->telemetry_count)
+  GraphEditCmd cmd = {.op = GE_WRITE_NODE_STATE,
+                      .batch_serial = current_batch_serial(lg),
+                      .u.write_node_state = {.node_id = node_id,
+                                             .dest_offset = dest_offset,
+                                             .source_data = source_copy,
+                                             .source_count = count}};
+
+  if (!submit_graph_edit(lg, &cmd)) {
+    free(source_copy);
     return false;
-  TelemetryDesc *td = &lg->telemetry[telemetry_id];
-  if (!td->in_use || slot < 0 || slot >= td->slot_count)
-    return false;
-  *out = atomic_load_explicit(&td->slots[slot], memory_order_acquire);
+  }
   return true;
-}
-
-bool telemetry_read_i32(LiveGraph *lg, int telemetry_id, int slot, int32_t *out) {
-  uint32_t bits = 0;
-  if (!telemetry_read_u32(lg, telemetry_id, slot, &bits))
-    return false;
-  *out = (int32_t)bits;
-  return true;
-}
-
-bool telemetry_read_f32(LiveGraph *lg, int telemetry_id, int slot, float *out) {
-  uint32_t bits = 0;
-  if (!telemetry_read_u32(lg, telemetry_id, slot, &bits))
-    return false;
-  union {
-    uint32_t u;
-    float f;
-  } v = {.u = bits};
-  *out = v.f;
-  return true;
-}
-
-void telemetry_store_u32(ProcessContext *ctx, int telemetry_id, int slot, uint32_t value) {
-  if (!ctx || !ctx->telemetry || telemetry_id < 0 || telemetry_id >= ctx->telemetry_count)
-    return;
-  TelemetryDesc *td = &ctx->telemetry[telemetry_id];
-  if (!td->in_use || slot < 0 || slot >= td->slot_count)
-    return;
-  atomic_store_explicit(&td->slots[slot], value, memory_order_release);
-}
-
-void telemetry_store_i32(ProcessContext *ctx, int telemetry_id, int slot, int32_t value) {
-  telemetry_store_u32(ctx, telemetry_id, slot, (uint32_t)value);
-}
-
-void telemetry_store_f32(ProcessContext *ctx, int telemetry_id, int slot, float value) {
-  union {
-    float f;
-    uint32_t u;
-  } v = {.f = value};
-  telemetry_store_u32(ctx, telemetry_id, slot, v.u);
 }
 
 bool is_failed_node(LiveGraph *lg, int logical_id) {
@@ -560,7 +585,7 @@ bool delete_node(LiveGraph *lg, int node_id) {
                       .batch_serial = current_batch_serial(lg),
                       .u.remove_node = {.node_id = node_id}};
 
-  return geq_push(lg->graphEditQueue, &cmd);
+  return submit_graph_edit(lg, &cmd);
 }
 
 bool graph_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
@@ -577,7 +602,7 @@ bool graph_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
                                     .dst_id = dst_node,
                                     .dst_port = dst_port}};
 
-  return geq_push(lg->graphEditQueue, &cmd);
+  return submit_graph_edit(lg, &cmd);
 }
 
 bool graph_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
@@ -589,7 +614,7 @@ bool graph_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
                                        .dst_id = dst_node,
                                        .dst_port = dst_port}};
 
-  return geq_push(lg->graphEditQueue, &cmd);
+  return submit_graph_edit(lg, &cmd);
 }
 
 bool hot_swap_node(LiveGraph *lg, int node_id, NodeVTable vt, size_t state_size,
@@ -625,7 +650,7 @@ bool hot_swap_node(LiveGraph *lg, int node_id, NodeVTable vt, size_t state_size,
                           }
 
   };
-  if (!geq_push(lg->graphEditQueue, &cmd)) {
+  if (!submit_graph_edit(lg, &cmd)) {
     // Queue push failed - clean up copied memory
     if (initial_state_copy) {
       free(initial_state_copy);
@@ -662,7 +687,7 @@ bool replace_keep_edges(LiveGraph *lg, int node_id, NodeVTable vt,
                           .initial_state_size = initial_state_size,
 
                       }};
-  if (!geq_push(lg->graphEditQueue, &cmd)) {
+  if (!submit_graph_edit(lg, &cmd)) {
     // Queue push failed - clean up copied memory
     if (initial_state_copy) {
       free(initial_state_copy);
@@ -696,7 +721,7 @@ bool add_node_to_watchlist(LiveGraph *lg, int node_id) {
   GraphEditCmd cmd = {.op = GE_ADD_WATCH,
                       .batch_serial = current_batch_serial(lg),
                       .u.add_watch = {.node_id = node_id}};
-  return geq_push(lg->graphEditQueue, &cmd);
+  return submit_graph_edit(lg, &cmd);
 }
 
 bool remove_node_from_watchlist(LiveGraph *lg, int node_id) {
@@ -705,7 +730,7 @@ bool remove_node_from_watchlist(LiveGraph *lg, int node_id) {
   GraphEditCmd cmd = {.op = GE_REMOVE_WATCH,
                       .batch_serial = current_batch_serial(lg),
                       .u.remove_watch = {.node_id = node_id}};
-  return geq_push(lg->graphEditQueue, &cmd);
+  return submit_graph_edit(lg, &cmd);
 }
 
 void *get_node_state(LiveGraph *lg, int node_id, size_t *state_size) {
@@ -733,6 +758,31 @@ void *get_node_state(LiveGraph *lg, int node_id, size_t *state_size) {
   if (state_size)
     *state_size = size;
   return result;
+}
+
+bool get_node_state_into(LiveGraph *lg, int node_id, void *out,
+                         size_t out_capacity, size_t *state_size) {
+  if (state_size)
+    *state_size = 0;
+  if (!lg || !out || node_id < 0 || node_id >= lg->node_capacity) {
+    return false;
+  }
+
+  pthread_rwlock_rdlock(&lg->watch.lock);
+
+  bool copied = false;
+  if (lg->watch.snapshots[node_id] && lg->watch.sizes[node_id] > 0) {
+    size_t size = lg->watch.sizes[node_id];
+    if (state_size)
+      *state_size = size;
+    if (size <= out_capacity) {
+      memcpy(out, lg->watch.snapshots[node_id], size);
+      copied = true;
+    }
+  }
+
+  pthread_rwlock_unlock(&lg->watch.lock);
+  return copied;
 }
 
 // Debug: dump graph topology to stderr

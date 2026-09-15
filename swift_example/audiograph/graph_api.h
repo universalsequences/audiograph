@@ -4,55 +4,14 @@
 #include "graph_engine.h"
 #include "graph_types.h"
 
-// ===================== High-Level Graph Builder API =====================
+// ===================== Watch List API =====================
+bool add_node_to_watchlist(LiveGraph *lg, int node_id);
+bool remove_node_from_watchlist(LiveGraph *lg, int node_id);
+void *get_node_state(LiveGraph *lg, int node_id, size_t *state_size);
+bool get_node_state_into(LiveGraph *lg, int node_id, void *out,
+                         size_t out_capacity, size_t *state_size);
 
-// Higher-level node handle for Web Audio-style API
-typedef struct AudioNode {
-  uint64_t logical_id;
-  NodeVTable vtable;
-  void *state;
-
-  // Connection tracking (build-time only)
-  struct AudioNode **inputs;  // nodes feeding into this one
-  struct AudioNode **outputs; // nodes this one feeds
-  int input_count, output_count;
-  int input_capacity, output_capacity;
-
-  // Metadata
-  const char *name;
-} AudioNode;
-
-// Graph builder context
-typedef struct GraphBuilder {
-  AudioNode **nodes;
-  int node_count;
-  int node_capacity;
-} GraphBuilder;
-
-// ===================== Graph Builder Operations =====================
-
-GraphBuilder *create_graph_builder(void);
-void add_node_to_builder(GraphBuilder *gb, AudioNode *node);
-int find_node_index(GraphBuilder *gb, AudioNode *target);
-void free_graph_builder(GraphBuilder *gb);
-
-// ===================== Web Audio-Style Node Creation =====================
-
-AudioNode *create_oscillator(GraphBuilder *gb, float freq_hz, const char *name);
-AudioNode *create_gain(GraphBuilder *gb, float gain_value, const char *name);
-AudioNode *create_mixer2(GraphBuilder *gb, const char *name);
-AudioNode *create_mixer3(GraphBuilder *gb, const char *name);
-
-// ===================== Generic Node Creation Helper =====================
-
-AudioNode *create_generic_node(GraphBuilder *gb, KernelFn process_fn,
-                               int memory_size, int num_inputs, int num_outputs,
-                               const char *name);
-
-// ===================== Graph Compilation =====================
-
-GraphState *compile_graph(GraphBuilder *gb, int sample_rate, int block_size,
-                          const char *label);
-int count_total_edges(GraphBuilder *gb);
+// Debug
+void debug_dump_graph(LiveGraph *lg);
 
 #endif // GRAPH_API_H

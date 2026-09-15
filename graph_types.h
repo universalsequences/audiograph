@@ -1,7 +1,6 @@
 #ifndef GRAPH_TYPES_H
 #define GRAPH_TYPES_H
 
-#define _GNU_SOURCE
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
@@ -46,18 +45,43 @@ static inline uint64_t nsec_now(void) {
 }
 
 // ===================== Kernel ABI =====================
+#define GBE_AUX_CAP 32
+
+typedef enum {
+  GBE_NOTE_ON = 1,
+  GBE_GATE_OFF,
+  GBE_PULSE,
+  GBE_PRESSURE = 4,
+  GBE_EXPRESSION = 5,
+  GBE_MIXER_PARAM = 6,
+} GraphBlockEventKind;
+
+typedef struct {
+  uint64_t logical_id;   // engine: routing
+  uint32_t frame_offset; // engine: outer-callback offset, rebased per slice
+  uint32_t sequence;     // engine: stable tie-break
+  uint32_t kind;         // node-interpreted tag
+  uint32_t aux_count;    // valid entries in aux[]
+  float aux[GBE_AUX_CAP]; // opaque to the engine
+} GraphBlockEvent;
+
 typedef void (*KernelFn)(float *const *in, float *const *out, int nframes,
                          void *state, void *buffers);
 typedef void (*InitFn)(void *state, int sampleRate, int maxBlock,
                        const void *initial_state);
 typedef void (*ResetFn)(void *state);
 typedef void (*MigrateFn)(void *newState, const void *oldState);
+typedef void (*BeginEventSliceFn)(void *state, uint64_t block_serial,
+                                  int slice_start, int slice_nframes);
+typedef bool (*ScheduleEventFn)(void *state, const GraphBlockEvent *event);
 
 typedef struct {
   KernelFn process;
   InitFn init;       // optional
   ResetFn reset;     // optional
   MigrateFn migrate; // optional: copy persistent state on graph swap
+  BeginEventSliceFn begin_event_slice; // optional: audio thread, before slice
+  ScheduleEventFn schedule_event;      // optional: audio thread, slice-local event
 } NodeVTable;
 
 // ===================== Parameter Mailbox =====================
@@ -69,13 +93,21 @@ typedef struct {
   float fvalue;        // e.g., new gain
 } ParamMsg;
 
-#define PARAM_RING_CAP 2048
+#define PARAM_RING_CAP 16384
 
 typedef struct ParamRing {
   ParamMsg buf[PARAM_RING_CAP];
   _Atomic uint32_t head; // producer writes
   _Atomic uint32_t tail; // consumer reads
 } ParamRing;
+
+#define BLOCK_EVENT_RING_CAP 16384
+
+typedef struct BlockEventRing {
+  GraphBlockEvent buf[BLOCK_EVENT_RING_CAP];
+  _Atomic uint32_t head; // producer writes
+  _Atomic uint32_t tail; // consumer reads
+} BlockEventRing;
 
 // ===================== MPMC Work Queue =====================
 
@@ -102,6 +134,26 @@ static inline bool params_pop(ParamRing *r, ParamMsg *out) {
   return true;
 }
 
+static inline bool block_events_push(BlockEventRing *r, GraphBlockEvent m) {
+  uint32_t h = atomic_load_explicit(&r->head, memory_order_relaxed);
+  uint32_t t = atomic_load_explicit(&r->tail, memory_order_acquire);
+  if ((h - t) >= BLOCK_EVENT_RING_CAP)
+    return false; // full
+  r->buf[h % BLOCK_EVENT_RING_CAP] = m;
+  atomic_store_explicit(&r->head, h + 1, memory_order_release);
+  return true;
+}
+
+static inline bool block_events_pop(BlockEventRing *r, GraphBlockEvent *out) {
+  uint32_t t = atomic_load_explicit(&r->tail, memory_order_relaxed);
+  uint32_t h = atomic_load_explicit(&r->head, memory_order_acquire);
+  if (t == h)
+    return false; // empty
+  *out = r->buf[t % BLOCK_EVENT_RING_CAP];
+  atomic_store_explicit(&r->tail, t + 1, memory_order_release);
+  return true;
+}
+
 typedef enum {
   GE_ADD_NODE,
   GE_REMOVE_NODE,
@@ -114,7 +166,9 @@ typedef enum {
   GE_REMOVE_WATCH,
 
   GE_CREATE_BUFFER,
-  GE_HOTSWAP_BUFFER
+  GE_HOTSWAP_BUFFER,
+
+  GE_WRITE_NODE_STATE // bulk-write a float block into a node's state memory
 
 } GraphEditOp;
 
@@ -159,6 +213,13 @@ typedef struct {
 } GEHotSwapBuffer;
 
 typedef struct {
+  int node_id;          // target node whose state to write
+  size_t dest_offset;   // destination offset into node state, in floats
+  float *source_data;   // floats to copy (caller-owned, freed after apply)
+  size_t source_count;  // number of floats in source_data
+} GEWriteNodeState;
+
+typedef struct {
   GraphEditOp op;
   uint64_t batch_serial;
   union {
@@ -191,6 +252,7 @@ typedef struct {
     } remove_watch;
     GECreateBuffer create_buffer;
     GEHotSwapBuffer hotswap_buffer;
+    GEWriteNodeState write_node_state;
   } u;
 } GraphEditCmd;
 
@@ -214,6 +276,7 @@ typedef struct {
   MPMCQueue *ring;            // Thread-safe node storage
   _Atomic int qlen;           // Logical queue length
   _Atomic int waiters;        // Number of threads waiting on items
+  _Atomic bool finished;     // Completion is a wake condition, even with no items
   dispatch_semaphore_t items; // Semaphore used for wakeups
 } ReadyQ;
 #else
@@ -222,6 +285,7 @@ typedef struct {
   MPMCQueue *ring;     // Thread-safe node storage
   _Atomic int qlen;    // Logical queue length
   _Atomic int waiters; // Number of threads waiting on items
+  _Atomic bool finished;
   sem_t items;         // Semaphore used for wakeups
 } ReadyQ;
 #endif
@@ -240,9 +304,12 @@ ReadyQ *rq_create(int capacity);
 void rq_destroy(ReadyQ *q);
 bool rq_push(ReadyQ *q, int32_t nid);
 bool rq_try_pop(ReadyQ *q, int32_t *out);
-bool rq_wait_nonempty(ReadyQ *q, int timeout_us);
-void rq_reset(ReadyQ *q); // Reset/drain queue for clean block start
+void rq_wait_for_work(ReadyQ *q, int timeout_us); // Work, completion, or timeout
+void rq_finish(ReadyQ *q); // Publish completion and wake every registered waiter
+// Reset and destruction require exclusive ownership: no producers, consumers,
+// or waiters. The engine's session reference barrier establishes this boundary.
+void rq_reset(ReadyQ *q);
 void rq_push_or_spin(ReadyQ *q, int32_t nid); // Retry until enqueue succeeds
-void rq_push_batch(ReadyQ *q, const int32_t *nids, int count); // Batch push with single signal
+void rq_push_batch(ReadyQ *q, const int32_t *nids, int count); // Publish batch, then notify waiters
 
 #endif // GRAPH_TYPES_H

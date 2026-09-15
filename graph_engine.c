@@ -1,11 +1,21 @@
 #include "graph_engine.h"
 #include "graph_edit.h"
 #include "graph_nodes.h"
+#include "graph_profile.h"
 #include <assert.h>
+#include <errno.h>
+#include <math.h>
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
+#if defined(__x86_64__) || defined(__i386__)
+#include <pmmintrin.h>
+#endif
 
 // On Apple platforms, enable QoS hints for worker threads to reduce jitter.
 #ifdef __APPLE__
@@ -26,22 +36,41 @@
 
 // ===================== Forward Declarations =====================
 
+// Only control threads take this lock. Workers acknowledge through atomics.
+static pthread_mutex_t workgroup_control_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 void bind_and_run_live(LiveGraph *lg, int nid, int nframes);
-static void init_pending_and_seed(LiveGraph *lg);
+static void init_pending_and_seed(LiveGraph *lg, int nframes);
 void process_live_block(LiveGraph *lg, int nframes);
 static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes);
-static void wait_for_block_start_or_shutdown(void);
+static inline bool try_execute_ready_node(LiveGraph *lg, int32_t nid,
+                                          int nframes);
+static inline void schedule_ready_node(LiveGraph *lg, int32_t nid, int nframes);
+static void wait_for_block_start_or_shutdown(int worker_index, int workgroup_version);
 static void rebuild_invalid_io_caches(LiveGraph *lg, int nframes);
 static int choose_active_worker_count(LiveGraph *lg);
+
+#ifndef AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
+#define AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS 0
+#endif
+
+#if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
+#define PENDING_RUNNING_SENTINEL (-2)
+#define PENDING_DONE_SENTINEL (-3)
+#define COMPLETION_LOG_CAPACITY 64
+#endif
 
 // ===================== Global Engine Instance =====================
 
 Engine g_engine;
+_Atomic uint64_t g_param_push_count = 0;
+_Atomic uint64_t g_param_push_fail_count = 0;
+_Atomic uint64_t g_block_event_push_count = 0;
+_Atomic uint64_t g_block_event_push_fail_count = 0;
 
 // Worker threads should be less aggressive than the audio callback thread.
-// The audio thread still actively helps drain the graph in process_live_block_internal(),
-// but idle helper workers back off quickly instead of burning CPU polling an empty
-// ready queue while another thread is processing the graph's current critical path.
+// The audio thread still actively helps drain the graph, but idle helper
+// workers back off quickly instead of burning CPU polling an empty ready queue.
 #ifndef AUDIOGRAPH_WORKER_EMPTY_SPINS
 #define AUDIOGRAPH_WORKER_EMPTY_SPINS 8
 #endif
@@ -50,15 +79,121 @@ Engine g_engine;
 #define AUDIOGRAPH_WORKER_WAIT_TIMEOUT_US 50
 #endif
 
-// Watchlist snapshots are used by UI-ish polling operators (transport, meters,
-// scopes, displays), but copying all watched node state every audio callback is
-// expensive. Throttle process_next_block() snapshots; direct process_live_block()
-// callers still update every call.
+#ifndef AUDIOGRAPH_CALLBACK_EMPTY_SPINS
+#define AUDIOGRAPH_CALLBACK_EMPTY_SPINS 64
+#endif
+
+#ifndef AUDIOGRAPH_CALLBACK_WAIT_TIMEOUT_US
+// macOS live measurements support a short completion-aware callback wait.
+// Retain Linux's existing policy until its realtime scheduling is measured.
+#ifdef __APPLE__
+#define AUDIOGRAPH_CALLBACK_WAIT_TIMEOUT_US 50
+#else
+#define AUDIOGRAPH_CALLBACK_WAIT_TIMEOUT_US 0
+#endif
+#endif
+
+#ifdef AUDIOGRAPH_EXPERIMENTS
+// Overrides are configured once, before starting the engine, and are absent
+// from ordinary builds. The benchmark always supplies all policy values.
+static int experiment_worker_spins = AUDIOGRAPH_WORKER_EMPTY_SPINS;
+static int experiment_worker_wait_us = AUDIOGRAPH_WORKER_WAIT_TIMEOUT_US;
+static int experiment_callback_spins = AUDIOGRAPH_CALLBACK_EMPTY_SPINS;
+static int experiment_callback_wait_us = AUDIOGRAPH_CALLBACK_WAIT_TIMEOUT_US;
+extern int audiograph_experiment_queue_hint;
+void audiograph_configure_experiment(int worker_spins, int worker_wait_us,
+                                    int callback_spins, int callback_wait_us,
+                                    int queue_hint) {
+  assert(worker_spins >= 1 && worker_wait_us >= 1 && callback_spins >= 1 &&
+         callback_wait_us >= 0);
+  experiment_worker_spins = worker_spins;
+  experiment_worker_wait_us = worker_wait_us;
+  experiment_callback_spins = callback_spins;
+  experiment_callback_wait_us = callback_wait_us;
+  audiograph_experiment_queue_hint = queue_hint;
+}
+#undef AUDIOGRAPH_WORKER_EMPTY_SPINS
+#undef AUDIOGRAPH_WORKER_WAIT_TIMEOUT_US
+#undef AUDIOGRAPH_CALLBACK_EMPTY_SPINS
+#undef AUDIOGRAPH_CALLBACK_WAIT_TIMEOUT_US
+#define AUDIOGRAPH_WORKER_EMPTY_SPINS experiment_worker_spins
+#define AUDIOGRAPH_WORKER_WAIT_TIMEOUT_US experiment_worker_wait_us
+#define AUDIOGRAPH_CALLBACK_EMPTY_SPINS experiment_callback_spins
+#define AUDIOGRAPH_CALLBACK_WAIT_TIMEOUT_US experiment_callback_wait_us
+#endif
+
+// RealtimeKit requires RLIMIT_RTTIME and Linux kills the entire process when an
+// SCHED_RR thread consumes that much CPU without a blocking syscall. Keep the
+// checkpoint far below RealtimeKit's usual 200 ms ceiling.
+#ifndef AUDIOGRAPH_RTKIT_CHECKPOINT_INTERVAL_NS
+#define AUDIOGRAPH_RTKIT_CHECKPOINT_INTERVAL_NS 1000000ull
+#endif
+
+// Watchlist snapshots are useful for UI polling, but copying all watched node
+// state every audio callback can be expensive. Direct process_live_block()
+// callers still update every call; process_next_block() throttles snapshots.
 #ifndef AUDIOGRAPH_WATCH_UPDATE_INTERVAL
 #define AUDIOGRAPH_WATCH_UPDATE_INTERVAL 4
 #endif
 
-static _Atomic uint32_t g_watch_update_counter = 0;
+#ifndef AUDIOGRAPH_STALL_RECOVERY_TIMEOUT_NS
+#define AUDIOGRAPH_STALL_RECOVERY_TIMEOUT_NS 50000000ull
+#endif
+
+static _Atomic int g_active_job_count = 0;
+#ifdef __linux__
+static EngineRtKitWorkerHook g_rtkit_worker_hook = NULL;
+static EngineRtKitCallbackHook g_rtkit_callback_hook = NULL;
+static _Atomic int g_rt_permission_warning_logged = 0;
+static __thread uint64_t g_last_rtkit_checkpoint_ns = 0;
+
+static inline int base_linux_scheduling_policy(int policy) {
+#ifdef SCHED_RESET_ON_FORK
+  return policy & ~SCHED_RESET_ON_FORK;
+#else
+  return policy;
+#endif
+}
+
+static inline void checkpoint_rtkit_cpu_budget(int policy) {
+  if (base_linux_scheduling_policy(policy) != SCHED_RR)
+    return;
+
+  uint64_t now_ns = nsec_now();
+  if (g_last_rtkit_checkpoint_ns == 0) {
+    g_last_rtkit_checkpoint_ns = now_ns;
+    return;
+  }
+  if (now_ns - g_last_rtkit_checkpoint_ns <
+      AUDIOGRAPH_RTKIT_CHECKPOINT_INTERVAL_NS) {
+    return;
+  }
+
+  // A positive nanosleep is a blocking syscall even at this deliberately tiny
+  // duration. Besides yielding to the other graph threads, it resets Linux's
+  // RLIMIT_RTTIME accounting. This is only used for RealtimeKit's SCHED_RR;
+  // direct SCHED_FIFO scheduling retains its existing hot path.
+  struct timespec request = {.tv_sec = 0, .tv_nsec = 1};
+  struct timespec remaining;
+  int result;
+  while ((result = nanosleep(&request, &remaining)) != 0 && errno == EINTR) {
+    request = remaining;
+  }
+  if (result == 0)
+    g_last_rtkit_checkpoint_ns = nsec_now();
+}
+#endif
+static _Atomic uint64_t g_stall_recovery_count = 0;
+static _Atomic uint64_t g_graph_trace_block_counter = 0;
+static _Atomic uint32_t g_graph_trace_silent_streak = 0;
+static _Atomic uint64_t g_param_apply_count = 0;
+static _Atomic uint64_t g_param_drop_oob_count = 0;
+static _Atomic uint64_t g_param_drop_nonfinite_count = 0;
+static _Atomic uint64_t g_block_event_apply_count = 0;
+static _Atomic uint64_t g_block_event_drop_stale_count = 0;
+static _Atomic uint64_t g_block_event_drop_unsupported_count = 0;
+static _Atomic uint64_t g_block_event_drop_invalid_count = 0;
+static _Atomic uint64_t g_block_event_schedule_reject_count = 0;
 
 static bool using_inline_in_cache(const RTNode *node) {
   return node->cached_inPtrs == (float **)node->cached_inInline;
@@ -72,6 +207,92 @@ static bool using_inline_out_cache(const RTNode *node) {
 
 // Thread-local storage for current node being processed
 static __thread RTNode *g_current_processing_node = NULL;
+
+#if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS || defined(AUDIOGRAPH_EXPERIMENTS)
+static __thread int g_current_execution_slot = 0;
+#endif
+
+#if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
+#define MAX_TRACKED_EXECUTION_SLOTS 65
+static _Atomic int g_inflight_node_ids[MAX_TRACKED_EXECUTION_SLOTS];
+static _Atomic uint64_t g_completion_seq = 0;
+static _Atomic int g_completed_jobs = 0;
+static _Atomic int g_completion_log_nodes[COMPLETION_LOG_CAPACITY];
+static _Atomic uint64_t g_completion_log_seq[COMPLETION_LOG_CAPACITY];
+
+static void dump_inflight_nodes(LiveGraph *lg) {
+  fprintf(stderr, "[audiograph] in-flight node dump begin\n");
+  for (int slot = 0; slot < MAX_TRACKED_EXECUTION_SLOTS; slot++) {
+    int nid = atomic_load_explicit(&g_inflight_node_ids[slot], memory_order_acquire);
+    if (nid < 0 || !lg || nid >= lg->node_count) {
+      continue;
+    }
+    RTNode *node = &lg->nodes[nid];
+    fprintf(stderr, "[audiograph] in-flight slot=%d node=%d logical=%llu name=%s\n",
+            slot, nid, (unsigned long long)node->logical_id,
+            node->debug_name ? node->debug_name : "<unnamed>");
+  }
+  fprintf(stderr, "[audiograph] in-flight node dump end\n");
+}
+
+static void dump_completion_log(LiveGraph *lg) {
+  int completed_jobs =
+      atomic_load_explicit(&g_completed_jobs, memory_order_acquire);
+  uint64_t completion_seq =
+      atomic_load_explicit(&g_completion_seq, memory_order_acquire);
+  fprintf(stderr,
+          "[audiograph] completion summary completed_jobs=%d completion_seq=%llu\n",
+          completed_jobs, (unsigned long long)completion_seq);
+  fprintf(stderr, "[audiograph] completion log begin\n");
+
+  uint64_t start_seq = 0;
+  if (completion_seq > COMPLETION_LOG_CAPACITY) {
+    start_seq = completion_seq - COMPLETION_LOG_CAPACITY;
+  }
+  for (uint64_t seq = start_seq; seq < completion_seq; seq++) {
+    int slot = (int)(seq % COMPLETION_LOG_CAPACITY);
+    uint64_t slot_seq =
+        atomic_load_explicit(&g_completion_log_seq[slot], memory_order_acquire);
+    if (slot_seq != seq + 1) {
+      continue;
+    }
+    int nid =
+        atomic_load_explicit(&g_completion_log_nodes[slot], memory_order_acquire);
+    if (!lg || nid < 0 || nid >= lg->node_count) {
+      fprintf(stderr,
+              "[audiograph] completion seq=%llu nid=%d INVALID\n",
+              (unsigned long long)seq, nid);
+      continue;
+    }
+    RTNode *node = &lg->nodes[nid];
+    fprintf(stderr,
+            "[audiograph] completion seq=%llu nid=%d logical=%llu name=%s\n",
+            (unsigned long long)seq, nid, (unsigned long long)node->logical_id,
+            node->debug_name ? node->debug_name : "<unnamed>");
+  }
+  fprintf(stderr, "[audiograph] completion log end\n");
+}
+
+static inline bool claim_ready_node(LiveGraph *lg, int32_t nid) {
+  if (!lg || nid < 0 || nid >= lg->node_count) {
+    return false;
+  }
+  int expected = 0;
+  if (atomic_compare_exchange_strong_explicit(&lg->sched.pending[nid], &expected,
+                                              PENDING_RUNNING_SENTINEL,
+                                              memory_order_acq_rel,
+                                              memory_order_acquire)) {
+    return true;
+  }
+
+  RTNode *node = &lg->nodes[nid];
+  fprintf(stderr,
+          "[audiograph] WARN: duplicate/spurious ready pop nid=%d logical=%llu pending=%d name=%s\n",
+          nid, (unsigned long long)node->logical_id, expected,
+          node->debug_name ? node->debug_name : "<unnamed>");
+  return false;
+}
+#endif
 
 int ap_current_node_ninputs(void) {
   if (g_current_processing_node) {
@@ -87,15 +308,56 @@ void initialize_engine(int block_Size, int sample_rate) {
   atomic_store_explicit(&g_engine.oswg_join_pending, 0, memory_order_relaxed);
   atomic_store_explicit(&g_engine.oswg_join_remaining, 0, memory_order_relaxed);
   atomic_store_explicit(&g_engine.oswg_version, 0, memory_order_relaxed);
-  atomic_store_explicit(&g_engine.rt_time_constraint, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_engine.rt_scheduling, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_engine.rt_priority, 20, memory_order_relaxed);
+  g_engine.workerPolicies = NULL;
+  g_engine.workerPriorities = NULL;
+  g_engine.workerWorkgroupErrors = NULL;
+  atomic_store_explicit(&g_engine.workerStartupCount, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_engine.callbackPolicy, ENGINE_SCHED_POLICY_UNKNOWN,
+                        memory_order_relaxed);
+  atomic_store_explicit(&g_engine.callbackPriority, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_engine.callbackReported, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_engine.graph_log, 0, memory_order_relaxed);
   atomic_store_explicit(&g_engine.activeWorkerLimit, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_active_job_count, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_stall_recovery_count, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_graph_trace_block_counter, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_graph_trace_silent_streak, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_param_push_count, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_param_push_fail_count, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_block_event_push_count, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_block_event_push_fail_count, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_param_apply_count, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_param_drop_oob_count, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_param_drop_nonfinite_count, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_block_event_apply_count, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_block_event_drop_stale_count, 0,
+                        memory_order_relaxed);
+  atomic_store_explicit(&g_block_event_drop_unsupported_count, 0,
+                        memory_order_relaxed);
+  atomic_store_explicit(&g_block_event_drop_invalid_count, 0,
+                        memory_order_relaxed);
+  atomic_store_explicit(&g_block_event_schedule_reject_count, 0,
+                        memory_order_relaxed);
+#if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
+  for (int i = 0; i < MAX_TRACKED_EXECUTION_SLOTS; i++) {
+    atomic_store_explicit(&g_inflight_node_ids[i], -1, memory_order_relaxed);
+  }
+  atomic_store_explicit(&g_completion_seq, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_completed_jobs, 0, memory_order_relaxed);
+  for (int i = 0; i < COMPLETION_LOG_CAPACITY; i++) {
+    atomic_store_explicit(&g_completion_log_nodes[i], -1, memory_order_relaxed);
+    atomic_store_explicit(&g_completion_log_seq[i], 0, memory_order_relaxed);
+  }
+#endif
 }
 
 // ===================== Graph Management =====================
 
 // ===================== Parameter Application =====================
 
-#define DGEN_HEADER_SLOTS 4
+#define DGEN_HEADER_SLOTS 5
 #define DGEN_CANARY_INDEX 2
 #define DGEN_HEADER_CANARY_BITS 0x4cd35a1dU
 #define DGEN_STATE_REDZONE_SLOTS 256
@@ -112,6 +374,7 @@ void apply_params(LiveGraph *g) {
   if (!g || !g->params)
     return;
   ParamMsg m;
+  uint64_t applied = 0;
   while (params_pop(g->params, &m)) {
     // O(1) direct lookup: logical_id is used as the array index in apply_add_node
     int node_id = (int)m.logical_id;
@@ -121,13 +384,41 @@ void apply_params(LiveGraph *g) {
       if (node->state && node->logical_id == m.logical_id) {
         float *memory = (float *)node->state;
         int state_slots = (int)(node->state_size / sizeof(float));
+        if (m.idx >= (uint64_t)state_slots) {
+          uint64_t dropped = atomic_fetch_add_explicit(
+                                 &g_param_drop_oob_count, 1, memory_order_acq_rel) +
+                             1;
+          if (dropped <= 16 || (dropped % 128u) == 0) {
+            fprintf(stderr,
+                    "[audiograph] dropped out-of-range param logical=%llu idx=%llu state_slots=%d drops=%llu\n",
+                    (unsigned long long)m.logical_id, (unsigned long long)m.idx,
+                    state_slots, (unsigned long long)dropped);
+          }
+          continue;
+        }
+        if (!isfinite(m.fvalue)) {
+          uint64_t dropped = atomic_fetch_add_explicit(
+                                 &g_param_drop_nonfinite_count, 1,
+                                 memory_order_acq_rel) +
+                             1;
+          if (dropped <= 16 || (dropped % 128u) == 0) {
+            fprintf(stderr,
+                    "[audiograph] dropped non-finite param logical=%llu idx=%llu value=%f drops=%llu\n",
+                    (unsigned long long)m.logical_id, (unsigned long long)m.idx,
+                    m.fvalue, (unsigned long long)dropped);
+          }
+          continue;
+        }
         memory[m.idx] = m.fvalue;
+        applied++;
         if (m.idx >= DGEN_HEADER_SLOTS && has_dgen_header_canary(memory)) {
           int total_slots = (int)memory[1];
           if (total_slots > 0) {
             int write_base = DGEN_HEADER_SLOTS + total_slots + DGEN_STATE_REDZONE_SLOTS;
-            int mirrored_idx = write_base + (m.idx - DGEN_HEADER_SLOTS);
-            if (mirrored_idx >= 0 && mirrored_idx < state_slots) {
+            int dgen_idx = (int)(m.idx - DGEN_HEADER_SLOTS);
+            int mirrored_idx = write_base + dgen_idx;
+            if (dgen_idx >= 0 && dgen_idx < total_slots &&
+                mirrored_idx >= 0 && mirrored_idx < state_slots) {
               memory[mirrored_idx] = m.fvalue;
             }
           }
@@ -135,6 +426,231 @@ void apply_params(LiveGraph *g) {
       }
     }
   }
+  if (applied > 0) {
+    atomic_fetch_add_explicit(&g_param_apply_count, applied, memory_order_acq_rel);
+  }
+}
+
+static inline bool graph_block_event_less_or_equal(const GraphBlockEvent *a,
+                                                   const GraphBlockEvent *b) {
+  if (a->frame_offset != b->frame_offset)
+    return a->frame_offset < b->frame_offset;
+  return a->sequence <= b->sequence;
+}
+
+static void stable_sort_block_events(GraphBlockEvent *events,
+                                     GraphBlockEvent *scratch, int count) {
+  if (!events || !scratch || count <= 1)
+    return;
+
+  GraphBlockEvent *src = events;
+  GraphBlockEvent *dst = scratch;
+  bool src_is_events = true;
+  for (int width = 1; width < count; width *= 2) {
+    for (int left = 0; left < count; left += width * 2) {
+      int mid = left + width;
+      int right = left + width * 2;
+      if (mid > count)
+        mid = count;
+      if (right > count)
+        right = count;
+
+      int i = left;
+      int j = mid;
+      int k = left;
+      while (i < mid && j < right) {
+        if (graph_block_event_less_or_equal(&src[i], &src[j])) {
+          dst[k++] = src[i++];
+        } else {
+          dst[k++] = src[j++];
+        }
+      }
+      while (i < mid)
+        dst[k++] = src[i++];
+      while (j < right)
+        dst[k++] = src[j++];
+    }
+
+    GraphBlockEvent *tmp = src;
+    src = dst;
+    dst = tmp;
+    src_is_events = !src_is_events;
+  }
+
+  if (!src_is_events) {
+    memcpy(events, src, (size_t)count * sizeof(GraphBlockEvent));
+  }
+}
+
+static bool block_event_target_is_valid(LiveGraph *lg,
+                                        const GraphBlockEvent *event) {
+  int node_id = (int)event->logical_id;
+  if (node_id < 0 || node_id >= lg->node_count)
+    return false;
+  RTNode *node = &lg->nodes[node_id];
+  if (!node->state || node->logical_id != event->logical_id)
+    return false;
+  return true;
+}
+
+uint64_t graph_control_submission_failures(const LiveGraph *lg) {
+  return lg ? atomic_load_explicit(&lg->control_submission_failures,
+                                   memory_order_acquire) : 0;
+}
+
+uint64_t graph_edit_delivery_failures(const LiveGraph *lg) {
+  return lg ? atomic_load_explicit(&lg->graph_edit_delivery_failures,
+                                   memory_order_acquire) : 0;
+}
+
+uint64_t graph_block_event_delivery_failures(const LiveGraph *lg) {
+  return lg ? atomic_load_explicit(&lg->block_event_delivery_failures,
+                                   memory_order_acquire) : 0;
+}
+
+static int drain_block_events_for_callback(LiveGraph *lg, int nframes) {
+  if (!lg || !lg->block_events || !lg->block_event_scratch ||
+      !lg->block_event_sort_scratch) {
+    return 0;
+  }
+
+  int count = 0;
+  GraphBlockEvent event;
+  while (block_events_pop(lg->block_events, &event)) {
+    if (event.aux_count > GBE_AUX_CAP)
+      event.aux_count = GBE_AUX_CAP;
+    if (event.frame_offset >= (uint32_t)nframes) {
+      atomic_fetch_add_explicit(&lg->block_event_delivery_failures, 1, memory_order_relaxed);
+      uint64_t dropped = atomic_fetch_add_explicit(
+                             &g_block_event_drop_invalid_count, 1,
+                             memory_order_acq_rel) +
+                         1;
+      if (dropped <= 16 || (dropped % 128u) == 0) {
+        fprintf(stderr,
+                "[audiograph] dropped out-of-callback block event logical=%llu frame=%u nframes=%d drops=%llu\n",
+                (unsigned long long)event.logical_id, event.frame_offset,
+                nframes, (unsigned long long)dropped);
+      }
+      continue;
+    }
+    if (!block_event_target_is_valid(lg, &event)) {
+      atomic_fetch_add_explicit(&lg->block_event_delivery_failures, 1, memory_order_relaxed);
+      uint64_t dropped = atomic_fetch_add_explicit(
+                             &g_block_event_drop_stale_count, 1,
+                             memory_order_acq_rel) +
+                         1;
+      if (dropped <= 16 || (dropped % 128u) == 0) {
+        fprintf(stderr,
+                "[audiograph] dropped stale block event logical=%llu frame=%u kind=%u drops=%llu\n",
+                (unsigned long long)event.logical_id, event.frame_offset,
+                event.kind, (unsigned long long)dropped);
+      }
+      continue;
+    }
+
+    RTNode *node = &lg->nodes[(int)event.logical_id];
+    if (!node->vtable.schedule_event) {
+      atomic_fetch_add_explicit(&lg->block_event_delivery_failures, 1, memory_order_relaxed);
+      uint64_t dropped = atomic_fetch_add_explicit(
+                             &g_block_event_drop_unsupported_count, 1,
+                             memory_order_acq_rel) +
+                         1;
+      if (dropped <= 16 || (dropped % 128u) == 0) {
+        fprintf(stderr,
+                "[audiograph] dropped unsupported block event logical=%llu frame=%u kind=%u drops=%llu\n",
+                (unsigned long long)event.logical_id, event.frame_offset,
+                event.kind, (unsigned long long)dropped);
+      }
+      continue;
+    }
+
+    if (count >= lg->block_event_scratch_capacity) {
+      atomic_fetch_add_explicit(&lg->block_event_delivery_failures, 1, memory_order_relaxed);
+      uint64_t dropped = atomic_fetch_add_explicit(
+                             &g_block_event_drop_invalid_count, 1,
+                             memory_order_acq_rel) +
+                         1;
+      if (dropped <= 16 || (dropped % 128u) == 0) {
+        fprintf(stderr,
+                "[audiograph] dropped block event scratch overflow logical=%llu frame=%u kind=%u drops=%llu\n",
+                (unsigned long long)event.logical_id, event.frame_offset,
+                event.kind, (unsigned long long)dropped);
+      }
+      continue;
+    }
+
+    lg->block_event_scratch[count++] = event;
+  }
+
+  stable_sort_block_events(lg->block_event_scratch, lg->block_event_sort_scratch,
+                           count);
+  lg->block_event_scratch_count = count;
+  return count;
+}
+
+static void begin_event_slice_for_nodes(LiveGraph *lg, uint64_t block_serial,
+                                        int slice_start,
+                                        int slice_nframes) {
+  for (int i = 0; i < lg->node_count; i++) {
+    RTNode *node = &lg->nodes[i];
+    bool deleted = (node->vtable.process == NULL && node->nInputs == 0 &&
+                    node->nOutputs == 0);
+    if (deleted || !node->state || !node->vtable.begin_event_slice)
+      continue;
+    if (lg->sched.is_orphaned && lg->sched.is_orphaned[i])
+      continue;
+    node->vtable.begin_event_slice(node->state, block_serial, slice_start,
+                                   slice_nframes);
+  }
+}
+
+static int deliver_block_events_for_slice(LiveGraph *lg, int start_index,
+                                          int slice_start,
+                                          int slice_nframes) {
+  int slice_end = slice_start + slice_nframes;
+  int index = start_index;
+  while (index < lg->block_event_scratch_count &&
+         (int)lg->block_event_scratch[index].frame_offset < slice_start) {
+    index++;
+  }
+
+  while (index < lg->block_event_scratch_count) {
+    GraphBlockEvent event = lg->block_event_scratch[index];
+    if ((int)event.frame_offset >= slice_end)
+      break;
+
+    int node_id = (int)event.logical_id;
+    if (node_id >= 0 && node_id < lg->node_count) {
+      RTNode *node = &lg->nodes[node_id];
+      if (node->state && node->logical_id == event.logical_id &&
+          node->vtable.schedule_event) {
+        event.frame_offset -= (uint32_t)slice_start;
+        bool accepted = node->vtable.schedule_event(node->state, &event);
+        if (accepted) {
+          atomic_fetch_add_explicit(&g_block_event_apply_count, 1,
+                                    memory_order_acq_rel);
+        } else {
+          atomic_fetch_add_explicit(&lg->block_event_delivery_failures, 1, memory_order_relaxed);
+          uint64_t rejected = atomic_fetch_add_explicit(
+                                  &g_block_event_schedule_reject_count, 1,
+                                  memory_order_acq_rel) +
+                              1;
+          if (rejected <= 16 || (rejected % 128u) == 0) {
+            fprintf(stderr,
+                    "[audiograph] node rejected block event logical=%llu local_frame=%u kind=%u drops=%llu\n",
+                    (unsigned long long)event.logical_id, event.frame_offset,
+                    event.kind, (unsigned long long)rejected);
+          }
+        }
+      } else {
+        atomic_fetch_add_explicit(&lg->block_event_delivery_failures, 1, memory_order_relaxed);
+      }
+    } else {
+      atomic_fetch_add_explicit(&lg->block_event_delivery_failures, 1, memory_order_relaxed);
+    }
+    index++;
+  }
+  return index;
 }
 
 // ===================== Block Processing =====================
@@ -142,26 +658,298 @@ void apply_params(LiveGraph *g) {
 // Legacy bind_and_run function removed - using port-based bind_and_run_live
 // only
 
-static void wait_for_block_start_or_shutdown(void) {
+// The high bit prevents new references while existing workers leave. Keeping
+// this gate in the engine lets a late worker reject a closed session without
+// dereferencing a graph that the render owner may already have destroyed.
+#define SESSION_CLOSED (UINT32_C(1) << 31)
+
+static bool acquire_work_session(void) {
+  uint32_t users = atomic_load_explicit(&g_engine.sessionUsers, memory_order_relaxed);
+  while (!(users & SESSION_CLOSED)) {
+    if (atomic_compare_exchange_weak_explicit(&g_engine.sessionUsers, &users, users + 1,
+                                              memory_order_acquire, memory_order_relaxed))
+      return true;
+  }
+  return false;
+}
+
+static void release_work_session(void) {
+  // No graph access is permitted after releasing this reference.
+  atomic_fetch_sub_explicit(&g_engine.sessionUsers, 1, memory_order_release);
+}
+
+static void close_work_session(LiveGraph *lg) {
+  atomic_fetch_or_explicit(&g_engine.sessionUsers, SESSION_CLOSED, memory_order_acq_rel);
+  rq_finish(lg->sched.readyQueue);
+  // Job completion precedes worker epilogues and departure from timed waits.
+  // Acquire the final reference release before any reset, edit, or reclamation.
+  while (atomic_load_explicit(&g_engine.sessionUsers, memory_order_acquire) != SESSION_CLOSED)
+    cpu_relax();
+  atomic_store_explicit(&g_engine.workSession, NULL, memory_order_release);
+}
+
+static void wait_for_block_start_or_shutdown(int worker_index, int workgroup_version) {
   pthread_mutex_lock(&g_engine.sess_mtx);
   for (;;) {
     if (!atomic_load_explicit(&g_engine.runFlag, memory_order_acquire))
       break;
     // Also wake if workgroup join is pending
-    if (atomic_load_explicit(&g_engine.oswg_join_pending, memory_order_acquire))
+    if (atomic_load_explicit(&g_engine.oswg_version, memory_order_acquire) != workgroup_version)
       break;
-    LiveGraph *lg =
-        atomic_load_explicit(&g_engine.workSession, memory_order_acquire);
-    if (lg && atomic_load_explicit(&lg->sched.jobsInFlight, memory_order_acquire) > 0)
+    // Only inspect engine-owned state here: no graph reference is held yet.
+    if (!(atomic_load_explicit(&g_engine.sessionUsers, memory_order_acquire) & SESSION_CLOSED) &&
+        worker_index < atomic_load_explicit(&g_engine.activeWorkerLimit, memory_order_acquire))
       break;
     pthread_cond_wait(&g_engine.sess_cv, &g_engine.sess_mtx);
   }
   pthread_mutex_unlock(&g_engine.sess_mtx);
 }
 
+#ifdef __linux__
+// Shared SCHED_FIFO promotion for the graph workers and the audio callback
+// thread that drives them. `priority_boost` is added to the configured base
+// priority before clamping to the platform range: workers use 0, the callback
+// thread uses +1 so the thread that publishes each block (and helps drain the
+// graph in process_next_block) is never preempted by its own helpers.
+// Returns true only when direct promotion was permission-denied and the
+// caller should ask the Rust RealtimeKit helper for SCHED_RR instead.
+static bool promote_current_linux_thread_to_fifo(int priority_boost,
+                                                 const char *role,
+                                                 int *requested_priority) {
+  if (!atomic_load_explicit(&g_engine.rt_scheduling, memory_order_acquire)) {
+    return false;
+  }
+
+  int min_priority = sched_get_priority_min(SCHED_FIFO);
+  int max_priority = sched_get_priority_max(SCHED_FIFO);
+  if (min_priority < 0 || max_priority < 0) {
+    int err = errno;
+    fprintf(stderr,
+            "[audiograph] WARN: cannot query SCHED_FIFO priority range: %s "
+            "(%s remains normal priority)\n",
+            strerror(err), role);
+    return false;
+  }
+
+  int requested =
+      atomic_load_explicit(&g_engine.rt_priority, memory_order_acquire) +
+      priority_boost;
+  int priority = requested;
+  if (priority < min_priority)
+    priority = min_priority;
+  if (priority > max_priority)
+    priority = max_priority;
+
+  struct sched_param policy = {.sched_priority = priority};
+  *requested_priority = priority;
+  int rc = pthread_setschedparam(pthread_self(), SCHED_FIFO, &policy);
+  if (rc != 0) {
+    if (rc == EPERM || rc == EACCES) {
+      return true;
+    } else {
+      fprintf(stderr,
+              "[audiograph] WARN: pthread_setschedparam(SCHED_FIFO, %d) "
+              "failed: %s (%s remains normal priority)\n",
+              priority, strerror(rc), role);
+    }
+    return false;
+  }
+
+  if (atomic_load_explicit(&g_engine.rt_log, memory_order_relaxed)) {
+    fprintf(stderr,
+            "[audiograph] %s %p set SCHED_FIFO priority %d%s\n",
+            role, (void *)pthread_self(), priority,
+            priority == requested ? "" : " (clamped to platform range)");
+  }
+  return false;
+}
+
+static void read_current_linux_scheduling(int *policy, int *priority,
+                                          const char *role) {
+  struct sched_param param = {.sched_priority = 0};
+  int observed_policy = SCHED_OTHER;
+  int rc = pthread_getschedparam(pthread_self(), &observed_policy, &param);
+  if (rc != 0) {
+    fprintf(stderr,
+            "[audiograph] WARN: cannot read achieved scheduling for %s: %s\n",
+            role, strerror(rc));
+    *policy = ENGINE_SCHED_POLICY_UNKNOWN;
+    *priority = 0;
+    return;
+  }
+  *policy = base_linux_scheduling_policy(observed_policy);
+  *priority = param.sched_priority;
+}
+
+void engine_set_rtkit_hooks(EngineRtKitWorkerHook worker_hook,
+                            EngineRtKitCallbackHook callback_hook) {
+  // Registered by the control thread before workers or the callback can run.
+  g_rtkit_worker_hook = worker_hook;
+  g_rtkit_callback_hook = callback_hook;
+}
+
+static void warn_realtime_unavailable_without_host(void) {
+  int expected = 0;
+  if (atomic_compare_exchange_strong_explicit(
+          &g_rt_permission_warning_logged, &expected, 1, memory_order_acq_rel,
+          memory_order_relaxed)) {
+    fprintf(stderr,
+            "[audiograph] WARN: direct SCHED_FIFO promotion was denied and "
+            "no host RealtimeKit fallback is registered; audio continues at "
+            "normal priority\n");
+  }
+}
+
+void engine_record_rtkit_callback_result(pid_t tid) {
+  struct sched_param param = {.sched_priority = 0};
+  int policy = sched_getscheduler(tid);
+  if (policy < 0 || sched_getparam(tid, &param) != 0) {
+    policy = ENGINE_SCHED_POLICY_UNKNOWN;
+    param.sched_priority = 0;
+  } else {
+    policy = base_linux_scheduling_policy(policy);
+  }
+  atomic_store_explicit(&g_engine.callbackPolicy, policy, memory_order_relaxed);
+  atomic_store_explicit(&g_engine.callbackPriority, param.sched_priority,
+                        memory_order_relaxed);
+  atomic_store_explicit(&g_engine.callbackReported, 1, memory_order_release);
+}
+
+static void promote_linux_worker_to_realtime(void) {
+  int requested_priority = 0;
+  if (promote_current_linux_thread_to_fifo(0, "worker", &requested_priority)) {
+    pid_t tid = (pid_t)syscall(SYS_gettid);
+    if (g_rtkit_worker_hook)
+      (void)g_rtkit_worker_hook(tid, requested_priority);
+    else
+      warn_realtime_unavailable_without_host();
+  }
+}
+#endif
+
+void engine_promote_current_thread_rt(void) {
+#ifdef __linux__
+  // cpal's ALSA backend spawns the callback thread with default scheduling
+  // and no thread-spawn hook, so the callback promotes itself on first entry.
+  // Without this the workers run SCHED_FIFO while the thread that drives the
+  // block stays SCHED_OTHER — priority inversion in the audio path.
+  int requested_priority = 0;
+  bool rtkit_needed = promote_current_linux_thread_to_fifo(
+      1, "audio callback thread", &requested_priority);
+  if (rtkit_needed) {
+    pid_t tid = (pid_t)syscall(SYS_gettid);
+    if (g_rtkit_callback_hook) {
+      // Mark the result pending BEFORE handing the TID to the helper. This
+      // thread is still SCHED_OTHER here, so it can be preempted between the
+      // hook call and any later store for longer than the helper's poll plus
+      // D-Bus round trip; a store after the hook could then clobber the
+      // helper's recorded result into a permanently-pending status.
+      atomic_store_explicit(&g_engine.callbackReported, 0,
+                            memory_order_release);
+      if (g_rtkit_callback_hook(tid, requested_priority))
+        return;
+    } else {
+      warn_realtime_unavailable_without_host();
+    }
+  }
+  int policy = ENGINE_SCHED_POLICY_UNKNOWN;
+  int priority = 0;
+  read_current_linux_scheduling(&policy, &priority, "audio callback thread");
+  atomic_store_explicit(&g_engine.callbackPolicy, policy, memory_order_relaxed);
+  atomic_store_explicit(&g_engine.callbackPriority, priority,
+                        memory_order_relaxed);
+  atomic_store_explicit(&g_engine.callbackReported, 1, memory_order_release);
+#endif
+  // On Apple this is deliberately a no-op: CoreAudio already delivers the
+  // callback on a THREAD_TIME_CONSTRAINT_POLICY realtime thread.
+}
+
+// Recursive DSP state decays into the subnormal float range during silence,
+// and x86 resolves subnormal operands in microcode at a 50-150 cycle penalty
+// per op — a silent graph becomes more expensive than a loud one. FTZ/DAZ are
+// per-thread MXCSR state, so every thread that executes graph nodes must set
+// them; the Rust audio callback applies the same mode to itself on first
+// entry. AArch64 handles subnormals at full speed and is left unchanged.
+static void flush_denormals_to_zero(void) {
+#if defined(__x86_64__) || defined(__i386__)
+  _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+  _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+#endif
+}
+
+#ifdef AUDIOGRAPH_RTSAN
+// ABI supplied by the pinned, development-only RealtimeSanitizer runtime.
+extern void __rtsan_realtime_enter(void);
+extern void __rtsan_realtime_exit(void);
+static _Atomic bool g_rtsan_enabled = true;
+
+void audiograph_rtsan_set_enabled(int enabled) {
+  atomic_store_explicit(&g_rtsan_enabled, enabled != 0, memory_order_release);
+}
+
+int audiograph_rtsan_enabled(void) {
+  return atomic_load_explicit(&g_rtsan_enabled, memory_order_acquire);
+}
+
+static void refresh_worker_rtsan_scope(bool *active) {
+  bool enabled = audiograph_rtsan_enabled();
+  if (*active == enabled)
+    return;
+  if (enabled)
+    __rtsan_realtime_enter();
+  else
+    __rtsan_realtime_exit();
+  *active = enabled;
+}
+#endif
+
+#ifdef AUDIOGRAPH_RUST_HEAP_AUDIT
+extern void eseq_rust_audio_heap_worker_enter(void);
+extern void eseq_rust_audio_heap_worker_exit(void);
+#endif
+
 static void *worker_main(void *arg) {
-  int worker_index = (int)(intptr_t)arg;
-  // Elevate worker thread QoS on Apple platforms for better scheduling.
+#ifdef AUDIOGRAPH_RUST_HEAP_AUDIT
+  eseq_rust_audio_heap_worker_enter();
+#endif
+#ifdef AUDIOGRAPH_RTSAN
+  bool rtsan_active = false;
+  refresh_worker_rtsan_scope(&rtsan_active);
+#endif
+  intptr_t worker_slot = (intptr_t)arg;
+  int worker_index = (int)worker_slot - 1;
+  flush_denormals_to_zero();
+#if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS || defined(AUDIOGRAPH_EXPERIMENTS)
+  g_current_execution_slot = (int)worker_slot;
+#endif
+  // Elevate worker scheduling before it begins participating in graph work.
+#ifdef __linux__
+  promote_linux_worker_to_realtime();
+  int policy = ENGINE_SCHED_POLICY_UNKNOWN;
+  int priority = 0;
+  read_current_linux_scheduling(&policy, &priority, "worker");
+  atomic_store_explicit(&g_engine.workerPolicies[worker_index], policy,
+                        memory_order_relaxed);
+  atomic_store_explicit(&g_engine.workerPriorities[worker_index], priority,
+                        memory_order_relaxed);
+#endif
+#ifdef HAVE_OS_WORKGROUP
+  os_workgroup_t oswg = NULL;
+  os_workgroup_join_token_s oswg_token;  // Stack-allocated token struct (not pointer)
+  memset(&oswg_token, 0, sizeof(oswg_token));
+  bool oswg_joined = false;
+  // Snapshot before the startup acknowledgement. A restarted pool must not
+  // acknowledge a workgroup change completed by the previous pool; the host
+  // publishes new changes after engine_start_workers returns.
+  int oswg_local_version = atomic_load_explicit(&g_engine.oswg_version, memory_order_acquire);
+#endif
+  // Starting workers is synchronous with respect to this initialization point,
+  // so the host can truthfully report the achieved policy before continuing.
+  pthread_mutex_lock(&g_engine.workerStartupMtx);
+  atomic_fetch_add_explicit(&g_engine.workerStartupCount, 1,
+                            memory_order_release);
+  pthread_cond_broadcast(&g_engine.workerStartupCv);
+  pthread_mutex_unlock(&g_engine.workerStartupMtx);
 #ifdef __APPLE__
 #ifdef QOS_CLASS_USER_INTERACTIVE
   (void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
@@ -170,8 +958,7 @@ static void *worker_main(void *arg) {
 
 #ifdef HAVE_MACH_RT
   // Optionally promote to Mach time-constraint scheduling
-  if (atomic_load_explicit(&g_engine.rt_time_constraint,
-                           memory_order_acquire)) {
+  if (atomic_load_explicit(&g_engine.rt_scheduling, memory_order_acquire)) {
     // Compute period from engine config
     double sr =
         (g_engine.sampleRate > 0) ? (double)g_engine.sampleRate : 48000.0;
@@ -208,19 +995,22 @@ static void *worker_main(void *arg) {
   }
 #endif
 
-#ifdef HAVE_OS_WORKGROUP
-  os_workgroup_t oswg = NULL;
-  os_workgroup_join_token_s oswg_token;  // Stack-allocated token struct (not pointer)
-  memset(&oswg_token, 0, sizeof(oswg_token));
-  bool oswg_joined = false;
-  int oswg_local_version = 0; // Track which version we've joined
-#endif
   for (;;) {
+#ifdef AUDIOGRAPH_RTSAN
+    refresh_worker_rtsan_scope(&rtsan_active);
+#endif
     if (!atomic_load_explicit(&g_engine.runFlag, memory_order_acquire))
       break;
 
     // Park until a block is published
-    wait_for_block_start_or_shutdown();
+#ifdef HAVE_OS_WORKGROUP
+    wait_for_block_start_or_shutdown(worker_index, oswg_local_version);
+#else
+    wait_for_block_start_or_shutdown(worker_index, 0);
+#endif
+#ifdef AUDIOGRAPH_RTSAN
+    refresh_worker_rtsan_scope(&rtsan_active);
+#endif
     if (!atomic_load_explicit(&g_engine.runFlag, memory_order_acquire))
       break;
 
@@ -235,9 +1025,6 @@ static void *worker_main(void *arg) {
       if (oswg_joined) {
         // We have a valid join - leave using our saved references
         os_workgroup_leave(oswg, &oswg_token);
-        if (atomic_load_explicit(&g_engine.rt_log, memory_order_relaxed))
-          fprintf(stderr, "[audiograph] worker %p left os_workgroup %p (version %d -> %d)\n",
-                  (void *)pthread_self(), (void *)oswg, oswg_local_version, global_version);
         oswg_joined = false;
         oswg = NULL;
         memset(&oswg_token, 0, sizeof(oswg_token));
@@ -247,20 +1034,17 @@ static void *worker_main(void *arg) {
       oswg_local_version = global_version;
 
       void *w = atomic_load_explicit(&g_engine.oswg, memory_order_acquire);
+      int join_error = 0;
       if (w) {
         oswg = (os_workgroup_t)w;
-        int ok = os_workgroup_join(oswg, &oswg_token);
-        oswg_joined = (ok == 0);
-        if (oswg_joined) {
-          if (atomic_load_explicit(&g_engine.rt_log, memory_order_relaxed))
-            fprintf(stderr, "[audiograph] worker %p joined os_workgroup %p (version %d)\n",
-                    (void *)pthread_self(), (void *)oswg, global_version);
-        } else {
-          fprintf(stderr, "[audiograph] worker %p FAILED to join os_workgroup %p (err=%d)\n",
-                  (void *)pthread_self(), (void *)oswg, ok);
+        join_error = os_workgroup_join(oswg, &oswg_token);
+        oswg_joined = (join_error == 0);
+        if (!oswg_joined) {
           oswg = NULL;  // Don't keep stale pointer on failure
         }
       }
+      atomic_store_explicit(&g_engine.workerWorkgroupErrors[worker_index],
+                            join_error, memory_order_relaxed);
       // Decrement remaining counter; last worker clears the pending flag
       int remaining = atomic_fetch_sub_explicit(&g_engine.oswg_join_remaining, 1,
                                                 memory_order_acq_rel) - 1;
@@ -270,46 +1054,28 @@ static void *worker_main(void *arg) {
     }
 #endif
 
-    LiveGraph *lg =
-        atomic_load_explicit(&g_engine.workSession, memory_order_acquire);
-    if (!lg)
-      continue; // spurious wake or no work - but workgroup joining is done
+    if (!acquire_work_session())
+      continue;
+    LiveGraph *lg = atomic_load_explicit(&g_engine.workSession, memory_order_relaxed);
+    assert(lg != NULL);
 
-    // Adaptive worker limit: workers above the per-block limit stay out of the
-    // ready queue. This lets hosts keep a high max worker count for complex
-    // graphs while avoiding wake/steal jitter on tiny or mostly-serial graphs.
-    int active_limit = atomic_load_explicit(&g_engine.activeWorkerLimit,
-                                            memory_order_acquire);
+    int active_limit = atomic_load_explicit(&g_engine.activeWorkerLimit, memory_order_relaxed);
     if (worker_index >= active_limit) {
-      // Do not spin aggressively: this worker is intentionally inactive for the
-      // current audio block. Wait briefly until the session finishes or changes.
-      while (atomic_load_explicit(&g_engine.runFlag, memory_order_acquire)) {
-        LiveGraph *cur =
-            atomic_load_explicit(&g_engine.workSession, memory_order_acquire);
-        if (cur != lg)
-          break;
-        if (atomic_load_explicit(&lg->sched.jobsInFlight, memory_order_acquire) == 0)
-          break;
-        usleep(50);
-      }
+      release_work_session();
       continue;
     }
 
-    // Hot loop: run until this block is complete
+    // The reference protects all graph accesses, including the queue wait and
+    // the last job's bookkeeping. Inactive workers stay parked on sess_cv.
     for (;;) {
-      // If the session ended or graph pointer changed, exit the hot loop.
-      LiveGraph *cur =
-          atomic_load_explicit(&g_engine.workSession, memory_order_acquire);
-      if (cur != lg)
-        break;
-      if (atomic_load_explicit(&lg->sched.jobsInFlight, memory_order_acquire) == 0)
+      if (!atomic_load_explicit(&g_engine.runFlag, memory_order_acquire) ||
+          (atomic_load_explicit(&g_engine.sessionUsers, memory_order_relaxed) & SESSION_CLOSED) ||
+          atomic_load_explicit(&lg->sched.jobsInFlight, memory_order_acquire) <= 0)
         break;
 
       int32_t nid;
 
-      // Workers use a modest spin then park briefly. The audio callback thread
-      // remains the aggressive waiter/helper, so this reduces aggregate CPU from
-      // idle workers without forcing the realtime thread to block.
+      // Modest spin to catch bursts without kernel call, then short timed wait.
       bool got = false;
       for (int s = 0; s < AUDIOGRAPH_WORKER_EMPTY_SPINS; s++) {
         if ((got = rq_try_pop(lg->sched.readyQueue, &nid)))
@@ -317,10 +1083,7 @@ static void *worker_main(void *arg) {
         cpu_relax(); // brief pause
       }
       if (!got) {
-        // Queue appears empty while work is in flight; wait briefly for a wake
-        // signal instead of repeatedly polling the MPMC queue.
-        (void)rq_wait_nonempty(lg->sched.readyQueue,
-                               /*timeout_us=*/AUDIOGRAPH_WORKER_WAIT_TIMEOUT_US);
+        rq_wait_for_work(lg->sched.readyQueue, AUDIOGRAPH_WORKER_WAIT_TIMEOUT_US);
         continue;
       }
 
@@ -337,9 +1100,16 @@ static void *worker_main(void *arg) {
       if (nf <= 0 || nf > lg->block_size) {
         nf = lg->block_size; // Clamp to graph's internal block size for safety
       }
-      execute_and_fanout(lg, nid, nf);
+      if (try_execute_ready_node(lg, nid, nf)) {
+#ifdef __linux__
+        // Check after every node: DSP costs vary enough that an operation-count
+        // interval cannot safely bound uninterrupted realtime CPU usage.
+        checkpoint_rtkit_cpu_budget(policy);
+#endif
+      }
     }
 
+    release_work_session();
     // Loop back: will go to sleep on sess_cv until next block
   }
 
@@ -351,19 +1121,63 @@ static void *worker_main(void *arg) {
   }
 #endif
 
+#ifdef AUDIOGRAPH_RTSAN
+  if (rtsan_active)
+    __rtsan_realtime_exit();
+#endif
+#ifdef AUDIOGRAPH_RUST_HEAP_AUDIT
+  eseq_rust_audio_heap_worker_exit();
+#endif
   return NULL;
 }
 
 // ===================== Worker Pool Management =====================
 
 void engine_start_workers(int workers) {
-  g_engine.workerCount = workers;
-  g_engine.threads = (pthread_t *)calloc(workers, sizeof(pthread_t));
+  if (workers < 0)
+    workers = 0;
+  g_engine.workerCount = 0;
+  g_engine.threads = (pthread_t *)calloc((size_t)workers, sizeof(pthread_t));
+  g_engine.workerPolicies =
+      (_Atomic int *)calloc((size_t)workers, sizeof(_Atomic int));
+  g_engine.workerPriorities =
+      (_Atomic int *)calloc((size_t)workers, sizeof(_Atomic int));
+  g_engine.workerWorkgroupErrors =
+      (_Atomic int *)calloc((size_t)workers, sizeof(_Atomic int));
+  if (workers > 0 && (!g_engine.threads || !g_engine.workerPolicies ||
+                      !g_engine.workerPriorities || !g_engine.workerWorkgroupErrors)) {
+    fprintf(stderr,
+            "[audiograph] WARN: cannot allocate worker pool for %d workers\n",
+            workers);
+    free(g_engine.threads);
+    free(g_engine.workerPolicies);
+    free(g_engine.workerPriorities);
+    free(g_engine.workerWorkgroupErrors);
+    g_engine.threads = NULL;
+    g_engine.workerPolicies = NULL;
+    g_engine.workerPriorities = NULL;
+    g_engine.workerWorkgroupErrors = NULL;
+    workers = 0;
+  }
+  for (int i = 0; i < workers; i++) {
+    atomic_init(&g_engine.workerPolicies[i], ENGINE_SCHED_POLICY_UNKNOWN);
+    atomic_init(&g_engine.workerPriorities[i], 0);
+    atomic_init(&g_engine.workerWorkgroupErrors[i], 0);
+  }
+  atomic_store_explicit(&g_engine.workerStartupCount, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_engine.callbackPolicy, ENGINE_SCHED_POLICY_UNKNOWN,
+                        memory_order_relaxed);
+  atomic_store_explicit(&g_engine.callbackPriority, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_engine.callbackReported, 0, memory_order_relaxed);
 
-  // Initialize mutex and condition variable for block-start wake
+  // Initialize mutexes and condition variables before any worker can signal.
   pthread_mutex_init(&g_engine.sess_mtx, NULL);
   pthread_cond_init(&g_engine.sess_cv, NULL);
+  pthread_mutex_init(&g_engine.workerStartupMtx, NULL);
+  pthread_cond_init(&g_engine.workerStartupCv, NULL);
 
+  atomic_store_explicit(&g_engine.workSession, NULL, memory_order_relaxed);
+  atomic_store_explicit(&g_engine.sessionUsers, SESSION_CLOSED, memory_order_relaxed);
   atomic_store(&g_engine.runFlag, 1);
   for (int i = 0; i < workers; i++) {
     pthread_attr_t attr;
@@ -374,100 +1188,155 @@ void engine_start_workers(int workers) {
     (void)pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
 #endif
-    pthread_create(&g_engine.threads[i], &attr, worker_main, (void *)(intptr_t)i);
+    int rc = pthread_create(&g_engine.threads[i], &attr, worker_main,
+                            (void *)(intptr_t)(i + 1));
     pthread_attr_destroy(&attr);
+    if (rc != 0) {
+      fprintf(stderr, "[audiograph] WARN: cannot start worker %d: %s\n", i,
+              strerror(rc));
+      break;
+    }
+    g_engine.workerCount++;
   }
+
+  pthread_mutex_lock(&g_engine.workerStartupMtx);
+  while (atomic_load_explicit(&g_engine.workerStartupCount,
+                              memory_order_acquire) < g_engine.workerCount) {
+    pthread_cond_wait(&g_engine.workerStartupCv, &g_engine.workerStartupMtx);
+  }
+  pthread_mutex_unlock(&g_engine.workerStartupMtx);
+  graph_profile_start_recorder();
 }
 
 void engine_set_os_workgroup(void *oswg_ptr) {
 #ifdef HAVE_OS_WORKGROUP
-  // Store opaque pointer; Swift side retains it.
-  atomic_store_explicit(&g_engine.oswg, oswg_ptr, memory_order_release);
-
-  // Increment version to signal workers to re-join
-  int new_version = atomic_fetch_add_explicit(&g_engine.oswg_version, 1,
-                                              memory_order_acq_rel) + 1;
-
-  // Set counter to number of workers, then set flag and broadcast
-  // This ensures all workers see the flag before it's cleared
-  atomic_store_explicit(&g_engine.oswg_join_remaining, g_engine.workerCount,
-                        memory_order_release);
-  atomic_store_explicit(&g_engine.oswg_join_pending, 1, memory_order_release);
-  pthread_mutex_lock(&g_engine.sess_mtx);
-  pthread_cond_broadcast(&g_engine.sess_cv);
-  pthread_mutex_unlock(&g_engine.sess_mtx);
-
-  if (atomic_load_explicit(&g_engine.rt_log, memory_order_relaxed))
-    fprintf(stderr,
-            "[audiograph] set os_workgroup=%p (version %d, notifying %d existing workers)\n",
-            oswg_ptr, new_version, g_engine.workerCount);
+  pthread_mutex_lock(&workgroup_control_mutex);
+  void *previous = atomic_load_explicit(&g_engine.oswg, memory_order_acquire);
+  if (previous != oswg_ptr) {
+    // The engine, not the host, owns this reference until all helpers have
+    // acknowledged departure. Never turn a slow worker into a use-after-free.
+    if (oswg_ptr) os_retain(oswg_ptr);
+    atomic_store_explicit(&g_engine.oswg, oswg_ptr, memory_order_release);
+    atomic_store_explicit(&g_engine.oswg_join_remaining, g_engine.workerCount,
+                          memory_order_relaxed);
+    atomic_store_explicit(&g_engine.oswg_join_pending, g_engine.workerCount > 0,
+                          memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_engine.oswg_version, 1, memory_order_release);
+    if (g_engine.workerCount > 0) {
+      pthread_mutex_lock(&g_engine.sess_mtx);
+      pthread_cond_broadcast(&g_engine.sess_cv);
+      pthread_mutex_unlock(&g_engine.sess_mtx);
+      // Control-thread wait, just like joining the worker pool at shutdown.
+      // The workers only store atomics; no logging or control mutex on them.
+      while (atomic_load_explicit(&g_engine.oswg_join_pending, memory_order_acquire))
+        usleep(100);
+    }
+    if (previous) os_release(previous);
+  }
+  pthread_mutex_unlock(&workgroup_control_mutex);
 #else
   (void)oswg_ptr;
 #endif
 }
 
 void engine_clear_os_workgroup(void) {
+  engine_set_os_workgroup(NULL);
+}
+
+void engine_release_os_workgroup(void *oswg) {
 #ifdef HAVE_OS_WORKGROUP
-  // First, signal workers to leave by setting NULL and incrementing version
-  atomic_store_explicit(&g_engine.oswg, NULL, memory_order_release);
-  int new_version = atomic_fetch_add_explicit(&g_engine.oswg_version, 1,
-                                              memory_order_acq_rel) + 1;
+  if (oswg) os_release(oswg);
+#else
+  (void)oswg;
+#endif
+}
 
-  atomic_store_explicit(&g_engine.oswg_join_remaining, g_engine.workerCount,
-                        memory_order_release);
-  atomic_store_explicit(&g_engine.oswg_join_pending, 1, memory_order_release);
-  pthread_mutex_lock(&g_engine.sess_mtx);
-  pthread_cond_broadcast(&g_engine.sess_cv);
-  pthread_mutex_unlock(&g_engine.sess_mtx);
-
-  if (atomic_load_explicit(&g_engine.rt_log, memory_order_relaxed))
-    fprintf(stderr,
-            "[audiograph] clearing os_workgroup (version %d, waiting for %d workers to leave)\n",
-            new_version, g_engine.workerCount);
-
-  // IMPORTANT: Wait for all workers to leave before returning
-  // This ensures Swift can safely release the old workgroup
-  int timeout_ms = 1000;  // 1 second timeout
-  int waited_ms = 0;
-  while (atomic_load_explicit(&g_engine.oswg_join_pending, memory_order_acquire) != 0) {
-    usleep(1000);  // 1ms
-    waited_ms++;
-    if (waited_ms >= timeout_ms) {
-      int remaining = atomic_load_explicit(&g_engine.oswg_join_remaining, memory_order_acquire);
-      fprintf(stderr,
-              "[audiograph] WARNING: timeout waiting for workers to leave workgroup (%d remaining)\n",
-              remaining);
-      break;
+void engine_get_workgroup_status(EngineWorkgroupStatus *status) {
+  memset(status, 0, sizeof(*status));
+  pthread_mutex_lock(&workgroup_control_mutex);
+  status->worker_count = g_engine.workerCount;
+#ifdef HAVE_OS_WORKGROUP
+  status->supported = 1;
+  status->assigned = atomic_load_explicit(&g_engine.oswg, memory_order_acquire) != NULL;
+  status->generation = atomic_load_explicit(&g_engine.oswg_version, memory_order_acquire);
+  status->pending_workers = atomic_load_explicit(&g_engine.oswg_join_remaining, memory_order_acquire);
+  if (status->assigned) {
+    for (int i = 0; i < g_engine.workerCount; ++i) {
+      int error = atomic_load_explicit(&g_engine.workerWorkgroupErrors[i], memory_order_relaxed);
+      if (error) {
+        status->failed_workers++;
+        if (!status->first_error) status->first_error = error;
+      } else {
+        status->joined_workers++;
+      }
     }
   }
-
-  if (atomic_load_explicit(&g_engine.rt_log, memory_order_relaxed))
-    fprintf(stderr, "[audiograph] os_workgroup cleared (workers left in %d ms)\n", waited_ms);
-#else
-  (void)0; // os_workgroup unsupported
 #endif
+  pthread_mutex_unlock(&workgroup_control_mutex);
 }
 
 void engine_enable_rt_logging(int enable) {
   atomic_store_explicit(&g_engine.rt_log, enable ? 1 : 0, memory_order_release);
 }
 
-void engine_enable_rt_time_constraint(int enable) {
-  atomic_store_explicit(&g_engine.rt_time_constraint, enable ? 1 : 0,
+void engine_enable_graph_logging(int enable) {
+  atomic_store_explicit(&g_engine.graph_log, enable ? 1 : 0, memory_order_release);
+}
+
+void engine_enable_rt_scheduling(int enable) {
+  atomic_store_explicit(&g_engine.rt_scheduling, enable ? 1 : 0,
                         memory_order_release);
 }
 
+void engine_set_rt_priority(int priority) {
+  atomic_store_explicit(&g_engine.rt_priority, priority, memory_order_release);
+}
+
+void engine_get_rt_status(EngineRtStatus *status) {
+  if (!status)
+    return;
+
+  status->worker_count = g_engine.workerCount;
+  status->workers_reported = atomic_load_explicit(&g_engine.workerStartupCount,
+                                                  memory_order_acquire);
+  status->worker_policy = ENGINE_SCHED_POLICY_UNKNOWN;
+  status->worker_priority = 0;
+  for (int i = 0; i < status->workers_reported && i < g_engine.workerCount; i++) {
+    int policy = atomic_load_explicit(&g_engine.workerPolicies[i],
+                                      memory_order_relaxed);
+    int priority = atomic_load_explicit(&g_engine.workerPriorities[i],
+                                        memory_order_relaxed);
+    if (i == 0) {
+      status->worker_policy = policy;
+      status->worker_priority = priority;
+    } else {
+      if (status->worker_policy != policy)
+        status->worker_policy = ENGINE_SCHED_POLICY_MIXED;
+      if (status->worker_priority != priority)
+        status->worker_priority = ENGINE_SCHED_PRIORITY_MIXED;
+    }
+  }
+
+  status->callback_reported = atomic_load_explicit(&g_engine.callbackReported,
+                                                   memory_order_acquire);
+  status->callback_policy = atomic_load_explicit(&g_engine.callbackPolicy,
+                                                 memory_order_relaxed);
+  status->callback_priority = atomic_load_explicit(&g_engine.callbackPriority,
+                                                   memory_order_relaxed);
+}
+
 void engine_stop_workers(void) {
+  // The host must stop rendering before stopping the pool. Every completed
+  // render has already unregistered its queue waiters and worker references.
+  assert(atomic_load_explicit(&g_engine.sessionUsers, memory_order_acquire) == SESSION_CLOSED);
+  engine_clear_os_workgroup();
+  graph_profile_stop_recorder();
   atomic_store(&g_engine.runFlag, 0);
 
-  // Wake sleepers on both wait sites
+  // All workers are between blocks; only the session wait can remain.
   pthread_mutex_lock(&g_engine.sess_mtx);
   pthread_cond_broadcast(&g_engine.sess_cv);
   pthread_mutex_unlock(&g_engine.sess_mtx);
-
-  // Also wake any workers blocked in rq_wait_nonempty during a block
-  // We'll iterate through all potential live graphs, but since we're shutting
-  // down, we can just wait for threads to exit naturally
 
   for (int i = 0; i < g_engine.workerCount; i++) {
     pthread_join(g_engine.threads[i], NULL);
@@ -476,9 +1345,17 @@ void engine_stop_workers(void) {
   // Clean up synchronization primitives
   pthread_mutex_destroy(&g_engine.sess_mtx);
   pthread_cond_destroy(&g_engine.sess_cv);
+  pthread_mutex_destroy(&g_engine.workerStartupMtx);
+  pthread_cond_destroy(&g_engine.workerStartupCv);
 
   free(g_engine.threads);
+  free(g_engine.workerPolicies);
+  free(g_engine.workerPriorities);
+  free(g_engine.workerWorkgroupErrors);
   g_engine.threads = NULL;
+  g_engine.workerPolicies = NULL;
+  g_engine.workerPriorities = NULL;
+  g_engine.workerWorkgroupErrors = NULL;
   g_engine.workerCount = 0;
 }
 
@@ -589,13 +1466,14 @@ void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
   }
 
   if (node->vtable.process) {
-    ProcessContext ctx = {
-        .buffers = lg->buffers,
-        .telemetry = lg->telemetry,
-        .telemetry_count = lg->telemetry_count,
-    };
+    uint64_t profile_start = graph_profile_node_begin();
     node->vtable.process((float *const *)inPtrs, (float *const *)outPtrs,
-                         nframes, node->state, &ctx);
+                         nframes, node->state, lg->buffers);
+#ifdef AUDIOGRAPH_EXPERIMENTS
+    graph_profile_node_end(nid, g_current_execution_slot, profile_start);
+#else
+    (void)profile_start;
+#endif
   }
 
   // Clear thread-local context
@@ -611,6 +1489,10 @@ static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes) {
             nid, lg->node_count);
     return;
   }
+#if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
+  atomic_store_explicit(&g_inflight_node_ids[g_current_execution_slot], nid,
+                        memory_order_release);
+#endif
   bind_and_run_live(lg, nid, nframes); // uses silence/scratch for missing ports
 
   RTNode *node = &lg->nodes[nid];
@@ -629,16 +1511,109 @@ static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes) {
         continue;
       }
       // Use release on decrement to ensure buffer writes are visible to successor
-      if (atomic_fetch_sub_explicit(&lg->sched.pending[succ], 1, memory_order_release) == 1) {
-        rq_push_or_spin(lg->sched.readyQueue, succ);
+#if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
+      int prev_pending =
+          atomic_fetch_sub_explicit(&lg->sched.pending[succ], 1, memory_order_release);
+      if (prev_pending == 1) {
+        schedule_ready_node(lg, succ, nframes);
+      } else if (prev_pending <= 0) {
+        RTNode *succ_node = &lg->nodes[succ];
+        fprintf(stderr,
+                "[audiograph] WARN: pending underflow/duplicate fanout src=%d(%s) succ=%d(%s) prev_pending=%d indegree=%d\n",
+                nid, node->debug_name ? node->debug_name : "<unnamed>", succ,
+                succ_node->debug_name ? succ_node->debug_name : "<unnamed>",
+                prev_pending, lg->sched.indegree[succ]);
       }
+#else
+      if (atomic_fetch_sub_explicit(&lg->sched.pending[succ], 1,
+                                    memory_order_release) == 1) {
+        schedule_ready_node(lg, succ, nframes);
+      }
+#endif
     }
   }
 
+#if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
+  // Log completion and decrement counters BEFORE marking node as done.
+  // This ensures that if a stall diagnostic sees pending=-3, the matching
+  // jobsInFlight-- has already happened. Previously, pending was set first,
+  // which created a window where a node appeared "done" in diagnostics
+  // without its jobsInFlight decrement being visible.
+  uint64_t completion_seq =
+      atomic_fetch_add_explicit(&g_completion_seq, 1, memory_order_acq_rel);
+  int completion_slot = (int)(completion_seq % COMPLETION_LOG_CAPACITY);
+  atomic_store_explicit(&g_completion_log_nodes[completion_slot], nid,
+                        memory_order_release);
+  atomic_store_explicit(&g_completion_log_seq[completion_slot], completion_seq + 1,
+                        memory_order_release);
+  lg->sched.completed_this_block[nid] = true;
+  atomic_fetch_add_explicit(&g_completed_jobs, 1, memory_order_release);
+  int remaining_jobs = atomic_fetch_sub_explicit(&lg->sched.jobsInFlight, 1,
+                                                  memory_order_acq_rel) - 1;
+  // Mark done AFTER accounting — a node with pending=-3 is now guaranteed
+  // to have been fully counted in completed_jobs and jobsInFlight.
+  atomic_store_explicit(&lg->sched.pending[nid], PENDING_DONE_SENTINEL,
+                        memory_order_release);
+  atomic_store_explicit(&g_inflight_node_ids[g_current_execution_slot], -1,
+                        memory_order_release);
+#else
   // Publish this node's output writes before signaling global block completion.
   // The audio thread waits on jobsInFlight with acquire loads, so the final
   // transition to zero must carry release semantics.
-  atomic_fetch_sub_explicit(&lg->sched.jobsInFlight, 1, memory_order_release);
+  int remaining_jobs = atomic_fetch_sub_explicit(&lg->sched.jobsInFlight, 1,
+                                                  memory_order_acq_rel) - 1;
+#endif
+  if (remaining_jobs == 0)
+    rq_finish(lg->sched.readyQueue);
+}
+
+static inline bool try_execute_ready_node(LiveGraph *lg, int32_t nid,
+                                          int nframes) {
+  if (nid < 0 || nid >= lg->node_count) {
+    fprintf(stderr,
+            "[audiograph] WARN: invalid ready job id %d (node_count=%d)\n",
+            nid, lg->node_count);
+    return false;
+  }
+#if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
+  if (!claim_ready_node(lg, nid)) {
+    return false;
+  }
+#endif
+  atomic_fetch_add_explicit(&g_active_job_count, 1, memory_order_acq_rel);
+  execute_and_fanout(lg, nid, nframes);
+  atomic_fetch_sub_explicit(&g_active_job_count, 1, memory_order_acq_rel);
+  return true;
+}
+
+static inline void schedule_ready_node(LiveGraph *lg, int32_t nid, int nframes) {
+  ReadyQ *q = lg->sched.readyQueue;
+
+  for (;;) {
+    if (rq_push(q, nid)) {
+      return;
+    }
+
+    // A bounded ready queue can fill in very wide/heavy graphs. Spinning here
+    // can deadlock if every active audio/worker thread is also trying to
+    // enqueue. Help the scheduler make progress by draining an already-ready
+    // job, then retry the enqueue.
+    int32_t other;
+    if (rq_try_pop(q, &other)) {
+      (void)try_execute_ready_node(lg, other, nframes);
+      continue;
+    }
+
+    // If the queue looked full but another thread drained it first, retry.
+    if (rq_push(q, nid)) {
+      return;
+    }
+
+    // Last-resort progress path: the node is ready now, so running it inline
+    // is equivalent to popping it from the ready queue.
+    (void)try_execute_ready_node(lg, nid, nframes);
+    return;
+  }
 }
 
 // Check if a node has any connected outputs (for scheduling)
@@ -653,6 +1628,529 @@ static inline bool node_has_any_output_connected(LiveGraph *lg, int node_id) {
   }
   return false;
 }
+
+typedef struct {
+  int total_jobs;
+  int source_count;
+  int orphaned_count;
+  int deleted_count;
+} GraphTraceCounts;
+
+static GraphTraceCounts graph_trace_count_scheduler(LiveGraph *lg) {
+  GraphTraceCounts counts = {0, 0, 0, 0};
+  if (!lg) {
+    return counts;
+  }
+
+  for (int i = 0; i < lg->node_count; i++) {
+    RTNode *node = &lg->nodes[i];
+    bool deleted = (node->vtable.process == NULL && node->nInputs == 0 &&
+                    node->nOutputs == 0);
+    if (deleted) {
+      counts.deleted_count++;
+      continue;
+    }
+    if (lg->sched.is_orphaned && lg->sched.is_orphaned[i]) {
+      counts.orphaned_count++;
+      continue;
+    }
+
+    bool has_out = node_has_any_output_connected(lg, i);
+    bool is_sink = !has_out && lg->sched.indegree && lg->sched.indegree[i] > 0;
+    if (has_out || is_sink) {
+      counts.total_jobs++;
+      if (lg->sched.indegree && lg->sched.indegree[i] == 0 && has_out) {
+        counts.source_count++;
+      }
+    }
+  }
+
+  return counts;
+}
+
+static float graph_trace_peak(const float *output_buffer, int nframes, int channels) {
+  float peak = 0.0f;
+  if (!output_buffer || nframes <= 0 || channels <= 0) {
+    return peak;
+  }
+  size_t total = (size_t)nframes * (size_t)channels;
+  for (size_t i = 0; i < total; i++) {
+    float sample = output_buffer[i];
+    float mag = sample < 0.0f ? -sample : sample;
+    if (mag > peak) {
+      peak = mag;
+    }
+  }
+  return peak;
+}
+
+static float graph_trace_mono_peak(const float *buffer, int nframes) {
+  float peak = 0.0f;
+  if (!buffer || nframes <= 0) {
+    return peak;
+  }
+  for (int i = 0; i < nframes; i++) {
+    float sample = buffer[i];
+    float mag = sample < 0.0f ? -sample : sample;
+    if (mag > peak) {
+      peak = mag;
+    }
+  }
+  return peak;
+}
+
+static bool graph_trace_name_matches(const char *name) {
+  if (!name) {
+    return false;
+  }
+  return strstr(name, "_pan") || strstr(name, "_filter") ||
+         strstr(name, "_delay") || strstr(name, "_sum") ||
+         strstr(name, "_send") || strstr(name, "bus_L") ||
+         strstr(name, "bus_R") || strstr(name, "reverb") ||
+         strcmp(name, "SUM") == 0;
+}
+
+static float graph_trace_edge_peak(LiveGraph *lg, int edge_id, int nframes) {
+  if (!lg || edge_id < 0 || edge_id >= lg->edge_capacity) {
+    return 0.0f;
+  }
+  LiveEdge *edge = &lg->edges[edge_id];
+  if (!edge->in_use || !edge->buf) {
+    return 0.0f;
+  }
+  return graph_trace_mono_peak(edge->buf, nframes);
+}
+
+static void graph_trace_dump_node_io(LiveGraph *lg, int nid, int nframes) {
+  if (!lg || nid < 0 || nid >= lg->node_count) {
+    return;
+  }
+
+  RTNode *node = &lg->nodes[nid];
+  const char *name = node->debug_name ? node->debug_name : "<unnamed>";
+  bool deleted =
+      (node->vtable.process == NULL && node->nInputs == 0 && node->nOutputs == 0);
+
+  fprintf(stderr,
+          "[audiograph-trace] route-node id=%d logical=%llu name=%s nIn=%d nOut=%d indegree=%d succ=%d orphaned=%d deleted=%d\n",
+          nid, (unsigned long long)node->logical_id, name, node->nInputs,
+          node->nOutputs,
+          (lg->sched.indegree && nid < lg->node_count) ? lg->sched.indegree[nid]
+                                                       : -1,
+          node->succCount,
+          (lg->sched.is_orphaned && nid < lg->node_count &&
+           lg->sched.is_orphaned[nid])
+              ? 1
+              : 0,
+          deleted ? 1 : 0);
+
+  for (int port = 0; port < node->nInputs; port++) {
+    int edge_id = node->inEdgeId ? node->inEdgeId[port] : -1;
+    int src = (edge_id >= 0 && edge_id < lg->edge_capacity)
+                  ? lg->edges[edge_id].src_node
+                  : -1;
+    int src_port = (edge_id >= 0 && edge_id < lg->edge_capacity)
+                       ? lg->edges[edge_id].src_port
+                       : -1;
+    const char *src_name =
+        (src >= 0 && src < lg->node_count && lg->nodes[src].debug_name)
+            ? lg->nodes[src].debug_name
+            : "<none>";
+    fprintf(stderr,
+            "[audiograph-trace] route-in node=%d name=%s port=%d edge=%d peak=%0.6f src=%d src_port=%d src_name=%s\n",
+            nid, name, port, edge_id, graph_trace_edge_peak(lg, edge_id, nframes),
+            src, src_port, src_name);
+  }
+
+  for (int port = 0; port < node->nOutputs; port++) {
+    int edge_id = node->outEdgeId ? node->outEdgeId[port] : -1;
+    int refcount = (edge_id >= 0 && edge_id < lg->edge_capacity)
+                       ? lg->edges[edge_id].refcount
+                       : 0;
+    fprintf(stderr,
+            "[audiograph-trace] route-out node=%d name=%s port=%d edge=%d peak=%0.6f refcount=%d\n",
+            nid, name, port, edge_id,
+            graph_trace_edge_peak(lg, edge_id, nframes), refcount);
+  }
+}
+
+static void graph_trace_dump_signal_path(LiveGraph *lg, int nframes,
+                                         const char *reason) {
+  if (!lg || nframes <= 0) {
+    return;
+  }
+
+  fprintf(stderr, "[audiograph-trace] signal dump begin reason=%s nframes=%d\n",
+          reason ? reason : "<none>", nframes);
+
+  int output_node = find_live_output(lg);
+  if (output_node >= 0 && output_node < lg->node_count) {
+    RTNode *dac = &lg->nodes[output_node];
+    for (int ch = 0; ch < dac->nInputs; ch++) {
+      int eid = dac->inEdgeId ? dac->inEdgeId[ch] : -1;
+      int src = (eid >= 0 && eid < lg->edge_capacity) ? lg->edges[eid].src_node : -1;
+      int src_port = (eid >= 0 && eid < lg->edge_capacity) ? lg->edges[eid].src_port : -1;
+      float peak = (eid >= 0 && eid < lg->edge_capacity)
+                       ? graph_trace_mono_peak(lg->edges[eid].buf, nframes)
+                       : 0.0f;
+      const char *src_name =
+          (src >= 0 && src < lg->node_count && lg->nodes[src].debug_name)
+              ? lg->nodes[src].debug_name
+              : "<none>";
+      fprintf(stderr,
+              "[audiograph-trace] dac-input ch=%d edge=%d peak=%0.6f src=%d src_port=%d src_name=%s\n",
+              ch, eid, peak, src, src_port, src_name);
+    }
+  }
+
+  enum { TOP_EDGE_COUNT = 12 };
+  float top_peak[TOP_EDGE_COUNT] = {0};
+  int top_edge[TOP_EDGE_COUNT];
+  for (int i = 0; i < TOP_EDGE_COUNT; i++) {
+    top_edge[i] = -1;
+  }
+
+  for (int eid = 0; eid < lg->edge_capacity; eid++) {
+    LiveEdge *edge = &lg->edges[eid];
+    if (!edge->in_use || !edge->buf) {
+      continue;
+    }
+    float peak = graph_trace_mono_peak(edge->buf, nframes);
+    for (int rank = 0; rank < TOP_EDGE_COUNT; rank++) {
+      if (peak <= top_peak[rank]) {
+        continue;
+      }
+      for (int move = TOP_EDGE_COUNT - 1; move > rank; move--) {
+        top_peak[move] = top_peak[move - 1];
+        top_edge[move] = top_edge[move - 1];
+      }
+      top_peak[rank] = peak;
+      top_edge[rank] = eid;
+      break;
+    }
+  }
+
+  for (int rank = 0; rank < TOP_EDGE_COUNT; rank++) {
+    int eid = top_edge[rank];
+    if (eid < 0) {
+      continue;
+    }
+    LiveEdge *edge = &lg->edges[eid];
+    int src = edge->src_node;
+    const char *src_name =
+        (src >= 0 && src < lg->node_count && lg->nodes[src].debug_name)
+            ? lg->nodes[src].debug_name
+            : "<none>";
+    fprintf(stderr,
+            "[audiograph-trace] top-edge rank=%d edge=%d peak=%0.6f src=%d src_port=%d refcount=%d src_name=%s\n",
+              rank + 1, eid, top_peak[rank], src, edge->src_port, edge->refcount,
+            src_name);
+  }
+
+  fprintf(stderr, "[audiograph-trace] route dump begin\n");
+  for (int nid = 0; nid < lg->node_count; nid++) {
+    RTNode *node = &lg->nodes[nid];
+    if (!graph_trace_name_matches(node->debug_name)) {
+      continue;
+    }
+    graph_trace_dump_node_io(lg, nid, nframes);
+  }
+  fprintf(stderr, "[audiograph-trace] route dump end\n");
+
+  fprintf(stderr, "[audiograph-trace] signal dump end\n");
+}
+
+static void graph_trace_log_block(LiveGraph *lg, int nframes, float peak,
+                                  bool topology_event, bool edits_ok) {
+  if (!lg || !atomic_load_explicit(&g_engine.graph_log, memory_order_acquire)) {
+    return;
+  }
+
+  uint64_t block = atomic_fetch_add_explicit(&g_graph_trace_block_counter, 1,
+                                             memory_order_acq_rel) +
+                   1;
+  bool silent = peak <= 0.000001f;
+  uint32_t silent_streak = 0;
+  if (silent) {
+    silent_streak =
+        atomic_fetch_add_explicit(&g_graph_trace_silent_streak, 1,
+                                  memory_order_acq_rel) +
+        1;
+  } else {
+    atomic_store_explicit(&g_graph_trace_silent_streak, 0, memory_order_release);
+  }
+
+  bool periodic = (block % 86u) == 0;
+  bool silent_checkpoint =
+      silent && (silent_streak == 1 || silent_streak == 16 ||
+                 (silent_streak % 128u) == 0);
+  if (!topology_event && edits_ok && !periodic && !silent_checkpoint) {
+    return;
+  }
+
+  int ready_qlen = 0;
+  int ready_waiters = 0;
+  uint64_t ready_head = 0;
+  uint64_t ready_tail = 0;
+  uint32_t ready_mask = 0;
+  if (lg->sched.readyQueue) {
+    ready_qlen =
+        atomic_load_explicit(&lg->sched.readyQueue->qlen, memory_order_acquire);
+    ready_waiters =
+        atomic_load_explicit(&lg->sched.readyQueue->waiters, memory_order_acquire);
+    if (lg->sched.readyQueue->ring) {
+      ready_head = atomic_load_explicit(&lg->sched.readyQueue->ring->head,
+                                        memory_order_acquire);
+      ready_tail = atomic_load_explicit(&lg->sched.readyQueue->ring->tail,
+                                        memory_order_acquire);
+      ready_mask = lg->sched.readyQueue->ring->mask;
+    }
+  }
+
+  GraphTraceCounts counts = graph_trace_count_scheduler(lg);
+  int jobs = atomic_load_explicit(&lg->sched.jobsInFlight, memory_order_acquire);
+  int active_jobs = atomic_load_explicit(&g_active_job_count, memory_order_acquire);
+  int active_workers =
+      atomic_load_explicit(&g_engine.activeWorkerLimit, memory_order_acquire);
+  uint32_t param_head = 0;
+  uint32_t param_tail = 0;
+  if (lg->params) {
+    param_head = atomic_load_explicit(&lg->params->head, memory_order_acquire);
+    param_tail = atomic_load_explicit(&lg->params->tail, memory_order_acquire);
+  }
+  uint64_t param_pushes =
+      atomic_load_explicit(&g_param_push_count, memory_order_acquire);
+  uint64_t param_fails =
+      atomic_load_explicit(&g_param_push_fail_count, memory_order_acquire);
+  uint64_t param_applied =
+      atomic_load_explicit(&g_param_apply_count, memory_order_acquire);
+  uint64_t event_pushes =
+      atomic_load_explicit(&g_block_event_push_count, memory_order_acquire);
+  uint64_t event_fails =
+      atomic_load_explicit(&g_block_event_push_fail_count, memory_order_acquire);
+  uint64_t events_applied =
+      atomic_load_explicit(&g_block_event_apply_count, memory_order_acquire);
+  uint64_t events_stale =
+      atomic_load_explicit(&g_block_event_drop_stale_count, memory_order_acquire);
+  uint64_t events_invalid =
+      atomic_load_explicit(&g_block_event_drop_invalid_count, memory_order_acquire);
+  uint64_t events_unsupported = atomic_load_explicit(
+      &g_block_event_drop_unsupported_count, memory_order_acquire);
+  uint64_t events_rejected = atomic_load_explicit(
+      &g_block_event_schedule_reject_count, memory_order_acquire);
+
+  fprintf(stderr,
+          "[audiograph-trace] block=%llu nframes=%d peak=%0.6f silent_streak=%u topology_event=%d edits_ok=%d jobsInFlight=%d activeJobs=%d readyQ=%d waiters=%d readyHead=%llu readyTail=%llu readyMask=%u node_count=%d cached_total_jobs=%d recounted_total_jobs=%d source_count=%d recounted_source_count=%d orphaned=%d deleted=%d dirty=%d has_cycle=%d workers=%d active_workers=%d param_backlog=%u param_head=%u param_tail=%u param_pushes=%llu param_applied=%llu param_fails=%llu event_pushes=%llu event_applied=%llu event_fails=%llu event_stale=%llu event_invalid=%llu event_unsupported=%llu event_rejected=%llu\n",
+          (unsigned long long)block, nframes, peak, silent_streak,
+          topology_event ? 1 : 0, edits_ok ? 1 : 0, jobs, active_jobs,
+          ready_qlen, ready_waiters, (unsigned long long)ready_head,
+          (unsigned long long)ready_tail, ready_mask, lg->node_count,
+          lg->sched.cached_total_jobs, counts.total_jobs, lg->sched.source_count,
+          counts.source_count, counts.orphaned_count, counts.deleted_count,
+          lg->sched.dirty ? 1 : 0, lg->sched.has_cycle ? 1 : 0,
+          g_engine.workerCount, active_workers, param_head - param_tail, param_head,
+          param_tail, (unsigned long long)param_pushes,
+          (unsigned long long)param_applied, (unsigned long long)param_fails,
+          (unsigned long long)event_pushes, (unsigned long long)events_applied,
+          (unsigned long long)event_fails, (unsigned long long)events_stale,
+          (unsigned long long)events_invalid,
+          (unsigned long long)events_unsupported,
+          (unsigned long long)events_rejected);
+
+  if (silent_checkpoint &&
+      (silent_streak == 1 || silent_streak == 16 ||
+       (silent_streak % 128u) == 0)) {
+    graph_trace_dump_signal_path(lg, nframes,
+                                 silent_streak == 1 ? "first-silent"
+                                                    : "silent-checkpoint");
+  }
+}
+
+#if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
+static void dump_stalled_nodes(LiveGraph *lg) {
+  if (!lg) {
+    return;
+  }
+
+  int blocked_count = 0;
+  int ready_count = 0;
+  int running_count = 0;
+  int done_count = 0;
+  int orphaned_count = 0;
+  int deleted_count = 0;
+
+  for (int i = 0; i < lg->node_count; i++) {
+    RTNode *node = &lg->nodes[i];
+    bool deleted = (node->vtable.process == NULL && node->nInputs == 0 &&
+                    node->nOutputs == 0);
+    bool orphaned = lg->sched.is_orphaned[i];
+    int pending = atomic_load_explicit(&lg->sched.pending[i], memory_order_acquire);
+
+    if (deleted) {
+      deleted_count++;
+      continue;
+    }
+    if (orphaned) {
+      orphaned_count++;
+      continue;
+    }
+
+    if (pending > 0) {
+      blocked_count++;
+    } else if (pending == 0) {
+      ready_count++;
+    } else if (pending == PENDING_RUNNING_SENTINEL) {
+      running_count++;
+    } else if (pending == PENDING_DONE_SENTINEL) {
+      done_count++;
+    }
+  }
+
+  fprintf(stderr,
+          "[audiograph] stalled-node summary blocked=%d ready=%d running=%d done=%d orphaned=%d deleted=%d\n",
+          blocked_count, ready_count, running_count, done_count, orphaned_count,
+          deleted_count);
+  fprintf(stderr, "[audiograph] stalled-node dump begin\n");
+  for (int i = 0; i < lg->node_count; i++) {
+    RTNode *node = &lg->nodes[i];
+    bool deleted = (node->vtable.process == NULL && node->nInputs == 0 &&
+                    node->nOutputs == 0);
+    int pending = atomic_load_explicit(&lg->sched.pending[i], memory_order_acquire);
+    int indegree = lg->sched.indegree[i];
+    bool orphaned = lg->sched.is_orphaned[i];
+    bool has_out = node_has_any_output_connected(lg, i);
+
+    bool is_active_negative = !orphaned && !deleted &&
+                              (pending == PENDING_RUNNING_SENTINEL ||
+                               pending == PENDING_DONE_SENTINEL);
+    if (pending < 0 && !orphaned && !deleted && !is_active_negative) {
+      continue;
+    }
+
+    fprintf(stderr,
+            "[audiograph] stalled-node id=%d logical=%llu pending=%d indegree=%d orphaned=%d deleted=%d succCount=%d nIn=%d nOut=%d hasOut=%d name=%s\n",
+            i, (unsigned long long)node->logical_id, pending, indegree,
+            orphaned ? 1 : 0, deleted ? 1 : 0, node->succCount, node->nInputs,
+            node->nOutputs, has_out ? 1 : 0,
+            node->debug_name ? node->debug_name : "<unnamed>");
+  }
+  fprintf(stderr, "[audiograph] stalled-node dump end\n");
+
+  // Identify "ghost" nodes: pending=-3 but never went through completion this block.
+  // This is the primary diagnostic for the 1-off jobsInFlight stall.
+  int ghost_count = 0;
+  for (int i = 0; i < lg->node_count; i++) {
+    RTNode *node = &lg->nodes[i];
+    int pending = atomic_load_explicit(&lg->sched.pending[i], memory_order_acquire);
+    bool deleted = (node->vtable.process == NULL && node->nInputs == 0 &&
+                    node->nOutputs == 0);
+    bool orphaned = lg->sched.is_orphaned[i];
+    if (deleted || orphaned) continue;
+    if (pending == PENDING_DONE_SENTINEL && !lg->sched.completed_this_block[i]) {
+      fprintf(stderr,
+              "[audiograph] GHOST NODE id=%d logical=%llu indegree=%d succCount=%d nIn=%d nOut=%d name=%s\n",
+              i, (unsigned long long)node->logical_id, lg->sched.indegree[i],
+              node->succCount, node->nInputs, node->nOutputs,
+              node->debug_name ? node->debug_name : "<unnamed>");
+      ghost_count++;
+    }
+  }
+  if (ghost_count > 0) {
+    fprintf(stderr, "[audiograph] ghost node count=%d (pending=-3 but not completed this block)\n", ghost_count);
+  }
+}
+
+typedef struct {
+  int total_jobs;
+  int source_count;
+} SchedulingCounts;
+
+static SchedulingCounts recount_scheduling_counts(LiveGraph *lg, bool dump_nodes,
+                                                  const char *reason) {
+  SchedulingCounts counts = {0, 0};
+  if (!lg) {
+    return counts;
+  }
+
+  if (dump_nodes) {
+    fprintf(stderr, "[audiograph] scheduling recount begin reason=%s\n",
+            reason ? reason : "<none>");
+  }
+
+  for (int i = 0; i < lg->node_count; i++) {
+    RTNode *node = &lg->nodes[i];
+    bool deleted = (node->vtable.process == NULL && node->nInputs == 0 &&
+                    node->nOutputs == 0);
+    bool orphaned = lg->sched.is_orphaned[i];
+    bool has_out = node_has_any_output_connected(lg, i);
+    bool is_sink = !has_out && lg->sched.indegree[i] > 0;
+
+    if (deleted || orphaned) {
+      continue;
+    }
+
+    if (has_out || is_sink) {
+      counts.total_jobs++;
+      if (dump_nodes) {
+        fprintf(stderr,
+                "[audiograph] recount-job id=%d logical=%llu indegree=%d hasOut=%d isSink=%d succCount=%d nIn=%d nOut=%d name=%s\n",
+                i, (unsigned long long)node->logical_id, lg->sched.indegree[i],
+                has_out ? 1 : 0, is_sink ? 1 : 0, node->succCount, node->nInputs,
+                node->nOutputs, node->debug_name ? node->debug_name : "<unnamed>");
+      }
+      if (lg->sched.indegree[i] == 0 && has_out) {
+        counts.source_count++;
+      }
+    }
+  }
+
+  if (dump_nodes) {
+    fprintf(stderr,
+            "[audiograph] scheduling recount end reason=%s total_jobs=%d source_count=%d cached_total_jobs=%d cached_source_count=%d\n",
+            reason ? reason : "<none>", counts.total_jobs, counts.source_count,
+            lg->sched.cached_total_jobs, lg->sched.source_count);
+  }
+
+  return counts;
+}
+
+static void dump_cached_source_nodes(LiveGraph *lg) {
+  if (!lg) {
+    return;
+  }
+  fprintf(stderr, "[audiograph] cached source nodes begin\n");
+  for (int idx = 0; idx < lg->sched.source_count; idx++) {
+    int nid = lg->sched.source_nodes[idx];
+    if (nid < 0 || nid >= lg->node_count) {
+      fprintf(stderr, "[audiograph] cached-source idx=%d nid=%d INVALID\n", idx, nid);
+      continue;
+    }
+    RTNode *node = &lg->nodes[nid];
+    fprintf(stderr,
+            "[audiograph] cached-source idx=%d nid=%d logical=%llu indegree=%d succCount=%d nIn=%d nOut=%d name=%s\n",
+            idx, nid, (unsigned long long)node->logical_id, lg->sched.indegree[nid],
+            node->succCount, node->nInputs, node->nOutputs,
+            node->debug_name ? node->debug_name : "<unnamed>");
+  }
+  fprintf(stderr, "[audiograph] cached source nodes end\n");
+}
+
+static void dump_ready_queue_state(LiveGraph *lg) {
+  if (!lg || !lg->sched.readyQueue || !lg->sched.readyQueue->ring) {
+    return;
+  }
+  ReadyQ *q = lg->sched.readyQueue;
+  MPMCQueue *ring = q->ring;
+  int qlen = atomic_load_explicit(&q->qlen, memory_order_acquire);
+  int waiters = atomic_load_explicit(&q->waiters, memory_order_acquire);
+  uint64_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
+  uint64_t tail = atomic_load_explicit(&ring->tail, memory_order_acquire);
+  fprintf(stderr,
+          "[audiograph] readyq state qlen=%d waiters=%d head=%llu tail=%llu mask=%u approx_ring_count=%llu\n",
+          qlen, waiters, (unsigned long long)head, (unsigned long long)tail,
+          ring->mask, (unsigned long long)(head - tail));
+}
+#endif
 
 // ===================== OPTIMIZATION: Scheduling Cache =====================
 // Instead of O(n) scans every block, we cache source nodes and job counts.
@@ -722,14 +2220,13 @@ static int choose_active_worker_count(LiveGraph *lg) {
   int jobs = lg->sched.cached_total_jobs;
   int sources = lg->sched.source_count;
 
-  // Worker wake/sync overhead dominates tiny and mostly-serial graphs. Keep
-  // those single-threaded even when the host configured a high max worker count.
+  // Worker wake/sync overhead dominates tiny and mostly-serial graphs.
   if (jobs < 24)
     return 0;
 
   // Scale up conservatively with available work. Initial source width is only a
   // soft cap: many useful audio graphs start at one source and fan out later.
-  int active = jobs / 24;      // 24..47 jobs => 1 worker, 48..71 => 2, ...
+  int active = jobs / 24; // 24..47 jobs => 1 worker, 48..71 => 2, ...
   if (sources >= 2 && active > sources)
     active = sources;
   if (active < 1)
@@ -739,18 +2236,15 @@ static int choose_active_worker_count(LiveGraph *lg) {
   return active;
 }
 
-static void init_pending_and_seed(LiveGraph *lg) {
+static void init_pending_and_seed(LiveGraph *lg, int nframes) {
   // Rebuild cache if topology changed
   if (lg->sched.dirty) {
     rebuild_scheduling_cache(lg);
   }
 
-  // CRITICAL FIX: Properly reset/drain the ready queue to prevent stale node
-  // IDs. Only drain if there might be stale items.
-  int32_t dummy;
-  while (rq_try_pop(lg->sched.readyQueue, &dummy)) {
-    // Discard any stale items
-  }
+  // Properly reset/drain the ready queue and any stale semaphore signals before
+  // publishing this block's work.
+  rq_reset(lg->sched.readyQueue);
 
   // Reset pending counts to indegree for all active nodes
   // This is O(n) but uses relaxed stores which are fast
@@ -763,17 +2257,32 @@ static void init_pending_and_seed(LiveGraph *lg) {
     } else {
       atomic_store_explicit(&lg->sched.pending[i], lg->sched.indegree[i], memory_order_relaxed);
     }
+#if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
+    lg->sched.completed_this_block[i] = false;
+#endif
   }
 
   // Memory barrier to ensure all pending stores are visible before workers start
   atomic_thread_fence(memory_order_release);
 
-  // Seed ready queue from cached source list - O(sources) instead of O(n)
-  // Use batch push to reduce semaphore signals from O(sources) to O(1)
-  rq_push_batch(lg->sched.readyQueue, lg->sched.source_nodes, lg->sched.source_count);
+#if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
+  atomic_store_explicit(&g_completed_jobs, 0, memory_order_release);
+  atomic_store_explicit(&g_completion_seq, 0, memory_order_release);
+  for (int i = 0; i < COMPLETION_LOG_CAPACITY; i++) {
+    atomic_store_explicit(&g_completion_log_nodes[i], -1, memory_order_relaxed);
+    atomic_store_explicit(&g_completion_log_seq[i], 0, memory_order_relaxed);
+  }
+#endif
 
   atomic_store_explicit(&lg->sched.jobsInFlight, lg->sched.cached_total_jobs,
                         memory_order_release);
+
+  // Seed ready queue from cached source list - O(sources) instead of O(n).
+  // Use the helping enqueue path so a graph with more sources than queue slots
+  // cannot deadlock the audio callback during block setup.
+  for (int i = 0; i < lg->sched.source_count; i++) {
+    schedule_ready_node(lg, lg->sched.source_nodes[i], nframes);
+  }
 }
 
 bool detect_cycle(LiveGraph *lg) {
@@ -804,11 +2313,15 @@ static void drain_retire_list(LiveGraph *lg) {
 static void update_watched_node_states(LiveGraph *lg);
 
 static void process_live_block_internal(LiveGraph *lg, int nframes, bool update_watch) {
+  graph_profile_begin(lg, nframes);
   // Initialize pending counts and seed ready queue
-  init_pending_and_seed(lg);
+  init_pending_and_seed(lg, nframes);
 
   // Check for cycles that would cause silent deadlocks
   if (detect_cycle(lg)) {
+    atomic_store_explicit(&lg->sched.jobsInFlight, 0, memory_order_release);
+    rq_reset(lg->sched.readyQueue);
+
     // Clear output buffer to silence
     if (lg->dac_node_id >= 0 && lg->nodes[lg->dac_node_id].inEdgeId) {
       int master_edge_id = lg->nodes[lg->dac_node_id].inEdgeId[0];
@@ -819,6 +2332,7 @@ static void process_live_block_internal(LiveGraph *lg, int nframes, bool update_
     }
     if (update_watch)
       update_watched_node_states(lg);
+    graph_profile_end(lg);
     return;
   }
 
@@ -826,6 +2340,7 @@ static void process_live_block_internal(LiveGraph *lg, int nframes, bool update_
   if (atomic_load_explicit(&lg->sched.jobsInFlight, memory_order_acquire) <= 0) {
     if (update_watch)
       update_watched_node_states(lg);
+    graph_profile_end(lg);
     return;
   }
 
@@ -837,7 +2352,9 @@ static void process_live_block_internal(LiveGraph *lg, int nframes, bool update_
     // Publish session frames and graph
     atomic_store_explicit(&g_engine.sessionFrames, nframes,
                           memory_order_release);
-    atomic_store_explicit(&g_engine.workSession, lg, memory_order_release);
+    atomic_store_explicit(&g_engine.workSession, lg, memory_order_relaxed);
+    assert(atomic_load_explicit(&g_engine.sessionUsers, memory_order_relaxed) == SESSION_CLOSED);
+    atomic_store_explicit(&g_engine.sessionUsers, 0, memory_order_release);
 
     // wake workers
     pthread_mutex_lock(&g_engine.sess_mtx);
@@ -847,23 +2364,106 @@ static void process_live_block_internal(LiveGraph *lg, int nframes, bool update_
     // Audio thread helps do some work
     int32_t nid;
     int empty_spins = 0;
+    uint64_t stalled_empty_since_ns = 0;
+#if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
+    bool stall_logged = false;
+    struct timespec wait_started;
+    clock_gettime(CLOCK_MONOTONIC, &wait_started);
+#endif
     while (atomic_load_explicit(&lg->sched.jobsInFlight, memory_order_acquire) > 0) {
       if (rq_try_pop(lg->sched.readyQueue, &nid)) {
-        execute_and_fanout(lg, nid, nframes);
+        if (!try_execute_ready_node(lg, nid, nframes)) {
+          continue;
+        }
         empty_spins = 0; // Reset on successful work
+        stalled_empty_since_ns = 0;
+#ifdef __linux__
+        int callback_policy = atomic_load_explicit(
+            &g_engine.callbackPolicy, memory_order_relaxed);
+        checkpoint_rtkit_cpu_budget(callback_policy);
+#endif
       } else {
-        // Queue empty but work is still in flight, so a worker owns something
-        // on the current dependency frontier. This is the realtime callback
-        // thread; never call sched_yield() here. In optimized builds this loop
-        // can hit a yield very quickly, handing the audio deadline to the OS and
-        // causing rare multi-ms tail latency. Keep the callback runnable and
-        // poll lightly until workers publish more ready jobs or finish.
+        // Queue empty but work in flight - workers processing
+        // Check again if work completed (avoids unnecessary spins)
         if (atomic_load_explicit(&lg->sched.jobsInFlight, memory_order_acquire) == 0)
           break;
         cpu_relax();
+        // Help with bursts first, then park briefly. Publication or completion
+        // wakes this wait; it does not depend only on the timeout for progress.
+        if (AUDIOGRAPH_CALLBACK_WAIT_TIMEOUT_US > 0 &&
+            (empty_spins + 1) % AUDIOGRAPH_CALLBACK_EMPTY_SPINS == 0) {
+          rq_wait_for_work(lg->sched.readyQueue, AUDIOGRAPH_CALLBACK_WAIT_TIMEOUT_US);
+        }
         if (++empty_spins > 4096) {
           empty_spins = 0;
+#ifdef __linux__
+          int callback_policy = atomic_load_explicit(
+              &g_engine.callbackPolicy, memory_order_relaxed);
+          checkpoint_rtkit_cpu_budget(callback_policy);
+#endif
+          int active_jobs =
+              atomic_load_explicit(&g_active_job_count, memory_order_acquire);
+          if (active_jobs > 0) {
+            stalled_empty_since_ns = 0;
+          } else {
+            uint64_t now_ns = nsec_now();
+            if (stalled_empty_since_ns == 0) {
+              stalled_empty_since_ns = now_ns;
+            } else if (now_ns - stalled_empty_since_ns >=
+                       AUDIOGRAPH_STALL_RECOVERY_TIMEOUT_NS) {
+              int jobs =
+                  atomic_load_explicit(&lg->sched.jobsInFlight, memory_order_acquire);
+              int qlen =
+                  atomic_load_explicit(&lg->sched.readyQueue->qlen, memory_order_acquire);
+              uint64_t recovery = atomic_fetch_add_explicit(
+                                      &g_stall_recovery_count, 1,
+                                      memory_order_acq_rel) +
+                                  1;
+              fprintf(stderr,
+                      "[audiograph] STALL RECOVERY #%llu: no active/ready jobs, jobsInFlight=%d readyQ=%d node_count=%d source_count=%d cached_total_jobs=%d dirty=%d\n",
+                      (unsigned long long)recovery, jobs, qlen, lg->node_count,
+                      lg->sched.source_count, lg->sched.cached_total_jobs,
+                      lg->sched.dirty ? 1 : 0);
+              atomic_store_explicit(&lg->sched.jobsInFlight, 0,
+                                    memory_order_release);
+              break;
+            }
+          }
         }
+#if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
+        if (!stall_logged) {
+          struct timespec now;
+          clock_gettime(CLOCK_MONOTONIC, &now);
+          long waited_ms =
+              (now.tv_sec - wait_started.tv_sec) * 1000L +
+              (now.tv_nsec - wait_started.tv_nsec) / 1000000L;
+          if (waited_ms >= 10) {
+            int jobs = atomic_load_explicit(&lg->sched.jobsInFlight, memory_order_acquire);
+            int qlen = atomic_load_explicit(&lg->sched.readyQueue->qlen, memory_order_acquire);
+            SchedulingCounts recounted =
+                recount_scheduling_counts(lg, /*dump_nodes=*/true, "stall");
+            fprintf(stderr,
+                    "[audiograph] process_live_block stall: waited=%ldms jobsInFlight=%d readyQ=%d node_count=%d source_count=%d cached_total_jobs=%d recounted_total_jobs=%d recounted_source_count=%d dirty=%d\n",
+                    waited_ms, jobs, qlen, lg->node_count, lg->sched.source_count,
+                    lg->sched.cached_total_jobs, recounted.total_jobs,
+                    recounted.source_count, lg->sched.dirty ? 1 : 0);
+            dump_ready_queue_state(lg);
+            dump_cached_source_nodes(lg);
+            dump_stalled_nodes(lg);
+            dump_inflight_nodes(lg);
+            dump_completion_log(lg);
+            stall_logged = true;
+
+            // STALL RECOVERY: Force jobsInFlight to 0 so the audio callback
+            // can return and the next block can start fresh. Without this,
+            // a single accounting bug causes permanent audio death.
+            fprintf(stderr,
+                    "[audiograph] STALL RECOVERY: forcing jobsInFlight from %d to 0\n",
+                    jobs);
+            atomic_store_explicit(&lg->sched.jobsInFlight, 0, memory_order_release);
+          }
+        }
+#endif
       }
     }
 
@@ -872,21 +2472,18 @@ static void process_live_block_internal(LiveGraph *lg, int nframes, bool update_
     // writes from all worker threads.
     atomic_thread_fence(memory_order_acquire);
 
-    // Clear session
-    atomic_store_explicit(&g_engine.workSession, NULL, memory_order_release);
+    close_work_session(lg);
   } else {
     // Single-thread fallback
     int32_t nid;
     while (rq_try_pop(lg->sched.readyQueue, &nid)) {
-      execute_and_fanout(lg, nid, nframes);
+      (void)try_execute_ready_node(lg, nid, nframes);
     }
   }
 
+  graph_profile_end(lg);
   drain_retire_list(lg);
 
-  // Update watched node states for direct process_live_block callers.
-  // process_next_block processes in internal slices and snapshots once after
-  // all slices complete, avoiding duplicate large state copies per callback.
   if (update_watch)
     update_watched_node_states(lg);
 }
@@ -900,6 +2497,16 @@ int find_live_output(LiveGraph *lg) {
 }
 
 // ===================== Live Engine Implementation =====================
+bool prepare_graph_for_render(LiveGraph *lg) {
+  if (!lg || atomic_load_explicit(&lg->edit_batch_depth, memory_order_acquire) != 0)
+    return false;
+  bool ok = apply_graph_edits(lg->graphEditQueue, lg);
+  if (lg->sched.dirty)
+    rebuild_invalid_io_caches(lg, lg->block_size);
+  apply_params(lg);
+  return ok;
+}
+
 void process_next_block(LiveGraph *lg, float *output_buffer, int nframes) {
   if (!lg || !output_buffer || nframes <= 0) {
     // Clear output buffer if invalid input
@@ -910,22 +2517,40 @@ void process_next_block(LiveGraph *lg, float *output_buffer, int nframes) {
     return;
   }
 
+  int before_node_count = lg->node_count;
+  int before_cached_jobs = lg->sched.cached_total_jobs;
+  int before_source_count = lg->sched.source_count;
+  bool before_dirty = lg->sched.dirty;
+  bool edits_ok = true;
+  bool topology_event = false;
+
   if (atomic_load_explicit(&lg->edit_batch_depth, memory_order_acquire) == 0) {
-    apply_graph_edits(lg->graphEditQueue, lg);
+    edits_ok = apply_graph_edits(lg->graphEditQueue, lg);
+    topology_event = !edits_ok || before_node_count != lg->node_count ||
+                     before_cached_jobs != lg->sched.cached_total_jobs ||
+                     before_source_count != lg->sched.source_count ||
+                     before_dirty != lg->sched.dirty;
     if (lg->sched.dirty) {
       rebuild_invalid_io_caches(lg, lg->block_size);
     }
   }
 
   apply_params(lg);
+  (void)drain_block_events_for_callback(lg, nframes);
+  uint64_t block_serial =
+      atomic_fetch_add_explicit(&lg->block_event_serial, 1, memory_order_acq_rel);
 
   // Process in slices if callback frames exceed internal block size.
   int remaining = nframes;
   int out_offset = 0; // in frames
+  int event_index = 0;
   while (remaining > 0) {
     int slice = remaining;
     if (slice > lg->block_size)
       slice = lg->block_size;
+
+    begin_event_slice_for_nodes(lg, block_serial, out_offset, slice);
+    event_index = deliver_block_events_for_slice(lg, event_index, out_offset, slice);
 
     process_live_block_internal(lg, slice, false);
 
@@ -974,13 +2599,17 @@ void process_next_block(LiveGraph *lg, float *output_buffer, int nframes) {
     out_offset += slice;
   }
 
+  graph_trace_log_block(lg, nframes,
+                        graph_trace_peak(output_buffer, nframes, lg->num_channels),
+                        topology_event, edits_ok);
+
   // Throttle watchlist snapshots in the audio render path. A full snapshot can
   // be expensive when many UI/polling operators are watched, and most consumers
   // don't need audio-block-rate state updates.
 #if AUDIOGRAPH_WATCH_UPDATE_INTERVAL <= 1
   update_watched_node_states(lg);
 #else
-  uint32_t watch_tick = atomic_fetch_add_explicit(&g_watch_update_counter, 1,
+  uint32_t watch_tick = atomic_fetch_add_explicit(&lg->watch.update_counter, 1,
                                                   memory_order_relaxed);
   if ((watch_tick % AUDIOGRAPH_WATCH_UPDATE_INTERVAL) == 0) {
     update_watched_node_states(lg);
@@ -993,11 +2622,11 @@ static void update_watched_node_states(LiveGraph *lg) {
     return;
   }
 
-  // This function is called from process_next_block(), so never block the audio
+  // This can be called from process_next_block(), so never block the audio
   // thread behind UI watchlist readers/writers and avoid per-callback mallocs.
-  // If the UI is changing/reading watch state right now, skip this snapshot; the
-  // next throttled audio callback will publish a fresh one.
-  enum { WATCH_STACK_CAP = 64 };
+  // Loaded sequencer projects can watch one pan meter plus many sampler voices
+  // per track, so this must be comfortably above the common project size.
+  enum { WATCH_STACK_CAP = 2048 };
   int watch_nodes_stack[WATCH_STACK_CAP];
 
   if (pthread_mutex_trylock(&lg->watch.mutex) != 0) {
@@ -1006,8 +2635,9 @@ static void update_watched_node_states(LiveGraph *lg) {
 
   int watch_count = lg->watch.count;
   if (watch_count > WATCH_STACK_CAP) {
-    // Avoid heap allocation on the realtime path. Large watchlists should be
-    // handled by a non-RT snapshot path; for now, skip rather than glitch.
+    watch_count = WATCH_STACK_CAP;
+  }
+  if (watch_count <= 0) {
     pthread_mutex_unlock(&lg->watch.mutex);
     return;
   }
@@ -1032,8 +2662,7 @@ static void update_watched_node_states(LiveGraph *lg) {
       continue; // No state to copy
     }
 
-    // Reuse existing snapshot buffer if size matches; this is the common
-    // steady-state path for scope~/live.meter~ polling. Allocation only happens
+    // Reuse existing snapshot buffer if size matches. Allocation only happens
     // when a watch is first added or a hot-swap changes state size.
     if (lg->watch.snapshots[node_id] &&
         lg->watch.sizes[node_id] == node->state_size) {

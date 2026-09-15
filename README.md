@@ -2,7 +2,7 @@
 
 A real-time audio graph engine in C11 with lock-free multi-threaded scheduling, live graph editing, and zero-allocation audio processing.
 
-- **Multi-threaded DAG scheduling** with Mach RT time-constraint promotion and OS Workgroup coordination
+- **Multi-threaded DAG scheduling** with Mach time constraints on macOS, SCHED_FIFO on Linux, and OS Workgroup coordination
 - **Live editing** — add, remove, and reconnect nodes while audio is playing
 - **Lock-free throughout** — MPMC work queue, SPSC parameter ring, batched edit queue
 - **Auto-summing** — multiple sources to one input transparently create hidden SUM nodes
@@ -24,7 +24,7 @@ int main() {
     initialize_engine(512, 48000);
     LiveGraph *lg = create_live_graph(16, 512, "demo", 2); // stereo
 
-    engine_enable_rt_time_constraint(1);
+    engine_enable_rt_scheduling(1);
     engine_start_workers(4);
 
     // Build a signal chain
@@ -53,9 +53,61 @@ All graph operations (`graph_connect`, `add_node`, `delete_node`, etc.) are queu
 void initialize_engine(int block_size, int sample_rate);
 void engine_start_workers(int n);
 void engine_stop_workers(void);
-void engine_enable_rt_time_constraint(int enable); // Mach RT scheduling (macOS)
-void engine_set_os_workgroup(void *oswg);           // OS Workgroup (macOS 10.16+)
+void engine_enable_rt_scheduling(int enable); // Mach RT (macOS), SCHED_FIFO (Linux)
+void engine_set_rt_priority(int priority);     // Linux SCHED_FIFO priority
+void engine_set_os_workgroup(void *oswg);      // OS Workgroup (macOS 10.16+)
 ```
+
+On Linux, eseq first requests `SCHED_FIFO`, which requires a nonzero
+`RLIMIT_RTPRIO`. If that request is denied, a non-audio helper asks the system
+RealtimeKit service for capped `SCHED_RR`; this is the zero-configuration path
+on stock PipeWire desktops. Before its first request, the helper deliberately
+sets the process's soft and hard `RLIMIT_RTTIME` to RealtimeKit's
+`RTTimeUSecMax` (or a pre-existing lower hard limit). Linux sends `SIGKILL` if
+an RT thread consumes that entire uninterrupted CPU budget. The audio callback
+and graph workers therefore make periodic, minimal blocking checkpoints while
+running under RealtimeKit's `SCHED_RR`; this resets the kernel accounting even
+when a callback is stalled waiting for graph work or heavy DSP keeps workers
+busy across consecutive blocks. Direct `SCHED_FIFO` threads do not take these
+checkpoints and retain their existing hot path. The limit still protects the
+host from a runaway realtime thread.
+
+For uncapped FIFO priorities, the repository ships
+[`packaging/eseq-realtime.conf`](packaging/eseq-realtime.conf), a PAM limits
+drop-in granting realtime-group members `rtprio 95` and unlimited locked memory.
+Provision a development or manually installed host with:
+
+```sh
+sudo groupadd --system --force realtime
+sudo install -Dm644 packaging/eseq-realtime.conf \
+  /etc/security/limits.d/95-eseq-realtime.conf
+sudo usermod -aG realtime "$USER"
+```
+
+Log out completely and log back in after changing group membership; opening a
+new terminal inside the old login session is not sufficient. Verify the new
+session before launching eseq:
+
+```sh
+ulimit -r       # 95
+ulimit -l       # unlimited (some shells print "unlimited")
+```
+
+The drop-in is applied by `pam_limits` to login sessions. A service whose
+systemd unit overrides resource limits instead needs equivalent
+`LimitRTPRIO=95` and `LimitMEMLOCK=infinity` directives. Do not grant `CAP_SYS_NICE` to a development
+binary: file capabilities are lost whenever Cargo replaces the executable and
+grant broader scheduling authority than this group-scoped limit.
+
+At startup, eseq reports the policies and priorities actually observed on the
+worker and audio callback threads. With the drop-in, workers use `SCHED_FIFO`
+priority 20 and the callback uses priority 21. Without it, RealtimeKit normally
+grants `SCHED_RR` at its advertised cap: the helper reserves the top available
+step for the callback and keeps callback priority at least equal to worker
+priority when the cap has no headroom. If RealtimeKit or the system bus is also
+unavailable, threads remain `SCHED_OTHER` priority 0 and audio continues after
+a one-shot warning. Set `TINYSEQ_AUDIOGRAPH_RT_LOG=1` for per-thread promotion
+logs; `chrt -p <tid>` can independently inspect a thread from another shell.
 
 ### Graph Lifecycle
 
@@ -207,29 +259,23 @@ The `process` function must be **real-time safe**: no allocations, no locks, no 
 
 AudioGraph uses a **worker pool with Mach real-time scheduling** to parallelize DAG processing across cores.
 
-The problem: **standard POSIX threads are worse than useless for parallel audio**. Under time-sharing scheduling, context switches and variable wakeup latency dominate — and in audio, it's the **worst-case** block time that matters, not the average. A single block that exceeds the deadline causes an audible glitch.
+The problem: **standard POSIX threads are worse than useless for parallel audio**. Under time-sharing scheduling, context switches and variable wakeup latency dominate. A graph that processes in 0.5ms on one RT thread can take 1.2ms on four normal threads:
 
-| Configuration | Median | P95 | Speedup |
-|---|---|---|---|
-| Single-threaded (audio thread only) | 3.06ms | 3.33ms | 1.00x |
-| 1 RT worker | 1.50ms | 1.53ms | 2.04x |
-| 2 RT workers | 1.09ms | 1.58ms | 2.82x |
-| 4 RT workers | 1.11ms | 2.58ms | 2.77x |
-| 4 RT workers + OS Workgroup | 0.90ms | 1.84ms | 3.41x |
-| 6 RT workers | 0.98ms | 1.79ms | 3.14x |
-| **6 RT workers + OS Workgroup** | **0.74ms** | **0.79ms** | **4.13x** |
-| 8 RT workers | 0.99ms | 2.18ms | 3.09x |
-| 8 RT workers + OS Workgroup | 0.99ms | 1.39ms | 3.11x |
+| Configuration | Processing Time | Speedup |
+|---|---|---|
+| 1 RT thread | 0.48ms | 1.0x (baseline) |
+| 4 normal threads | 1.15ms | 0.42x (slower!) |
+| 4 RT threads | 0.18ms | 2.67x |
+| 4 RT threads + OS Workgroup | 0.14ms | 3.43x |
+| 8 RT threads + OS Workgroup | 0.09ms | 5.33x |
 
-*Measured on Apple M1 Max, 1000 independent oscillators → DAC (maximally parallel — all source nodes execute concurrently), 512-sample blocks @ 44.1kHz, via real CoreAudio callback. Best of 3 runs, 470 blocks per run.*
-
-The P95 column is the one that matters for audio — it determines whether you get glitches. Without OS Workgroup, the P95 is 2–3x the median because the kernel can preempt or migrate worker threads mid-block. With OS Workgroup at 6 workers, the P95 drops to **1.07x the median** — nearly jitter-free. Adding workers beyond 6 shows diminishing returns due to MPMC queue contention.
+*Measured on M1, 64-node graph, 512-sample blocks @ 48kHz.*
 
 The solution is three-layered:
 
 1. **QoS hints** (`QOS_CLASS_USER_INTERACTIVE`) — always active on macOS, tells the scheduler this work is latency-sensitive
 2. **Mach time-constraint policy** — promotes workers to hard real-time with a computation budget of 75% of the audio block period and a hard deadline at 100%. The OS guarantees no preemption within the budget.
-3. **OS Workgroups** (macOS 11+) — workers join a shared workgroup so the kernel co-schedules them on separate cores, minimizes migration, and can boost/throttle the group as a unit. The primary benefit is not raw throughput but **consistency** — workgroup eliminates the scheduling jitter that causes P95 spikes and audio glitches
+3. **OS Workgroups** (macOS 11+) — workers join a shared workgroup so the kernel co-schedules them on separate cores, minimizes migration, and can boost/throttle the group as a unit
 
 Workers park on a `pthread_cond_t` between blocks. When `process_next_block` is called, it broadcasts a wake, and all workers enter a spin-then-wait loop pulling nodes from the ready queue. The audio thread participates as a worker too — it doesn't just dispatch and wait.
 
