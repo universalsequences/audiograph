@@ -146,6 +146,9 @@ static EngineRtKitWorkerHook g_rtkit_worker_hook = NULL;
 static EngineRtKitCallbackHook g_rtkit_callback_hook = NULL;
 static _Atomic int g_rt_permission_warning_logged = 0;
 static __thread uint64_t g_last_rtkit_checkpoint_ns = 0;
+// Policy this thread last checkpointed with, so code that has no policy in
+// scope (an inline successor chain) can checkpoint the same way.
+static __thread int g_thread_checkpoint_policy = 0;
 
 static inline int base_linux_scheduling_policy(int policy) {
 #ifdef SCHED_RESET_ON_FORK
@@ -156,6 +159,7 @@ static inline int base_linux_scheduling_policy(int policy) {
 }
 
 static inline void checkpoint_rtkit_cpu_budget(int policy) {
+  g_thread_checkpoint_policy = policy;
   if (base_linux_scheduling_policy(policy) != SCHED_RR)
     return;
 
@@ -1760,88 +1764,121 @@ void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
 
 
 static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes) {
-  if (nid < 0 || nid >= lg->node_count) {
-    fprintf(stderr,
-            "[audiograph] WARN: execute_and_fanout skipping invalid nid=%d "
-            "(count=%d)\n",
-            nid, lg->node_count);
-    return;
-  }
-#if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
-  atomic_store_explicit(&g_inflight_node_ids[g_current_execution_slot], nid,
-                        memory_order_release);
-#endif
-  bind_and_run_live(lg, nid, nframes); // uses silence/scratch for missing ports
-
-  RTNode *node = &lg->nodes[nid];
-
-  // OPTIMIZATION: Check if we have any successors before the loop
-  // This avoids cache misses on is_orphaned for leaf nodes
-  if (node->succCount > 0) {
-    // Notify successors (node-level)
-    // Use release semantics to ensure our output buffer writes are visible
-    for (int i = 0; i < node->succCount; i++) {
-      int succ = node->succ[i];
-      if (succ < 0 || succ >= lg->node_count) {
-        continue;
-      }
-      if (lg->sched.is_orphaned[succ]) {
-        continue;
-      }
-      // Use release on decrement to ensure buffer writes are visible to successor
-#if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
-      int prev_pending =
-          atomic_fetch_sub_explicit(&lg->sched.pending[succ], 1, memory_order_release);
-      if (prev_pending == 1) {
-        schedule_ready_node(lg, succ, nframes);
-      } else if (prev_pending <= 0) {
-        RTNode *succ_node = &lg->nodes[succ];
-        fprintf(stderr,
-                "[audiograph] WARN: pending underflow/duplicate fanout src=%d(%s) succ=%d(%s) prev_pending=%d indegree=%d\n",
-                nid, node->debug_name ? node->debug_name : "<unnamed>", succ,
-                succ_node->debug_name ? succ_node->debug_name : "<unnamed>",
-                prev_pending, lg->sched.indegree[succ]);
-      }
-#else
-      if (atomic_fetch_sub_explicit(&lg->sched.pending[succ], 1,
-                                    memory_order_release) == 1) {
-        schedule_ready_node(lg, succ, nframes);
-      }
-#endif
+  // Runs `nid`, then keeps going on this thread with one of the successors it
+  // made ready. A node whose last input just arrived cannot have been seen by
+  // any other thread yet, so handing it to the ready queue only to pop it
+  // again buys nothing: a serial chain would pay a queue round-trip and a
+  // possible worker wake per node. Any further ready successors do go to the
+  // queue, so fan-out still spreads across workers.
+  //
+  // The chain's nodes are subtracted from jobsInFlight once, when the chain
+  // ends, rather than one contended write per node: the count only has to be
+  // exact when it reaches zero, and it cannot reach zero while this thread
+  // still owes its own nodes.
+  int completed = 0;
+  for (;;) {
+    if (nid < 0 || nid >= lg->node_count) {
+      fprintf(stderr,
+              "[audiograph] WARN: execute_and_fanout skipping invalid nid=%d "
+              "(count=%d)\n",
+              nid, lg->node_count);
+      break;
     }
-  }
+#if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
+    atomic_store_explicit(&g_inflight_node_ids[g_current_execution_slot], nid,
+                          memory_order_release);
+#endif
+    bind_and_run_live(lg, nid, nframes); // uses silence/scratch for missing ports
+
+    RTNode *node = &lg->nodes[nid];
+    int32_t next = -1; // ready successor to run inline after this node
+
+    // OPTIMIZATION: Check if we have any successors before the loop
+    // This avoids cache misses on is_orphaned for leaf nodes
+    if (node->succCount > 0) {
+      // Notify successors (node-level)
+      // Use release semantics to ensure our output buffer writes are visible
+      for (int i = 0; i < node->succCount; i++) {
+        int succ = node->succ[i];
+        if (succ < 0 || succ >= lg->node_count) {
+          continue;
+        }
+        if (lg->sched.is_orphaned[succ]) {
+          continue;
+        }
+        // Use release on decrement to ensure buffer writes are visible to successor
+        int prev_pending = atomic_fetch_sub_explicit(&lg->sched.pending[succ], 1,
+                                                     memory_order_release);
+        if (prev_pending == 1) {
+          // Keep the most recent ready successor for ourselves; publish the
+          // one we were holding so another thread can start on it now.
+          if (next >= 0)
+            schedule_ready_node(lg, next, nframes);
+          next = succ;
+        }
+#if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
+        else if (prev_pending <= 0) {
+          RTNode *succ_node = &lg->nodes[succ];
+          fprintf(stderr,
+                  "[audiograph] WARN: pending underflow/duplicate fanout src=%d(%s) succ=%d(%s) prev_pending=%d indegree=%d\n",
+                  nid, node->debug_name ? node->debug_name : "<unnamed>", succ,
+                  succ_node->debug_name ? succ_node->debug_name : "<unnamed>",
+                  prev_pending, lg->sched.indegree[succ]);
+        }
+#endif
+      }
+    }
 
 #if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
-  // Log completion and decrement counters BEFORE marking node as done.
-  // This ensures that if a stall diagnostic sees pending=-3, the matching
-  // jobsInFlight-- has already happened. Previously, pending was set first,
-  // which created a window where a node appeared "done" in diagnostics
-  // without its jobsInFlight decrement being visible.
-  uint64_t completion_seq =
-      atomic_fetch_add_explicit(&g_completion_seq, 1, memory_order_acq_rel);
-  int completion_slot = (int)(completion_seq % COMPLETION_LOG_CAPACITY);
-  atomic_store_explicit(&g_completion_log_nodes[completion_slot], nid,
-                        memory_order_release);
-  atomic_store_explicit(&g_completion_log_seq[completion_slot], completion_seq + 1,
-                        memory_order_release);
-  lg->sched.completed_this_block[nid] = true;
-  atomic_fetch_add_explicit(&g_completed_jobs, 1, memory_order_release);
-  int remaining_jobs = atomic_fetch_sub_explicit(&lg->sched.jobsInFlight, 1,
-                                                  memory_order_acq_rel) - 1;
-  // Mark done AFTER accounting — a node with pending=-3 is now guaranteed
-  // to have been fully counted in completed_jobs and jobsInFlight.
-  atomic_store_explicit(&lg->sched.pending[nid], PENDING_DONE_SENTINEL,
-                        memory_order_release);
-  atomic_store_explicit(&g_inflight_node_ids[g_current_execution_slot], -1,
-                        memory_order_release);
+    // Log completion and decrement counters BEFORE marking node as done.
+    // This ensures that if a stall diagnostic sees pending=-3, the matching
+    // jobsInFlight-- has already happened. Previously, pending was set first,
+    // which created a window where a node appeared "done" in diagnostics
+    // without its jobsInFlight decrement being visible.
+    uint64_t completion_seq =
+        atomic_fetch_add_explicit(&g_completion_seq, 1, memory_order_acq_rel);
+    int completion_slot = (int)(completion_seq % COMPLETION_LOG_CAPACITY);
+    atomic_store_explicit(&g_completion_log_nodes[completion_slot], nid,
+                          memory_order_release);
+    atomic_store_explicit(&g_completion_log_seq[completion_slot], completion_seq + 1,
+                          memory_order_release);
+    lg->sched.completed_this_block[nid] = true;
+    atomic_fetch_add_explicit(&g_completed_jobs, 1, memory_order_release);
+    int remaining_jobs = atomic_fetch_sub_explicit(&lg->sched.jobsInFlight, 1,
+                                                    memory_order_acq_rel) - 1;
+    // Mark done AFTER accounting — a node with pending=-3 is now guaranteed
+    // to have been fully counted in completed_jobs and jobsInFlight.
+    atomic_store_explicit(&lg->sched.pending[nid], PENDING_DONE_SENTINEL,
+                          memory_order_release);
+    atomic_store_explicit(&g_inflight_node_ids[g_current_execution_slot], -1,
+                          memory_order_release);
+    if (remaining_jobs == 0)
+      rq_finish(lg->sched.readyQueue);
 #else
-  // Publish this node's output writes before signaling global block completion.
-  // The audio thread waits on jobsInFlight with acquire loads, so the final
-  // transition to zero must carry release semantics.
-  int remaining_jobs = atomic_fetch_sub_explicit(&lg->sched.jobsInFlight, 1,
-                                                  memory_order_acq_rel) - 1;
+    completed++;
 #endif
-  if (remaining_jobs == 0)
+
+    if (next < 0)
+      break;
+#if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
+    // Same claim a queue pop would have made (pending 0 -> RUNNING).
+    if (!claim_ready_node(lg, next))
+      break;
+#endif
+#ifdef __linux__
+    // A long inline chain must still reach RealtimeKit's CPU-budget
+    // checkpoint; the per-job call sites only run once the chain returns.
+    checkpoint_rtkit_cpu_budget(g_thread_checkpoint_policy);
+#endif
+    nid = next;
+  }
+
+  // Publish this chain's output writes before signaling global block
+  // completion. The audio thread waits on jobsInFlight with acquire loads, so
+  // the final transition to zero must carry release semantics.
+  if (completed > 0 &&
+      atomic_fetch_sub_explicit(&lg->sched.jobsInFlight, completed,
+                                memory_order_acq_rel) == completed)
     rq_finish(lg->sched.readyQueue);
 }
 
@@ -2434,6 +2471,75 @@ static void dump_ready_queue_state(LiveGraph *lg) {
 // Instead of O(n) scans every block, we cache source nodes and job counts.
 // The cache is rebuilt only when topology changes (scheduling_dirty flag).
 
+// Reset every node's pending count for a new pass over the graph: its
+// indegree, or -1 for a slot that is deleted or orphaned and must never run.
+static inline void reset_pending_counts(LiveGraph *lg) {
+  for (int i = 0; i < lg->node_count; i++) {
+    bool deleted = (lg->nodes[i].vtable.process == NULL &&
+                    lg->nodes[i].nInputs == 0 && lg->nodes[i].nOutputs == 0);
+    int pending = (deleted || lg->sched.is_orphaned[i]) ? -1 : lg->sched.indegree[i];
+    atomic_store_explicit(&lg->sched.pending[i], pending, memory_order_relaxed);
+  }
+}
+
+#if !AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
+// Precompute the order a block runs in when no worker takes part, so that
+// block needs no ready queue, no pending counters and no per-node atomics: it
+// is a plain loop over this array. Readiness follows the same rule
+// execute_and_fanout applies at run time (same successor lists, same orphan
+// skip), so the plan holds the same nodes the queue path would run; the order
+// among ready nodes is depth-first. The pending array is the scratch space —
+// it is reset at the start of any block that does use it. If the replay does
+// not account for every scheduled job the plan is discarded and the queue
+// path runs as before.
+static void build_serial_order(LiveGraph *lg, int totalJobs) {
+  lg->sched.order_count = -1;
+  if (lg->sched.has_cycle || totalJobs <= 0 || !lg->sched.order ||
+      totalJobs > lg->node_capacity)
+    return;
+
+  reset_pending_counts(lg);
+
+  // Depth-first replay: a node that becomes ready runs before older ready
+  // nodes, the same policy as the inline successor at run time. That keeps a
+  // buffer's producer next to its consumer, so it is still in cache when read
+  // (breadth-first would run every source in the graph before any consumer).
+  // The ready stack lives in the tail of the same array, growing down, while
+  // the output grows up from the front; a node is in exactly one of the two,
+  // so they cannot collide while the replay stays within totalJobs.
+  int32_t *order = lg->sched.order;
+  int out = 0, sp = totalJobs;
+  for (int i = lg->sched.source_count - 1; i >= 0; i--) {
+    if (sp <= out)
+      return;
+    order[--sp] = lg->sched.source_nodes[i];
+  }
+
+  while (sp < totalJobs) {
+    int32_t nid = order[sp++];
+    order[out++] = nid;
+    RTNode *node = &lg->nodes[nid];
+    for (int i = 0; i < node->succCount; i++) {
+      int succ = node->succ[i];
+      if (succ < 0 || succ >= lg->node_count || lg->sched.is_orphaned[succ])
+        continue;
+      int left = atomic_load_explicit(&lg->sched.pending[succ],
+                                      memory_order_relaxed) - 1;
+      atomic_store_explicit(&lg->sched.pending[succ], left,
+                            memory_order_relaxed);
+      if (left == 0) {
+        if (sp <= out)
+          return; // more ready nodes than scheduled jobs: do not trust it
+        order[--sp] = succ;
+      }
+    }
+  }
+
+  if (out == totalJobs)
+    lg->sched.order_count = out;
+}
+#endif
+
 static void rebuild_scheduling_cache(LiveGraph *lg) {
   int totalJobs = 0;
   int sourceCount = 0;
@@ -2487,6 +2593,9 @@ static void rebuild_scheduling_cache(LiveGraph *lg) {
   lg->sched.has_cycle = (totalJobs > 0 && lg->sched.source_count == 0);
 
   lg->sched.cached_total_jobs = totalJobs;
+#if !AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
+  build_serial_order(lg, totalJobs);
+#endif
   lg->sched.dirty = false;
 }
 
@@ -2527,18 +2636,11 @@ static void init_pending_and_seed(LiveGraph *lg, int nframes) {
   // Reset pending counts to indegree for all active nodes
   // This is O(n) but uses relaxed stores which are fast
   // Workers will use atomic decrements on these values
-  for (int i = 0; i < lg->node_count; i++) {
-    bool deleted = (lg->nodes[i].vtable.process == NULL &&
-                    lg->nodes[i].nInputs == 0 && lg->nodes[i].nOutputs == 0);
-    if (deleted || lg->sched.is_orphaned[i]) {
-      atomic_store_explicit(&lg->sched.pending[i], -1, memory_order_relaxed);
-    } else {
-      atomic_store_explicit(&lg->sched.pending[i], lg->sched.indegree[i], memory_order_relaxed);
-    }
+  reset_pending_counts(lg);
 #if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
-    lg->sched.completed_this_block[i] = false;
+  memset(lg->sched.completed_this_block, 0,
+         (size_t)lg->node_count * sizeof(bool));
 #endif
-  }
 
   // Memory barrier to ensure all pending stores are visible before workers start
   atomic_thread_fence(memory_order_release);
@@ -2594,6 +2696,31 @@ static void process_live_block_internal(LiveGraph *lg, int nframes, bool update_
   lg->render_pass++; // silence declarations are per pass
   lg->render_nframes = nframes;
   graph_profile_begin(lg, nframes);
+
+#if !AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
+  // No worker will join this block (none running, or the graph is too small
+  // to be worth waking them): run the precomputed serial plan and skip the
+  // scheduler entirely.
+  if (lg->sched.dirty)
+    rebuild_scheduling_cache(lg);
+  if (lg->sched.order_count > 0 && choose_active_worker_count(lg) == 0) {
+    atomic_store_explicit(&g_engine.activeWorkerLimit, 0, memory_order_release);
+    const int32_t *order = lg->sched.order;
+    const int count = lg->sched.order_count;
+#ifdef __linux__
+    int callback_policy =
+        atomic_load_explicit(&g_engine.callbackPolicy, memory_order_relaxed);
+#endif
+    for (int i = 0; i < count; i++) {
+      bind_and_run_live(lg, order[i], nframes);
+#ifdef __linux__
+      checkpoint_rtkit_cpu_budget(callback_policy);
+#endif
+    }
+    goto finish;
+  }
+#endif
+
   // Initialize pending counts and seed ready queue
   init_pending_and_seed(lg, nframes);
 
@@ -2755,13 +2882,23 @@ static void process_live_block_internal(LiveGraph *lg, int nframes, bool update_
 
     close_work_session(lg);
   } else {
-    // Single-thread fallback
+    // Single-thread fallback. No worker is in this block, so the stall
+    // watchdog's active-job counter (two writes to a shared line per job in
+    // try_execute_ready_node) has no reader; skip it unless diagnostics need
+    // the claim it also performs.
     int32_t nid;
     while (rq_try_pop(lg->sched.readyQueue, &nid)) {
+#if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
       (void)try_execute_ready_node(lg, nid, nframes);
+#else
+      execute_and_fanout(lg, nid, nframes);
+#endif
     }
   }
 
+#if !AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
+finish:
+#endif
   graph_profile_end(lg);
   drain_retire_list(lg);
 

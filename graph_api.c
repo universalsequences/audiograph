@@ -136,6 +136,8 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   lg->sched.source_capacity = 256;  // Start with reasonable capacity
   lg->sched.source_nodes = calloc(lg->sched.source_capacity, sizeof(int32_t));
   lg->sched.source_count = 0;
+  lg->sched.order = calloc((size_t)lg->node_capacity, sizeof(int32_t));
+  lg->sched.order_count = -1;
   lg->sched.cached_total_jobs = 0;
   lg->sched.has_cycle = false;
   lg->sched.dirty = true;  // Force initial rebuild
@@ -287,6 +289,7 @@ void destroy_live_graph(LiveGraph *lg) {
   // Free scheduling cache
   if (lg->sched.source_nodes)
     free(lg->sched.source_nodes);
+  free(lg->sched.order);
 
   // Free the graph itself
   free(lg);

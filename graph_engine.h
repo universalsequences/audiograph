@@ -140,6 +140,11 @@ typedef struct LiveGraph {
     int32_t *source_nodes; // cached source node IDs (indegree=0, has outputs)
     int source_count;
     int source_capacity;
+    // Serial plan: every scheduled node in a valid execution order, rebuilt
+    // with the cache. order_count <= 0 means "no plan, use the ready queue".
+    // Sized node_capacity and grown with the other per-node arrays.
+    int32_t *order;
+    int order_count;
     int cached_total_jobs;
     bool has_cycle;
     bool dirty;            // true when topology changed, triggers cache rebuild

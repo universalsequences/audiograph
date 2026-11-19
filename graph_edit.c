@@ -1329,9 +1329,11 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
   void **new_state_snapshots = calloc(new_capacity, sizeof(void *));
   size_t *new_state_sizes = calloc(new_capacity, sizeof(size_t));
   int32_t *new_source_nodes = malloc(new_source_capacity * sizeof(int32_t));
+  int32_t *new_order = malloc((size_t)new_capacity * sizeof(int32_t));
 
   if (!new_nodes || !new_pending || !new_completed || !new_indegree || !new_orphaned ||
-      !new_state_snapshots || !new_state_sizes || !new_source_nodes) {
+      !new_state_snapshots || !new_state_sizes || !new_source_nodes ||
+      !new_order) {
     // Clean up any successful allocations
     if (new_nodes)
       free(new_nodes);
@@ -1349,6 +1351,7 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
       free(new_state_sizes);
     if (new_source_nodes)
       free(new_source_nodes);
+    free(new_order);
     return false;
   }
 
@@ -1472,6 +1475,11 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
   free(lg->sched.source_nodes);
   lg->sched.source_nodes = new_source_nodes;
   lg->sched.source_capacity = new_source_capacity;
+  // The serial plan is rebuilt from scratch (dirty is set below), so the old
+  // contents are not carried over.
+  free(lg->sched.order);
+  lg->sched.order = new_order;
+  lg->sched.order_count = -1;
   lg->node_capacity = new_capacity;
   lg->sched.dirty = true;
 
@@ -1492,6 +1500,7 @@ fail:
   free(new_state_snapshots);
   free(new_state_sizes);
   free(new_source_nodes);
+  free(new_order);
   return false;
 }
 
