@@ -9,6 +9,19 @@
 #include <stdlib.h>
 #include <stdatomic.h>
 
+// Size of the unit a core takes exclusive ownership of to write. Fields that
+// different threads write must be this far apart or every write evicts the
+// neighbours from the other cores. Apple Silicon uses 128-byte lines
+// (sysctl hw.cachelinesize); padding to 64 there leaves the producer cursor
+// on the same line as the buffer pointer and puts two cells on each line.
+#ifndef AG_CACHE_LINE
+#if defined(__APPLE__) && defined(__aarch64__)
+#define AG_CACHE_LINE 128
+#else
+#define AG_CACHE_LINE 64
+#endif
+#endif
+
 // Forward-declare alloc_aligned (defined in graph_types.h or provide inline)
 static inline void *mpmc_alloc_aligned(size_t alignment, size_t size) {
   void *p = NULL;
@@ -20,30 +33,30 @@ static inline void *mpmc_alloc_aligned(size_t alignment, size_t size) {
 typedef struct {
   _Atomic uint64_t sequence; // Per-cell sequence number for ABA protection
   int32_t value;             // Node ID to process
-  char padding[64 - sizeof(_Atomic uint64_t) -
+  char padding[AG_CACHE_LINE - sizeof(_Atomic uint64_t) -
                sizeof(int32_t)]; // Cache line align
-} __attribute__((aligned(64))) MPMCCell;
+} __attribute__((aligned(AG_CACHE_LINE))) MPMCCell;
 
 typedef struct {
   MPMCCell *buffer; // Ring buffer of cells
   uint32_t mask;    // Capacity - 1 (must be power of 2)
-  char padding1[64 - sizeof(MPMCCell *) - sizeof(uint32_t)];
+  char padding1[AG_CACHE_LINE - sizeof(MPMCCell *) - sizeof(uint32_t)];
   _Atomic uint64_t head; // Producer cursor
-  char padding2[64 - sizeof(_Atomic uint64_t)];
+  char padding2[AG_CACHE_LINE - sizeof(_Atomic uint64_t)];
   _Atomic uint64_t tail; // Consumer cursor
-  char padding3[64 - sizeof(_Atomic uint64_t)];
-} __attribute__((aligned(64))) MPMCQueue;
+  char padding3[AG_CACHE_LINE - sizeof(_Atomic uint64_t)];
+} __attribute__((aligned(AG_CACHE_LINE))) MPMCQueue;
 
 static inline MPMCQueue *mpmc_create(uint32_t capacity) {
   // Capacity must be power of 2
   if ((capacity & (capacity - 1)) != 0)
     return NULL;
 
-  MPMCQueue *q = (MPMCQueue *)mpmc_alloc_aligned(64, sizeof(MPMCQueue));
+  MPMCQueue *q = (MPMCQueue *)mpmc_alloc_aligned(AG_CACHE_LINE, sizeof(MPMCQueue));
   if (!q)
     return NULL;
 
-  q->buffer = (MPMCCell *)mpmc_alloc_aligned(64, capacity * sizeof(MPMCCell));
+  q->buffer = (MPMCCell *)mpmc_alloc_aligned(AG_CACHE_LINE, capacity * sizeof(MPMCCell));
   if (!q->buffer) {
     free(q);
     return NULL;

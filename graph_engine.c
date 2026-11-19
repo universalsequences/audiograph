@@ -40,12 +40,14 @@
 static pthread_mutex_t workgroup_control_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void bind_and_run_live(LiveGraph *lg, int nid, int nframes);
-static void init_pending_and_seed(LiveGraph *lg, int nframes);
+static void init_pending_and_seed(LiveGraph *lg);
 void process_live_block(LiveGraph *lg, int nframes);
 static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes);
 static inline bool try_execute_ready_node(LiveGraph *lg, int32_t nid,
                                           int nframes);
 static inline void schedule_ready_node(LiveGraph *lg, int32_t nid, int nframes);
+static inline bool next_source_node(LiveGraph *lg, int *next, int *end,
+                                    int32_t *nid);
 static void wait_for_block_start_or_shutdown(int worker_index, int workgroup_version);
 static void rebuild_invalid_io_caches(LiveGraph *lg, int nframes);
 static int choose_active_worker_count(LiveGraph *lg);
@@ -81,6 +83,16 @@ _Atomic uint64_t g_block_event_push_fail_count = 0;
 
 #ifndef AUDIOGRAPH_CALLBACK_EMPTY_SPINS
 #define AUDIOGRAPH_CALLBACK_EMPTY_SPINS 64
+#endif
+
+// Polls before the callback's FIRST park after it last found work. The usual
+// reason it runs dry is that the block is nearly over and the workers are
+// finishing their last nodes, tens of microseconds away; a park there costs a
+// kernel wake (~10 us) that lands directly on the block time. Later parks in
+// the same dry spell use the short count above, so a long wait behind heavy
+// nodes still sleeps instead of spinning. ~4 ns per poll.
+#ifndef AUDIOGRAPH_CALLBACK_FIRST_EMPTY_SPINS
+#define AUDIOGRAPH_CALLBACK_FIRST_EMPTY_SPINS 4096
 #endif
 
 #ifndef AUDIOGRAPH_CALLBACK_WAIT_TIMEOUT_US
@@ -140,7 +152,14 @@ void audiograph_configure_experiment(int worker_spins, int worker_wait_us,
 #define AUDIOGRAPH_STALL_RECOVERY_TIMEOUT_NS 50000000ull
 #endif
 
-static _Atomic int g_active_job_count = 0;
+// Two writes per popped job from every thread: keep it off the cache lines of
+// the globals around it.
+static struct {
+  char pad_before[AG_CACHE_LINE];
+  _Atomic int count;
+  char pad_after[AG_CACHE_LINE];
+} g_active_jobs;
+#define g_active_job_count g_active_jobs.count
 #ifdef __linux__
 static EngineRtKitWorkerHook g_rtkit_worker_hook = NULL;
 static EngineRtKitCallbackHook g_rtkit_callback_hook = NULL;
@@ -830,14 +849,51 @@ static void release_work_session(void) {
   atomic_fetch_sub_explicit(&g_engine.sessionUsers, 1, memory_order_release);
 }
 
+// Ends the block's session without waiting for the workers to leave it. Every
+// job is done by now, so a worker still holding a reference only has its
+// epilogue left: it reads this graph's jobsInFlight, ready queue, source
+// count and source cursor, then releases. A worker asleep in the queue's timed wait needs a kernel wake to
+// get that far (tens of microseconds), which the block's deadline should not
+// pay for. The wait moves to engine_drain_work_session(), which must run
+// before anything that reuses or frees those two things.
 static void close_work_session(LiveGraph *lg) {
   atomic_fetch_or_explicit(&g_engine.sessionUsers, SESSION_CLOSED, memory_order_acq_rel);
   rq_finish(lg->sched.readyQueue);
-  // Job completion precedes worker epilogues and departure from timed waits.
+}
+
+// Wait for the last block's workers to release the session. Called at the
+// start of the next block and before the pool is stopped. Normally a no-op:
+// the workers left long before. Render thread only: it owns workSession.
+void engine_drain_work_session(void) {
+  if (!atomic_load_explicit(&g_engine.workSession, memory_order_acquire))
+    return;
   // Acquire the final reference release before any reset, edit, or reclamation.
   while (atomic_load_explicit(&g_engine.sessionUsers, memory_order_acquire) != SESSION_CLOSED)
     cpu_relax();
   atomic_store_explicit(&g_engine.workSession, NULL, memory_order_release);
+}
+
+// For destroy_live_graph, which may run on a control thread while the render
+// thread is busy with a different graph. Only waits while `lg` is still the
+// published session, and only clears the session if it still is: an
+// unconditional store here could erase a session the render thread opened in
+// the meantime. If the render thread has moved on, its own drain already
+// waited for lg's workers.
+void engine_drain_work_session_for(LiveGraph *lg) {
+  for (;;) {
+    LiveGraph *current =
+        atomic_load_explicit(&g_engine.workSession, memory_order_acquire);
+    if (current != lg || !lg)
+      return;
+    if (atomic_load_explicit(&g_engine.sessionUsers, memory_order_acquire) ==
+        SESSION_CLOSED) {
+      (void)atomic_compare_exchange_strong_explicit(
+          &g_engine.workSession, &current, NULL, memory_order_release,
+          memory_order_relaxed);
+      return;
+    }
+    cpu_relax();
+  }
 }
 
 static void wait_for_block_start_or_shutdown(int worker_index, int workgroup_version) {
@@ -1218,6 +1274,7 @@ static void *worker_main(void *arg) {
     }
     graph_profile_worker_join((int)worker_slot);
 
+    int src_next = 0, src_end = 0; // this worker's claim on the source list
     // The reference protects all graph accesses, including the queue wait and
     // the last job's bookkeeping. Inactive workers stay parked on sess_cv.
     for (;;) {
@@ -1229,8 +1286,10 @@ static void *worker_main(void *arg) {
       int32_t nid;
 
       // Modest spin to catch bursts without kernel call, then short timed wait.
-      bool got = false;
-      for (int s = 0; s < AUDIOGRAPH_WORKER_EMPTY_SPINS; s++) {
+      // (A longer spin before the first park was measured: no effect on block
+      // time at 1024 or 4096 polls.)
+      bool got = next_source_node(lg, &src_next, &src_end, &nid);
+      for (int s = 0; !got && s < AUDIOGRAPH_WORKER_EMPTY_SPINS; s++) {
         if ((got = rq_try_pop(lg->sched.readyQueue, &nid)))
           break;
         cpu_relax(); // brief pause
@@ -1479,8 +1538,9 @@ void engine_get_rt_status(EngineRtStatus *status) {
 }
 
 void engine_stop_workers(void) {
-  // The host must stop rendering before stopping the pool. Every completed
-  // render has already unregistered its queue waiters and worker references.
+  // The host must stop rendering before stopping the pool. Let the last
+  // render's workers unregister their queue waits and references.
+  engine_drain_work_session();
   assert(atomic_load_explicit(&g_engine.sessionUsers, memory_order_acquire) == SESSION_CLOSED);
   engine_clear_os_workgroup();
   graph_profile_stop_recorder();
@@ -1885,6 +1945,30 @@ static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes) {
       atomic_fetch_sub_explicit(&lg->sched.jobsInFlight, completed,
                                 memory_order_acq_rel) == completed)
     rq_finish(lg->sched.readyQueue);
+}
+
+// Next source node for this thread, from its current claim or a new one.
+// `next`/`end` are the caller's claim (start both at 0). Sources are all ready
+// when the block opens and none appear later, so they do not need the ready
+// queue: no cell to write, no pop, one atomic add per claim.
+static inline bool next_source_node(LiveGraph *lg, int *next, int *end,
+                                    int32_t *nid) {
+  if (*next >= *end) {
+    const int count = lg->sched.source_count;
+    // Cheap exit once they are gone: nobody writes the cursor any more, so
+    // this read stays in every core's cache.
+    if (atomic_load_explicit(&lg->sched.source_cursor, memory_order_relaxed) >= count)
+      return false;
+    const int chunk = lg->sched.source_chunk;
+    int begin = atomic_fetch_add_explicit(&lg->sched.source_cursor, chunk,
+                                          memory_order_relaxed);
+    if (begin >= count)
+      return false;
+    *next = begin;
+    *end = begin + chunk < count ? begin + chunk : count;
+  }
+  *nid = lg->sched.source_nodes[(*next)++];
+  return true;
 }
 
 static inline bool try_execute_ready_node(LiveGraph *lg, int32_t nid,
@@ -2476,14 +2560,36 @@ static void dump_ready_queue_state(LiveGraph *lg) {
 // Instead of O(n) scans every block, we cache source nodes and job counts.
 // The cache is rebuilt only when topology changes (scheduling_dirty flag).
 
-// Reset every node's pending count for a new pass over the graph: its
-// indegree, or -1 for a slot that is deleted or orphaned and must never run.
+// A node's pending count at the start of a pass over the graph: its indegree,
+// or -1 for a slot that is deleted or orphaned and must never run.
+static inline int initial_pending(const LiveGraph *lg, int i) {
+  return (node_is_deleted(&lg->nodes[i]) || lg->sched.is_orphaned[i])
+             ? -1
+             : lg->sched.indegree[i];
+}
+
+// Runs at the start of every block, on the audio thread, before any worker is
+// woken, so it is time taken straight off the block. Reading each node record
+// to decide cost 6-16 us on the benchmark graphs; the answers only change
+// with the topology, so rebuild_scheduling_cache keeps them in pending_init.
 static inline void reset_pending_counts(LiveGraph *lg) {
-  for (int i = 0; i < lg->node_count; i++) {
-    bool deleted = (lg->nodes[i].vtable.process == NULL &&
-                    lg->nodes[i].nInputs == 0 && lg->nodes[i].nOutputs == 0);
-    int pending = (deleted || lg->sched.is_orphaned[i]) ? -1 : lg->sched.indegree[i];
-    atomic_store_explicit(&lg->sched.pending[i], pending, memory_order_relaxed);
+  const int32_t *init = lg->sched.pending_init;
+  // A node added since the last rebuild without marking the cache dirty has
+  // no entry yet. It starts orphaned, so it must not run: -1, as before.
+  int known = lg->sched.pending_init_count;
+  if (known > lg->node_count)
+    known = lg->node_count;
+  for (int i = known; i < lg->node_count; i++)
+    atomic_store_explicit(&lg->sched.pending[i], -1, memory_order_relaxed);
+  for (int i = 0; i < known; i++) {
+#if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
+    if (init[i] != initial_pending(lg, i))
+      fprintf(stderr,
+              "[audiograph] WARN: stale pending_init for node %d (%d, now %d): "
+              "a topology edit did not mark the scheduling cache dirty\n",
+              i, init[i], initial_pending(lg, i));
+#endif
+    atomic_store_explicit(&lg->sched.pending[i], init[i], memory_order_relaxed);
   }
 }
 
@@ -2598,6 +2704,9 @@ static void rebuild_scheduling_cache(LiveGraph *lg) {
   lg->sched.has_cycle = (totalJobs > 0 && lg->sched.source_count == 0);
 
   lg->sched.cached_total_jobs = totalJobs;
+  for (int i = 0; i < lg->node_count; i++)
+    lg->sched.pending_init[i] = initial_pending(lg, i);
+  lg->sched.pending_init_count = lg->node_count;
 #if !AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
   build_serial_order(lg, totalJobs);
 #endif
@@ -2628,7 +2737,7 @@ static int choose_active_worker_count(LiveGraph *lg) {
   return active;
 }
 
-static void init_pending_and_seed(LiveGraph *lg, int nframes) {
+static void init_pending_and_seed(LiveGraph *lg) {
   // Rebuild cache if topology changed
   if (lg->sched.dirty) {
     rebuild_scheduling_cache(lg);
@@ -2662,12 +2771,13 @@ static void init_pending_and_seed(LiveGraph *lg, int nframes) {
   atomic_store_explicit(&lg->sched.jobsInFlight, lg->sched.cached_total_jobs,
                         memory_order_release);
 
-  // Seed ready queue from cached source list - O(sources) instead of O(n).
-  // Use the helping enqueue path so a graph with more sources than queue slots
-  // cannot deadlock the audio callback during block setup.
-  for (int i = 0; i < lg->sched.source_count; i++) {
-    schedule_ready_node(lg, lg->sched.source_nodes[i], nframes);
-  }
+  // Sources are not queued: threads claim them from source_nodes directly
+  // (next_source_node). Queueing them cost the callback 2000 pushes before
+  // any worker could start on the widest benchmark graph, and the workers as
+  // many pops; claiming from the list made that graph 25% faster at 8 threads
+  // and cut its CPU by a third. The claim size is set once the worker count
+  // is known, before any thread can claim.
+  atomic_store_explicit(&lg->sched.source_cursor, 0, memory_order_relaxed);
 }
 
 bool detect_cycle(LiveGraph *lg) {
@@ -2698,6 +2808,7 @@ static void drain_retire_list(LiveGraph *lg) {
 static void update_watched_node_states(LiveGraph *lg);
 
 static void process_live_block_internal(LiveGraph *lg, int nframes, bool update_watch) {
+  engine_drain_work_session();
   lg->render_pass++; // silence declarations are per pass
   lg->render_nframes = nframes;
   graph_profile_begin(lg, nframes);
@@ -2727,7 +2838,7 @@ static void process_live_block_internal(LiveGraph *lg, int nframes, bool update_
 #endif
 
   // Initialize pending counts and seed ready queue
-  init_pending_and_seed(lg, nframes);
+  init_pending_and_seed(lg);
 
   // Check for cycles that would cause silent deadlocks
   if (detect_cycle(lg)) {
@@ -2759,6 +2870,15 @@ static void process_live_block_internal(LiveGraph *lg, int nframes, bool update_
   int active_workers = choose_active_worker_count(lg);
   atomic_store_explicit(&g_engine.activeWorkerLimit, active_workers,
                         memory_order_release);
+  {
+    // Claim size. A claimed source cannot be taken by anyone else, so with
+    // few sources each heading a long chain (64 tracks, say) a thread holding
+    // two leaves an idle thread nothing to do: claims of 2 measured 3% slower
+    // at 4 threads. Only claim several when sources are plentiful, where the
+    // cost is threads meeting at the cursor instead.
+    int chunk = lg->sched.source_count / (32 * (active_workers + 1));
+    lg->sched.source_chunk = chunk < 1 ? 1 : chunk > 16 ? 16 : chunk;
+  }
 
   if (active_workers > 0) {
     // Publish session frames and graph
@@ -2777,18 +2897,24 @@ static void process_live_block_internal(LiveGraph *lg, int nframes, bool update_
     // Audio thread helps do some work
     int32_t nid;
     int empty_spins = 0;
+    int polls_since_park = 0;
+    int park_after = AUDIOGRAPH_CALLBACK_FIRST_EMPTY_SPINS;
     uint64_t stalled_empty_since_ns = 0;
 #if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
     bool stall_logged = false;
     struct timespec wait_started;
     clock_gettime(CLOCK_MONOTONIC, &wait_started);
 #endif
+    int src_next = 0, src_end = 0; // the callback's claim on the source list
     while (atomic_load_explicit(&lg->sched.jobsInFlight, memory_order_acquire) > 0) {
-      if (rq_try_pop(lg->sched.readyQueue, &nid)) {
+      if (next_source_node(lg, &src_next, &src_end, &nid) ||
+          rq_try_pop(lg->sched.readyQueue, &nid)) {
         if (!try_execute_ready_node(lg, nid, nframes)) {
           continue;
         }
         empty_spins = 0; // Reset on successful work
+        polls_since_park = 0;
+        park_after = AUDIOGRAPH_CALLBACK_FIRST_EMPTY_SPINS;
         stalled_empty_since_ns = 0;
 #ifdef __linux__
         int callback_policy = atomic_load_explicit(
@@ -2804,8 +2930,10 @@ static void process_live_block_internal(LiveGraph *lg, int nframes, bool update_
         // Help with bursts first, then park briefly. Publication or completion
         // wakes this wait; it does not depend only on the timeout for progress.
         if (AUDIOGRAPH_CALLBACK_WAIT_TIMEOUT_US > 0 &&
-            (empty_spins + 1) % AUDIOGRAPH_CALLBACK_EMPTY_SPINS == 0) {
+            ++polls_since_park >= park_after) {
           rq_wait_for_work(lg->sched.readyQueue, AUDIOGRAPH_CALLBACK_WAIT_TIMEOUT_US);
+          polls_since_park = 0;
+          park_after = AUDIOGRAPH_CALLBACK_EMPTY_SPINS;
         }
         if (++empty_spins > 4096) {
           empty_spins = 0;
@@ -2892,7 +3020,9 @@ static void process_live_block_internal(LiveGraph *lg, int nframes, bool update_
     // try_execute_ready_node) has no reader; skip it unless diagnostics need
     // the claim it also performs.
     int32_t nid;
-    while (rq_try_pop(lg->sched.readyQueue, &nid)) {
+    int src_next = 0, src_end = 0;
+    while (next_source_node(lg, &src_next, &src_end, &nid) ||
+           rq_try_pop(lg->sched.readyQueue, &nid)) {
 #if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
       (void)try_execute_ready_node(lg, nid, nframes);
 #else
@@ -2923,6 +3053,8 @@ int find_live_output(LiveGraph *lg) {
 bool prepare_graph_for_render(LiveGraph *lg) {
   if (!lg || atomic_load_explicit(&lg->edit_batch_depth, memory_order_acquire) != 0)
     return false;
+  // Before edits, like process_next_block.
+  engine_drain_work_session();
   bool ok = apply_graph_edits(lg->graphEditQueue, lg);
   if (lg->sched.dirty)
     rebuild_invalid_io_caches(lg, lg->block_size);
@@ -2939,6 +3071,9 @@ void process_next_block(LiveGraph *lg, float *output_buffer, int nframes) {
     }
     return;
   }
+
+  // Before edits: they may free what the last block's workers still hold.
+  engine_drain_work_session();
 
   int before_node_count = lg->node_count;
   int before_cached_jobs = lg->sched.cached_total_jobs;

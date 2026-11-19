@@ -200,10 +200,6 @@ static inline void indegree_dec_on_last_pred(LiveGraph *lg, int src, int dst) {
   }
 }
 
-static bool node_is_deleted(const RTNode *node) {
-  return node && node->vtable.process == NULL && node->nInputs == 0 &&
-         node->nOutputs == 0;
-}
 
 static void clear_successors(RTNode *node) {
   if (!node) {
@@ -1330,10 +1326,11 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
   size_t *new_state_sizes = calloc(new_capacity, sizeof(size_t));
   int32_t *new_source_nodes = malloc(new_source_capacity * sizeof(int32_t));
   int32_t *new_order = malloc((size_t)new_capacity * sizeof(int32_t));
+  int32_t *new_pending_init = malloc((size_t)new_capacity * sizeof(int32_t));
 
   if (!new_nodes || !new_pending || !new_completed || !new_indegree || !new_orphaned ||
       !new_state_snapshots || !new_state_sizes || !new_source_nodes ||
-      !new_order) {
+      !new_order || !new_pending_init) {
     // Clean up any successful allocations
     if (new_nodes)
       free(new_nodes);
@@ -1352,6 +1349,7 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
     if (new_source_nodes)
       free(new_source_nodes);
     free(new_order);
+    free(new_pending_init);
     return false;
   }
 
@@ -1480,6 +1478,9 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
   free(lg->sched.order);
   lg->sched.order = new_order;
   lg->sched.order_count = -1;
+  free(lg->sched.pending_init);
+  lg->sched.pending_init = new_pending_init;
+  lg->sched.pending_init_count = 0; // rebuilt before use: dirty is set below
   lg->node_capacity = new_capacity;
   lg->sched.dirty = true;
 
@@ -1501,6 +1502,7 @@ fail:
   free(new_state_sizes);
   free(new_source_nodes);
   free(new_order);
+  free(new_pending_init);
   return false;
 }
 
