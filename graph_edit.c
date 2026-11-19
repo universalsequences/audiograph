@@ -3,8 +3,6 @@
 #include "hot_swap.h"
 #include <assert.h>
 
-#define EDGE_BUFFER_PAD_FLOATS 64
-
 static bool using_inline_in_cache(const RTNode *node) {
   return node->cached_inPtrs == (float **)node->cached_inInline;
 }
@@ -67,6 +65,10 @@ int alloc_edge(LiveGraph *lg) {
   }
   memset(lg->edges[i].buf, 0,
          sizeof(float) * (lg->block_size + EDGE_BUFFER_PAD_FLOATS));
+  lg->edges[i].silent_pass = 0; // freshly zeroed; never "silent this pass"
+  lg->edges[i].silent_frames = 0;
+  lg->edges[i].shape_pass = 0;
+  lg->edges[i].shape = 0;
   return i;
 }
 
@@ -198,10 +200,67 @@ static inline void indegree_dec_on_last_pred(LiveGraph *lg, int src, int dst) {
   }
 }
 
+static bool node_is_deleted(const RTNode *node) {
+  return node && node->vtable.process == NULL && node->nInputs == 0 &&
+         node->nOutputs == 0;
+}
+
+static void clear_successors(RTNode *node) {
+  if (!node) {
+    return;
+  }
+  free(node->succ);
+  node->succ = NULL;
+  node->succCount = 0;
+}
+
+static void rebuild_dependency_links_from_edges(LiveGraph *lg) {
+  if (!lg || !lg->sched.indegree) {
+    return;
+  }
+
+  for (int nid = 0; nid < lg->node_count; nid++) {
+    lg->sched.indegree[nid] = 0;
+    clear_successors(&lg->nodes[nid]);
+  }
+
+  for (int dst = 0; dst < lg->node_count; dst++) {
+    RTNode *dst_node = &lg->nodes[dst];
+    if (node_is_deleted(dst_node) || !dst_node->inEdgeId) {
+      continue;
+    }
+
+    for (int port = 0; port < dst_node->nInputs; port++) {
+      int edge_id = dst_node->inEdgeId[port];
+      if (edge_id < 0 || edge_id >= lg->edge_capacity) {
+        continue;
+      }
+      LiveEdge *edge = &lg->edges[edge_id];
+      if (!edge->in_use) {
+        continue;
+      }
+
+      int src = edge->src_node;
+      if (src < 0 || src >= lg->node_count || src == dst) {
+        continue;
+      }
+      if (node_is_deleted(&lg->nodes[src])) {
+        continue;
+      }
+
+      // Scheduling tracks unique predecessor nodes, not individual input
+      // ports. A stereo node with L/R from the same source should wait for
+      // that source once, because one execution writes all of its outputs.
+      if (!has_successor(&lg->nodes[src], dst)) {
+        add_successor_port(&lg->nodes[src], dst);
+        lg->sched.indegree[dst]++;
+      }
+    }
+  }
+}
+
 // Forward declarations
 bool apply_delete_node_internal(LiveGraph *lg, int node_id);
-static bool apply_add_watchlist(LiveGraph *lg, int node_id);
-static bool apply_remove_watchlist(LiveGraph *lg, int node_id);
 static bool grow_node_capacity(LiveGraph *lg, int required_capacity);
 
 // Internal version that skips update_orphaned_status for batched operations
@@ -236,14 +295,6 @@ static bool apply_add_watchlist_internal(LiveGraph *lg, int node_id) {
   return true;
 }
 
-static bool apply_add_watchlist(LiveGraph *lg, int node_id) {
-  bool result = apply_add_watchlist_internal(lg, node_id);
-  if (result) {
-    update_orphaned_status(lg);
-  }
-  return result;
-}
-
 // Internal version that skips update_orphaned_status for batched operations
 static bool apply_remove_watchlist_internal(LiveGraph *lg, int node_id) {
   if (!lg || node_id < 0) {
@@ -276,14 +327,6 @@ static bool apply_remove_watchlist_internal(LiveGraph *lg, int node_id) {
   return false;
 }
 
-static bool apply_remove_watchlist(LiveGraph *lg, int node_id) {
-  bool result = apply_remove_watchlist_internal(lg, node_id);
-  if (result) {
-    update_orphaned_status(lg);
-  }
-  return result;
-}
-
 // Recursive function to mark nodes reachable from DAC (port-based only)
 static void mark_reachable_from_dac(LiveGraph *lg, int node_id, bool *visited) {
   if (node_id < 0 || node_id >= lg->node_count || visited[node_id])
@@ -310,9 +353,13 @@ void update_orphaned_status(LiveGraph *lg) {
   // Mark scheduling cache as dirty - topology has changed
   lg->sched.dirty = true;
 
-  // Invalidate IO caches for all nodes - topology has changed
+  // Invalidate IO caches for all nodes - topology has changed. Reserve each
+  // node's discard buffers for its unconnected outputs now, in the edit
+  // phase, so the rebuild that follows only assigns pointers. On allocation
+  // failure the rebuild falls back to the shared scratch for those ports.
   for (int i = 0; i < lg->node_count; i++) {
     lg->nodes[i].io_cache_valid = false;
+    (void)node_reserve_unconnected_outputs(lg, &lg->nodes[i]);
   }
 
   // First, mark all nodes as orphaned (except watched nodes)
@@ -394,10 +441,12 @@ void update_orphaned_status(LiveGraph *lg) {
   mark_reachable_from_dac(lg, lg->dac_node_id, visited);
   free(visited);
 
-  // NOTE: Indegree is maintained incrementally by connect/disconnect operations
-  // via indegree_inc_on_first_pred() and indegree_dec_on_last_pred().
-  // The O(n²) recomputation that was here was removed for performance -
-  // with 7000 nodes it caused ~50ms audio dropouts on topology changes.
+  // Rebuild scheduler dependencies from the authoritative edge graph after
+  // each topology update. Hidden auto-SUM nodes are especially sensitive to
+  // stale predecessor/successor links: if a SUM is marked ready before all of
+  // its real producers complete, it can publish a zero output even though its
+  // input edge buffers contain signal later in the block.
+  rebuild_dependency_links_from_edges(lg);
 }
 
 // ===================== Failed ID Tracking =====================
@@ -507,10 +556,63 @@ bool apply_hotswap_buffer(LiveGraph *lg, int buffer_id, int new_size,
   return true;
 }
 
+// Bulk-write a float block into a node's state memory. Bounds-checked against
+// the node's allocated state size. Applied on the audio thread at a safe point.
+bool apply_write_node_state(LiveGraph *lg, int node_id, size_t dest_offset,
+                            const float *source_data, size_t count) {
+  if (node_id < 0 || node_id >= lg->node_capacity || !source_data) {
+    return false;
+  }
+  RTNode *node = &lg->nodes[node_id];
+  if (!node->state || node->state_size == 0) {
+    return false;
+  }
+  size_t cap_floats = node->state_size / sizeof(float);
+  if (dest_offset > cap_floats || count > cap_floats - dest_offset) {
+    return false; // out of bounds
+  }
+  // Count only writes that change the state (see apply_params): re-sending
+  // an identical table must not wake a tail-sleeping node.
+  float *dest = (float *)node->state + dest_offset;
+  if (memcmp(dest, source_data, count * sizeof(float)) != 0) {
+    memcpy(dest, source_data, count * sizeof(float));
+    node->state_writes++;
+  }
+  return true;
+}
+
 // to be called from block-boundary (i.e. before each block is executed)
+// A queued disconnect succeeds when its requested link is already absent.
+// Keep that distinct from malformed endpoints or a failed graph mutation.
+typedef enum {
+  DISCONNECT_ERROR = -1,
+  DISCONNECT_UNCHANGED = 0,
+  DISCONNECT_CHANGED = 1,
+} DisconnectResult;
+
+static DisconnectResult apply_disconnect_result(LiveGraph *lg, int src_node,
+                                                int src_port, int dst_node,
+                                                int dst_port);
+
+// A node that no longer exists is not a failure: the UI side notices the
+// stalled block count and re-attaches or detaches on its own schedule.
+static bool apply_set_node_meter(LiveGraph *lg, int node_id, int slot,
+                                 int clear_slot) {
+  if (!lg || node_id < 0 || node_id >= lg->node_count)
+    return true;
+  RTNode *node = &lg->nodes[node_id];
+  if (slot >= 0 && slot < AP_NODE_METER_CAPACITY) {
+    node->meter_slot = slot + 1;
+  } else if (node->meter_slot == clear_slot + 1) {
+    node->meter_slot = 0;
+  }
+  return true;
+}
+
 bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
   GraphEditCmd cmd;
   GraphEditCmd next_cmd;
+  uint64_t last_applied_batch_serial = 0;
 
   bool all_ok = true;
   bool needs_orphan_update = false;
@@ -519,6 +621,7 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
 
   if (reserved_node_id >= lg->node_capacity &&
       !grow_node_capacity(lg, reserved_node_id)) {
+    atomic_fetch_add_explicit(&lg->graph_edit_delivery_failures, 1, memory_order_relaxed);
     return false;
   }
 
@@ -534,6 +637,9 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
     }
     if (!geq_pop(r, &cmd)) {
       break;
+    }
+    if (cmd.batch_serial > last_applied_batch_serial) {
+      last_applied_batch_serial = cmd.batch_serial;
     }
     bool ok = true;
     bool topology_changed = false;
@@ -556,6 +662,9 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
       if (cmd.u.add_node.initial_state) {
         free(cmd.u.add_node.initial_state);
       }
+      if (cmd.u.add_node.name) {
+        free(cmd.u.add_node.name);
+      }
       break;
     }
     case GE_REMOVE_NODE:
@@ -570,10 +679,11 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
       break;
     }
     case GE_DISCONNECT: {
-      ok = apply_disconnect_internal(
+      DisconnectResult result = apply_disconnect_result(
           lg, cmd.u.disconnect.src_id, cmd.u.disconnect.src_port,
           cmd.u.disconnect.dst_id, cmd.u.disconnect.dst_port);
-      topology_changed = ok;
+      ok = result != DISCONNECT_ERROR;
+      topology_changed = result == DISCONNECT_CHANGED;
       break;
     }
     case GE_HOT_SWAP_NODE:
@@ -612,12 +722,28 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
         free(cmd.u.hotswap_buffer.source_data);
       }
       break;
+    case GE_WRITE_NODE_STATE:
+      ok = apply_write_node_state(lg, cmd.u.write_node_state.node_id,
+                                  cmd.u.write_node_state.dest_offset,
+                                  cmd.u.write_node_state.source_data,
+                                  cmd.u.write_node_state.source_count);
+      // Free the copied source data after apply
+      if (cmd.u.write_node_state.source_data) {
+        free(cmd.u.write_node_state.source_data);
+      }
+      break;
+    case GE_SET_NODE_METER:
+      ok = apply_set_node_meter(lg, cmd.u.set_node_meter.node_id,
+                                cmd.u.set_node_meter.slot,
+                                cmd.u.set_node_meter.clear_slot);
+      break;
     default: {
       ok = false; // unknown op
       break;
     }
     }
     if (!ok) {
+      atomic_fetch_add_explicit(&lg->graph_edit_delivery_failures, 1, memory_order_relaxed);
       all_ok = false;
     }
     if (topology_changed) {
@@ -630,6 +756,11 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
     update_orphaned_status(lg);
   }
 
+  if (last_applied_batch_serial != 0) {
+    atomic_store_explicit(&lg->applied_edit_batch_serial,
+                          last_applied_batch_serial, memory_order_release);
+  }
+
   return all_ok;
 }
 
@@ -637,11 +768,11 @@ bool apply_graph_edits(GraphEditQueue *r, LiveGraph *lg) {
  * Internal disconnect - skips update_orphaned_status for batched operations.
  * Also uses apply_delete_node_internal to avoid nested orphan updates.
  */
-bool apply_disconnect_internal(LiveGraph *lg, int src_node, int src_port,
-                               int dst_node, int dst_port) {
+static DisconnectResult apply_disconnect_result(LiveGraph *lg, int src_node, int src_port,
+                                                int dst_node, int dst_port) {
   if (!lg || src_node < 0 || src_node >= lg->node_count || dst_node < 0 ||
       dst_node >= lg->node_count) {
-    return false;
+    return DISCONNECT_ERROR;
   }
 
   RTNode *S = &lg->nodes[src_node];
@@ -649,11 +780,11 @@ bool apply_disconnect_internal(LiveGraph *lg, int src_node, int src_port,
 
   if (src_port < 0 || src_port >= S->nOutputs || dst_port < 0 ||
       dst_port >= D->nInputs) {
-    return false;
+    return DISCONNECT_ERROR;
   }
 
   if (!D->inEdgeId || !S->outEdgeId)
-    return false;
+    return DISCONNECT_ERROR;
 
   // Check if dst_port has a SUM node
   int sum_id = D->fanin_sum_node_id ? D->fanin_sum_node_id[dst_port] : -1;
@@ -665,11 +796,11 @@ bool apply_disconnect_internal(LiveGraph *lg, int src_node, int src_port,
 
     // Nothing connected on that dst port → nothing to do
     if (eid_in < 0)
-      return false;
+      return DISCONNECT_UNCHANGED;
 
     // Ensure we're disconnecting the intended link
     if (eid_out < 0 || eid_in != eid_out) {
-      return false;
+      return DISCONNECT_UNCHANGED;
     }
 
     // Unwire the destination port
@@ -695,12 +826,12 @@ bool apply_disconnect_internal(LiveGraph *lg, int src_node, int src_port,
     // SUM node exists - find which SUM input corresponds to src_node:src_port
     if (!is_sum_node_valid(lg, sum_id)) {
       // SUM node was deleted - treat as successful disconnect
-      return true;
+      return DISCONNECT_CHANGED;
     }
     RTNode *SUM = &lg->nodes[sum_id];
     int src_eid = S->outEdgeId[src_port];
     if (src_eid < 0)
-      return false; // Source not connected
+      return DISCONNECT_UNCHANGED; // Source not connected
 
     // Find the SUM input that matches this source
     int sum_input_idx = -1;
@@ -712,7 +843,7 @@ bool apply_disconnect_internal(LiveGraph *lg, int src_node, int src_port,
     }
 
     if (sum_input_idx == -1)
-      return false; // Source not connected to this SUM
+      return DISCONNECT_UNCHANGED; // Source not connected to this SUM
 
     // Disconnect src_node from SUM
     SUM->inEdgeId[sum_input_idx] = -1;
@@ -737,7 +868,7 @@ bool apply_disconnect_internal(LiveGraph *lg, int src_node, int src_port,
     // Validate SUM node before realloc - it may have been deleted
     if (!SUM->inEdgeId) {
       // SUM node was deleted - skip realloc
-      return true;
+      return DISCONNECT_CHANGED;
     }
 
     if (SUM->nInputs > 0) {
@@ -780,7 +911,7 @@ bool apply_disconnect_internal(LiveGraph *lg, int src_node, int src_port,
       // Only one input left - collapse SUM back to direct connection.
       // Deletion of a source feeding a SUM can leave a cleared (-1) or retired
       // edge in the SUM input array until a later logical disconnect compacts
-      // the SUM.  Do not index lg->edges unless the remaining SUM input still
+      // the SUM. Do not index lg->edges unless the remaining SUM input still
       // names a live edge.
       int remaining_eid = SUM->inEdgeId[0];
       int sum_out = SUM->outEdgeId ? SUM->outEdgeId[0] : -1;
@@ -790,7 +921,7 @@ bool apply_disconnect_internal(LiveGraph *lg, int src_node, int src_port,
         D->fanin_sum_node_id[dst_port] = -1;
         indegree_dec_on_last_pred(lg, sum_id, dst_node);
         apply_delete_node_internal(lg, sum_id);
-        return true;
+        return DISCONNECT_CHANGED;
       }
 
       // Find the source of the remaining edge
@@ -802,13 +933,13 @@ bool apply_disconnect_internal(LiveGraph *lg, int src_node, int src_port,
         D->fanin_sum_node_id[dst_port] = -1;
         indegree_dec_on_last_pred(lg, sum_id, dst_node);
         apply_delete_node_internal(lg, sum_id);
-        return true;
+        return DISCONNECT_CHANGED;
       }
 
       // Create a new edge for the direct connection
       int direct_eid = alloc_edge(lg);
       if (direct_eid < 0)
-        return false;
+        return DISCONNECT_ERROR;
 
       // Set up the new direct edge
       lg->edges[direct_eid].src_node = remaining_src;
@@ -822,7 +953,7 @@ bool apply_disconnect_internal(LiveGraph *lg, int src_node, int src_port,
                                   sizeof(float));
         if (!lg->edges[direct_eid].buf) {
           retire_edge(lg, direct_eid);
-          return false;
+          return DISCONNECT_ERROR;
         }
         memset(lg->edges[direct_eid].buf, 0,
                sizeof(float) * (lg->block_size + EDGE_BUFFER_PAD_FLOATS));
@@ -833,7 +964,6 @@ bool apply_disconnect_internal(LiveGraph *lg, int src_node, int src_port,
       D->fanin_sum_node_id[dst_port] = -1;
 
       // Wire source to new edge and update successor relationships
-      bool added = false;
       if (remaining_src >= 0) {
         // Check if source already has an outgoing edge
         int existing_out_eid =
@@ -855,7 +985,6 @@ bool apply_disconnect_internal(LiveGraph *lg, int src_node, int src_port,
 
         if (!has_successor(&lg->nodes[remaining_src], dst_node)) {
           add_successor_port(&lg->nodes[remaining_src], dst_node);
-          added = true;
         } else {
           // remaining_src was ALREADY a predecessor of dst_node (via another port).
           // SUM contributed 1 to dst_node's indegree, but remaining_src taking over
@@ -933,7 +1062,7 @@ bool apply_disconnect_internal(LiveGraph *lg, int src_node, int src_port,
     // If SUM->nInputs > 1, SUM continues to exist with fewer inputs
   }
 
-  return true;
+  return DISCONNECT_CHANGED;
 }
 
 /**
@@ -942,6 +1071,12 @@ bool apply_disconnect_internal(LiveGraph *lg, int src_node, int src_port,
  * hidden SUM logic automatically. Returns true if the logical connection
  * existed and was removed.
  */
+bool apply_disconnect_internal(LiveGraph *lg, int src_node, int src_port,
+                               int dst_node, int dst_port) {
+  return apply_disconnect_result(lg, src_node, src_port, dst_node, dst_port) ==
+         DISCONNECT_CHANGED;
+}
+
 bool apply_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
                       int dst_port) {
   bool result =
@@ -958,6 +1093,9 @@ bool apply_delete_node_internal(LiveGraph *lg, int node_id) {
   }
 
   RTNode *node = &lg->nodes[node_id];
+  if (node_is_deleted(node)) {
+    return true;
+  }
 
   // Remove from watchlist before freeing node state. Otherwise deleted watched
   // nodes leave stale IDs/snapshots behind, which can accumulate in dynamic
@@ -986,8 +1124,11 @@ bool apply_delete_node_internal(LiveGraph *lg, int node_id) {
 
       // remove this node's consumption
       node->inEdgeId[dst_port] = -1;
+      // Keep successor removal coupled to the "last remaining predecessor"
+      // check. Removing it unconditionally can drop a valid fanout edge while
+      // leaving indegree intact when multiple source ports still feed the same
+      // destination node.
       indegree_dec_on_last_pred(lg, s, node_id);
-      remove_successor(&lg->nodes[s], node_id);
 
       LiveEdge *e = &lg->edges[eid];
       if (e->refcount > 0)
@@ -1003,7 +1144,7 @@ bool apply_delete_node_internal(LiveGraph *lg, int node_id) {
       }
 
       // If this inbound edge belonged to a hidden SUM node, compact/collapse is
-      // handled by logical disconnects.  During node deletion, at least scrub
+      // handled by logical disconnects. During node deletion, at least scrub
       // the SUM bookkeeping so a later disconnect cannot treat this destination
       // port as still SUM-backed after the SUM has been deleted.
       if (node->fanin_sum_node_id && node->fanin_sum_node_id[dst_port] >= 0) {
@@ -1099,6 +1240,10 @@ bool apply_delete_node_internal(LiveGraph *lg, int node_id) {
     free(node->state);
     node->state = NULL;
   }
+  if (node->debug_name) {
+    free(node->debug_name);
+    node->debug_name = NULL;
+  }
 
   // Free port arrays
   if (node->inEdgeId) {
@@ -1125,6 +1270,8 @@ bool apply_delete_node_internal(LiveGraph *lg, int node_id) {
     free(node->succ);
     node->succ = NULL;
   }
+
+  node_free_null_outputs(node);
 
   // Free cached IO pointers
   if (node->cached_inPtrs) {
@@ -1178,12 +1325,15 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
   int *new_indegree = malloc(new_capacity * sizeof(int));
   bool *new_orphaned = malloc(new_capacity * sizeof(bool));
   atomic_int *new_pending = calloc(new_capacity, sizeof(atomic_int));
+  bool *new_completed = calloc(new_capacity, sizeof(bool));
   void **new_state_snapshots = calloc(new_capacity, sizeof(void *));
   size_t *new_state_sizes = calloc(new_capacity, sizeof(size_t));
   int32_t *new_source_nodes = malloc(new_source_capacity * sizeof(int32_t));
+  int32_t *new_order = malloc((size_t)new_capacity * sizeof(int32_t));
 
-  if (!new_nodes || !new_pending || !new_indegree || !new_orphaned ||
-      !new_state_snapshots || !new_state_sizes || !new_source_nodes) {
+  if (!new_nodes || !new_pending || !new_completed || !new_indegree || !new_orphaned ||
+      !new_state_snapshots || !new_state_sizes || !new_source_nodes ||
+      !new_order) {
     // Clean up any successful allocations
     if (new_nodes)
       free(new_nodes);
@@ -1193,12 +1343,15 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
       free(new_orphaned);
     if (new_pending)
       free(new_pending);
+    if (new_completed)
+      free(new_completed);
     if (new_state_snapshots)
       free(new_state_snapshots);
     if (new_state_sizes)
       free(new_state_sizes);
     if (new_source_nodes)
       free(new_source_nodes);
+    free(new_order);
     return false;
   }
 
@@ -1305,6 +1458,7 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
   free(lg->sched.pending);
   free(lg->sched.indegree);
   free(lg->sched.is_orphaned);
+  free(lg->sched.completed_this_block);
   if (lg->watch.snapshots)
     free(lg->watch.snapshots);
   if (lg->watch.sizes)
@@ -1313,6 +1467,7 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
   // Update pointers and capacity
   lg->nodes = new_nodes;
   lg->sched.pending = new_pending;
+  lg->sched.completed_this_block = new_completed;
   lg->sched.indegree = new_indegree;
   lg->sched.is_orphaned = new_orphaned;
   lg->watch.snapshots = new_state_snapshots;
@@ -1320,6 +1475,11 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
   free(lg->sched.source_nodes);
   lg->sched.source_nodes = new_source_nodes;
   lg->sched.source_capacity = new_source_capacity;
+  // The serial plan is rebuilt from scratch (dirty is set below), so the old
+  // contents are not carried over.
+  free(lg->sched.order);
+  lg->sched.order = new_order;
+  lg->sched.order_count = -1;
   lg->node_capacity = new_capacity;
   lg->sched.dirty = true;
 
@@ -1336,9 +1496,11 @@ fail:
   free(new_indegree);
   free(new_orphaned);
   free(new_pending);
+  free(new_completed);
   free(new_state_snapshots);
   free(new_state_sizes);
   free(new_source_nodes);
+  free(new_order);
   return false;
 }
 
@@ -1358,7 +1520,8 @@ int apply_add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
   // Allocate aligned memory for node state if size > 0
   void *state = NULL;
   if (state_size > 0) {
-    state = alloc_state_f32(state_size, 64);
+    assert((state_size % sizeof(float)) == 0);
+    state = alloc_state_f32(state_size / sizeof(float), 64);
     if (!state) {
       return -1;
     }
@@ -1376,6 +1539,7 @@ int apply_add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
   memset(node, 0, sizeof(RTNode));
 
   node->logical_id = logical_id;
+  node->debug_name = name ? strdup(name) : NULL;
   node->vtable = vtable;
   node->state = state;
   node->state_size = state_size;
@@ -1540,7 +1704,6 @@ bool apply_connect_internal(LiveGraph *lg, int src_node, int src_port,
 
       // Find old source of existing_eid
       int old_src = lg->edges[existing_eid].src_node;
-      int old_src_port = lg->edges[existing_eid].src_port;
 
       // Disconnect old_src → D:dst_port (lightweight local form)
       D->inEdgeId[dst_port] = -1;

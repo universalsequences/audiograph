@@ -34,8 +34,21 @@ void engine_clear_os_workgroup(void);
 // Optional: enable minimal logging from RT workers (join success/failure)
 void engine_enable_rt_logging(int enable);
 
-// Enable/disable Mach time-constraint scheduling for workers (Apple only)
-void engine_enable_rt_time_constraint(int enable);
+// Enable/disable platform realtime scheduling for workers. Apple uses Mach
+// time constraints; Linux uses SCHED_FIFO. The priority applies to Linux only.
+void engine_enable_rt_scheduling(int enable);
+void engine_set_rt_priority(int priority);
+
+// EngineRtStatus and the ENGINE_SCHED_* sentinels come from graph_engine.h.
+// Snapshot the policies and priorities actually observed on the worker and
+// callback threads. Policies are native SCHED_* values on Linux.
+void engine_get_rt_status(EngineRtStatus *status);
+
+// Promote the calling thread (the audio callback thread) to realtime
+// scheduling: Linux SCHED_FIFO at rt priority + 1 so it outranks the workers
+// it drives. No-op on Apple, where CoreAudio already supplies an RT callback
+// thread, and when rt scheduling is disabled.
+void engine_promote_current_thread_rt(void);
 
 // ===================== Live Graph Management =====================
 
@@ -90,6 +103,14 @@ bool graph_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
 bool graph_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
                       int dst_port);
 
+// Number of producer commands that can be queued without overflowing.
+uint32_t graph_edit_queue_available(const LiveGraph *lg);
+// Serial of the producer-side batch currently being assembled, or zero when
+// no batch is open.
+uint64_t graph_edit_current_batch_serial(const LiveGraph *lg);
+// Highest committed batch fully consumed at an audio block boundary.
+uint64_t graph_edit_applied_batch_serial(const LiveGraph *lg);
+
 bool hot_swap_node(LiveGraph *lg, int node_id, NodeVTable vt, size_t state_size,
                    int nin, int nout, bool xfade,
                    void (*migrate)(void *, void *), const void *initial_state,
@@ -122,6 +143,7 @@ void process_next_block(LiveGraph *lg, float *output_buffer, int nframes);
 
 // Thread-safe parameter updates (non-blocking)
 bool params_push(ParamRing *r, ParamMsg m);
+bool push_block_event(LiveGraph *lg, GraphBlockEvent event);
 
 // ===================== Watch List API =====================
 
@@ -135,6 +157,8 @@ bool remove_node_from_watchlist(LiveGraph *lg, int node_id);
 // Returns NULL if node is not watched or doesn't exist
 // If state_size is not NULL, it will be set to the size of the returned state
 void *get_node_state(LiveGraph *lg, int node_id, size_t *state_size);
+bool get_node_state_into(LiveGraph *lg, int node_id, void *out,
+                         size_t out_capacity, size_t *state_size);
 
 // ===================== Buffer API =====================
 
@@ -162,16 +186,6 @@ int create_buffer(LiveGraph *lg, int size, int channel_count,
 // Note: source_data is copied - caller can free it immediately after this call
 int hot_swap_buffer(LiveGraph *lg, int buffer_id, const float *source_data,
                     int size, int channel_count);
-
-// ===================== Telemetry API =====================
-
-int create_telemetry(LiveGraph *lg, int slot_count);
-bool telemetry_read_u32(LiveGraph *lg, int telemetry_id, int slot, uint32_t *out);
-bool telemetry_read_i32(LiveGraph *lg, int telemetry_id, int slot, int32_t *out);
-bool telemetry_read_f32(LiveGraph *lg, int telemetry_id, int slot, float *out);
-void telemetry_store_u32(ProcessContext *ctx, int telemetry_id, int slot, uint32_t value);
-void telemetry_store_i32(ProcessContext *ctx, int telemetry_id, int slot, int32_t value);
-void telemetry_store_f32(ProcessContext *ctx, int telemetry_id, int slot, float value);
 
 // ===================== Node VTables for Custom Nodes =====================
 

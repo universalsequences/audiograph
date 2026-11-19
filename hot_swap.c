@@ -1,5 +1,6 @@
 #include "hot_swap.h"
 #include "graph_edit.h"
+#include <assert.h>
 
 // Hot-swap and port resizing operations for live graph nodes
 
@@ -106,10 +107,18 @@ bool apply_hot_swap(LiveGraph *lg, GEHotSwapNode *p) {
   // are wrong size. rebuild_node_io_cache() will reallocate on next process.
   n->io_cache_valid = false;
 
+  // A hot swap is not a topology change (no update_orphaned_status), so that
+  // rebuild runs lazily on whichever worker processes the node. Reserve the
+  // discard buffers for any added (unconnected) ports here, in the edit
+  // phase, so the worker only assigns pointers. On allocation failure the
+  // rebuild falls back to the shared scratch.
+  (void)node_reserve_unconnected_outputs(lg, n);
+
   // Allocate new state memory if needed
   void *new_state = NULL;
   if (p->state_size > 0) {
-    new_state = alloc_state_f32(p->state_size, 64);
+    assert((p->state_size % sizeof(float)) == 0);
+    new_state = alloc_state_f32(p->state_size / sizeof(float), 64);
     if (!new_state) {
       return false; // Memory allocation failed
     }
@@ -206,7 +215,8 @@ bool apply_replace_keep_edges_internal(LiveGraph *lg, GEReplaceKeepEdges *p) {
   // 4) Allocate and install new state/vtable
   void *new_state = NULL;
   if (p->state_size > 0) {
-    new_state = alloc_state_f32(p->state_size, 64);
+    assert((p->state_size % sizeof(float)) == 0);
+    new_state = alloc_state_f32(p->state_size / sizeof(float), 64);
     if (!new_state) {
       return false; // Memory allocation failed
     }

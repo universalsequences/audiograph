@@ -5,13 +5,14 @@ import Foundation
 // Simple kernel manager that compiles and loads our custom C code
 class CustomKernelManager {
     private var dylibHandle: UnsafeMutableRawPointer?
-    private var kernelFn: (@convention(c) (UnsafePointer<UnsafeMutablePointer<Float>?>?, UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32, UnsafeMutableRawPointer?) -> Void)?
+    private var kernelFn: (@convention(c) (UnsafePointer<UnsafeMutablePointer<Float>?>?, UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32, UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Void)?
     
     private let kernelSource = """
     #include <stdio.h>
     
     // Simple kernel that outputs constant 0.5 on all channels
-    void constant_kernel(float *const *in, float *const *out, int nframes, void *state) {
+    void constant_kernel(float *const *in, float *const *out, int nframes, void *state, void *buffers) {
+        (void)buffers;
         printf("=== CUSTOM KERNEL CALLED ===\\n");
         printf("in=%p, out=%p, nframes=%d, state=%p\\n", (void*)in, (void*)out, nframes, state);
         
@@ -87,12 +88,12 @@ class CustomKernelManager {
             throw NSError(domain: "DLError", code: 3, userInfo: [NSLocalizedDescriptionKey: "Symbol constant_kernel not found: \(error)"])
         }
         
-        kernelFn = unsafeBitCast(sym, to: (@convention(c) (UnsafePointer<UnsafeMutablePointer<Float>?>?, UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32, UnsafeMutableRawPointer?) -> Void).self)
+        kernelFn = unsafeBitCast(sym, to: (@convention(c) (UnsafePointer<UnsafeMutablePointer<Float>?>?, UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32, UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Void).self)
         
         print("✅ Custom kernel compiled and loaded successfully!")
     }
     
-    func getKernelFunction() -> (@convention(c) (UnsafePointer<UnsafeMutablePointer<Float>?>?, UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32, UnsafeMutableRawPointer?) -> Void)? {
+    func getKernelFunction() -> (@convention(c) (UnsafePointer<UnsafeMutablePointer<Float>?>?, UnsafePointer<UnsafeMutablePointer<Float>?>?, Int32, UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Void)? {
         return kernelFn
     }
     
@@ -148,13 +149,15 @@ class AudioGraphManager {
             process: kernelFn,
             init: nil,
             reset: nil,
-            migrate: nil
+            migrate: nil,
+            begin_event_slice: nil,
+            schedule_event: nil
         )
         
-        let customNode = add_node(lg, vtable, nil, "custom_kernel", 0, 1)
+        let customNode = add_node(lg, vtable, 0, "custom_kernel", 0, 1, nil, 0)
         
         // Connect custom node directly to DAC
-        _ = connect(lg, customNode, 0, lg.pointee.dac_node_id, 0)
+        _ = graph_connect(lg, customNode, 0, lg.pointee.dac_node_id, 0)
         
         print("✓ Created simple audio graph: custom_kernel -> DAC")
     }

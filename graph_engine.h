@@ -3,6 +3,14 @@
 
 #include "graph_types.h"
 
+extern _Atomic uint64_t g_param_push_count;
+extern _Atomic uint64_t g_param_push_fail_count;
+extern _Atomic uint64_t g_block_event_push_count;
+extern _Atomic uint64_t g_block_event_push_fail_count;
+
+// Floats past block_size every edge (and per-node discard) buffer carries.
+#define EDGE_BUFFER_PAD_FLOATS 64
+
 // ===================== Runtime Graph Types =====================
 
 // Live graph edge buffer
@@ -13,10 +21,24 @@ typedef struct {
   int src_node;  // who writes this edge
   int src_port;  // which output port
   int next_free; // free-list link (-1 = end of list; only valid when !in_use)
+  // Silence propagation (ap_set_output_silent): the render pass in which the
+  // source kernel last declared this buffer all zeros. Silent this pass iff
+  // it equals LiveGraph.render_pass; a kernel that never declares leaves it
+  // stale, so nothing needs resetting. Equal to the previous pass means the
+  // buffer still holds zeros (only its source writes it) over frames
+  // 0..silent_frames; passes vary in length, so a shorter silent pass must
+  // not vouch for the frames a longer one reads.
+  uint64_t silent_pass;
+  int silent_frames;
+  // Declared lane shape (ap_set_output_shape): valid only in the render pass
+  // equal to shape_pass, like silent_pass.
+  uint64_t shape_pass;
+  int shape;
 } LiveEdge;
 
 typedef struct RTNode {
   uint64_t logical_id; // stable ID for migration/params
+  char *debug_name;
   NodeVTable vtable;
   void *state;       // aligned, preallocated
   size_t state_size; // size of allocated state for watch list copying
@@ -41,6 +63,25 @@ typedef struct RTNode {
   float *cached_inInline[MAX_IO];
   float *cached_outInline[MAX_IO];
   bool io_cache_valid;     // False if topology changed, needs rebuild
+  // Private discard buffers for this node's unconnected outputs: one
+  // (block_size + EDGE_BUFFER_PAD_FLOATS) run per unconnected port, in port
+  // order, null_out_capacity runs. Reserved in the edit phase
+  // (node_reserve_unconnected_outputs), never shrunk, never allocated by the
+  // IO-cache rebuild. Unconnected ports never share a buffer with another
+  // port or another node, so a host can read back an unrouted channel (DGen
+  // probes / @amp) after process. NULL = none.
+  float *null_out;
+  int null_out_capacity;
+  uint32_t io_generation;  // Bumped per IO rebuild; see ap_current_node_io_generation
+  // Bumped whenever a param or bulk state write changes this node's state
+  // (apply_params, apply_write_node_state); a write of identical bits does
+  // not count. See ap_current_node_state_writes.
+  uint32_t state_writes;
+
+  // Output meter: 0 = unmetered, otherwise (slot index + 1) into
+  // LiveGraph.node_meters. Zeroed with the node, so a reused node id starts
+  // unmetered. Written only by the audio thread (GE_SET_NODE_METER).
+  int32_t meter_slot;
 
   // scheduling
   int32_t *succ; // successor node indices
@@ -53,23 +94,20 @@ typedef struct {
   int channel_count;
 } BufferDesc;
 
-#define TELEMETRY_MAX_SLOTS 16
+// Per-node output meter. A fixed table that is never reallocated, so the UI
+// reads it lock-free while the graph grows. The audio thread max-accumulates
+// the absolute peak of the node's first two outputs (float bits; non-negative
+// floats order the same as their bit patterns) and counts metered blocks; the
+// reader exchanges the peaks back to zero, so each read sees everything since
+// the previous one and applies its own ballistics.
+#define AP_NODE_METER_CAPACITY 256
 
-typedef struct TelemetryDesc {
-  _Atomic uint32_t slots[TELEMETRY_MAX_SLOTS];
-  int slot_count;
-  bool in_use;
-} TelemetryDesc;
-
-// Per-process-call context passed as the final NodeVTable.process argument.
-// Historically this argument was BufferDesc*. Keep buffers here, and add future
-// graph-owned realtime resources (telemetry/event queues) without expanding the
-// process function ABI again.
-typedef struct ProcessContext {
-  BufferDesc *buffers;
-  TelemetryDesc *telemetry;
-  int telemetry_count;
-} ProcessContext;
+typedef struct NodeMeterSlot {
+  _Atomic int32_t node_id; // owning node, -1 = free (claimed by the UI side)
+  _Atomic uint32_t peak_l_bits;
+  _Atomic uint32_t peak_r_bits;
+  _Atomic uint32_t blocks; // metered blocks run; stalls when the node is gone
+} NodeMeterSlot;
 
 // ===================== Live Editing System =====================
 
@@ -81,10 +119,10 @@ typedef struct RetireEntry {
 typedef struct LiveGraph {
   // --- Node & edge storage ---
   RTNode *nodes;
+  uint64_t render_pass; // bumped per process_live_block_internal (silence)
+  int render_nframes;   // that pass's frame count
   BufferDesc *buffers;
-  TelemetryDesc *telemetry;
   int node_count, node_capacity, buffer_count, buffer_capacity;
-  int telemetry_count, telemetry_capacity;
   LiveEdge *edges;
   int edge_capacity;
   int edge_free_head; // head of free-list threading through LiveEdge.next_free
@@ -102,12 +140,29 @@ typedef struct LiveGraph {
     int32_t *source_nodes; // cached source node IDs (indegree=0, has outputs)
     int source_count;
     int source_capacity;
+    // Serial plan: every scheduled node in a valid execution order, rebuilt
+    // with the cache. order_count <= 0 means "no plan, use the ready queue".
+    // Sized node_capacity and grown with the other per-node arrays.
+    int32_t *order;
+    int order_count;
     int cached_total_jobs;
     bool has_cycle;
     bool dirty;            // true when topology changed, triggers cache rebuild
+    bool *completed_this_block; // per-node flag: set at completion site, cleared at block start
   } sched;
 
   ParamRing *params;
+  BlockEventRing *block_events;
+  GraphBlockEvent *block_event_scratch;
+  GraphBlockEvent *block_event_sort_scratch;
+  int block_event_scratch_capacity;
+  int block_event_scratch_count;
+  _Atomic uint64_t block_event_serial;
+  // Delivery failures are graph-local so strict offline drivers can reject a
+  // partial render without depending on logs or another graph's counters.
+  _Atomic uint64_t block_event_delivery_failures;
+  _Atomic uint64_t control_submission_failures;
+  _Atomic uint64_t graph_edit_delivery_failures;
 
   int dac_node_id;
   int num_channels;
@@ -132,17 +187,24 @@ typedef struct LiveGraph {
   _Atomic uint64_t active_edit_batch_serial;
   _Atomic uint64_t next_edit_batch_serial;
   _Atomic uint64_t committed_edit_batch_serial;
+  // Highest committed batch fully consumed by apply_graph_edits on the audio
+  // thread. Producers use this as an explicit reclamation fence for resources
+  // referenced by nodes removed in an earlier batch.
+  _Atomic uint64_t applied_edit_batch_serial;
 
   // --- Watch list & state monitoring ---
   struct {
     int *list;
     int count;
     int capacity;
+    _Atomic uint32_t update_counter;
     pthread_mutex_t mutex;
     void **snapshots;        // state copies indexed by node_id
     size_t *sizes;           // state sizes indexed by node_id
     pthread_rwlock_t lock;
   } watch;
+
+  NodeMeterSlot *node_meters; // [AP_NODE_METER_CAPACITY], see NodeMeterSlot
 
 } LiveGraph;
 
@@ -156,6 +218,10 @@ typedef struct Engine {
 
   _Atomic(LiveGraph *) workSession; // published at block start, NULL after
   _Atomic int sessionFrames;        // number of frames for current block
+  // Closed bit plus worker reference count. A worker must acquire a reference
+  // before reading workSession or any graph data. The render owner closes the
+  // gate and waits for all references before reusing or destroying the graph.
+  _Atomic uint32_t sessionUsers;
 
   // Block-start wake mechanism
   pthread_mutex_t sess_mtx; // protects sess_cv wait/signal
@@ -170,11 +236,44 @@ typedef struct Engine {
   _Atomic int oswg_join_pending; // set to 1 to wake workers for workgroup join
   _Atomic int oswg_join_remaining; // count of workers that need to see the flag
   _Atomic int oswg_version;      // incremented on each workgroup change for re-join detection
+  _Atomic int *workerWorkgroupErrors; // join result for each acknowledged worker
   _Atomic int rt_log; // enable lightweight debug prints from workers
-  _Atomic int rt_time_constraint; // apply Mach RT time-constraint policy
+  _Atomic int graph_log; // enable per-block audiograph scheduler/output trace
+  _Atomic int rt_scheduling; // apply the platform realtime worker policy
+  _Atomic int rt_priority; // SCHED_FIFO priority on Linux
+
+  // Actual scheduling observed after each Linux thread's promotion attempt.
+  // Per-worker slots let the public snapshot detect a partial/mixed outcome.
+  _Atomic int *workerPolicies;
+  _Atomic int *workerPriorities;
+  _Atomic int workerStartupCount;
+  pthread_mutex_t workerStartupMtx;
+  pthread_cond_t workerStartupCv;
+  _Atomic int callbackPolicy;
+  _Atomic int callbackPriority;
+  _Atomic int callbackReported;
 } Engine;
 
+// `worker_policy` and `callback_policy` are native pthread_getschedparam policy
+// values (SCHED_OTHER/SCHED_FIFO/SCHED_RR). Keeping the achieved native policy
+// makes this API able to report an rtkit SCHED_RR grant as well as direct FIFO.
+#define ENGINE_SCHED_POLICY_UNKNOWN (-1)
+#define ENGINE_SCHED_POLICY_MIXED (-2)
+#define ENGINE_SCHED_PRIORITY_MIXED (-1)
+typedef struct EngineRtStatus {
+  int worker_count;
+  int workers_reported;
+  int worker_policy;
+  int worker_priority;
+  int callback_reported;
+  int callback_policy;
+  int callback_priority;
+} EngineRtStatus;
+
 void engine_start_workers(int workers);
+// Stop rendering before stopping the pool. Completed render calls have already
+// released all worker graph references, so their graphs may be destroyed while
+// the pool remains alive. Pool lifecycle calls are serialized by the host.
 void engine_stop_workers(void);
 void apply_params(LiveGraph *g);
 
@@ -183,18 +282,74 @@ void apply_params(LiveGraph *g);
 // from the audio unit. No-ops on platforms without OS Workgroup support.
 void engine_set_os_workgroup(void *oswg);
 void engine_clear_os_workgroup(void);
+// Control-thread-only snapshots. Pool lifecycle and binding calls must be
+// serialized by the host. Binding retains its own reference and synchronously
+// waits for every worker to leave/join before releasing the previous group.
+typedef struct EngineWorkgroupStatus {
+  int supported;
+  int assigned;
+  int generation;
+  int worker_count;
+  int joined_workers;
+  int failed_workers;
+  int pending_workers;
+  int first_error;
+} EngineWorkgroupStatus;
+void engine_get_workgroup_status(EngineWorkgroupStatus *status);
+void engine_release_os_workgroup(void *oswg);
 
 // Enable or disable minimal worker join logging (off by default).
 void engine_enable_rt_logging(int enable);
+void engine_enable_graph_logging(int enable);
 
-// Enable/disable Mach time-constraint scheduling for workers (Apple only).
-void engine_enable_rt_time_constraint(int enable);
+// Enable/disable platform realtime scheduling for workers. macOS uses Mach
+// time constraints; Linux uses SCHED_FIFO.
+void engine_enable_rt_scheduling(int enable);
+void engine_set_rt_priority(int priority);
+void engine_get_rt_status(EngineRtStatus *status);
+#ifdef __linux__
+typedef int (*EngineRtKitWorkerHook)(pid_t tid, int requested_priority);
+typedef int (*EngineRtKitCallbackHook)(pid_t tid, int requested_priority);
+// Optional host hooks. Null preserves the standalone C engine's graceful
+// SCHED_OTHER fallback without introducing a D-Bus or Rust link dependency.
+void engine_set_rtkit_hooks(EngineRtKitWorkerHook worker_hook,
+                            EngineRtKitCallbackHook callback_hook);
+#endif
+
+// Promote the calling thread to realtime scheduling. Intended for the audio
+// callback thread, which drives each block and helps drain the graph: on
+// Linux it gets SCHED_FIFO at the configured rt priority + 1 so it outranks
+// the workers it feeds. No-op on Apple (CoreAudio already delivers the
+// callback on a realtime thread) and when rt scheduling is disabled; a
+// permission failure is published to the non-RT Rust RealtimeKit helper; the
+// thread continues at normal priority if that fallback is unavailable.
+void engine_promote_current_thread_rt(void);
+#ifdef __linux__
+// Called by the RealtimeKit helper after its asynchronous callback-thread
+// request, to publish the native policy observed for that Linux TID.
+void engine_record_rtkit_callback_result(pid_t tid);
+#endif
+bool push_block_event(LiveGraph *lg, GraphBlockEvent event);
+uint64_t graph_block_event_delivery_failures(const LiveGraph *lg);
+uint64_t graph_control_submission_failures(const LiveGraph *lg);
+uint64_t graph_edit_delivery_failures(const LiveGraph *lg);
+// Exclusive render ownership required, as for process_next_block. Applies
+// committed edits and ordinary parameters without advancing any DSP state.
+bool prepare_graph_for_render(LiveGraph *lg);
 
 // ===================== Live Graph Operations =====================
 
 LiveGraph *create_live_graph(int initial_capacity, int block_size,
                              const char *label, int num_channels);
 void destroy_live_graph(LiveGraph *lg);
+// Per-node discard buffers for unconnected outputs (see RTNode.null_out).
+bool node_reserve_null_outputs(LiveGraph *lg, RTNode *node, int ports);
+bool node_reserve_unconnected_outputs(LiveGraph *lg, RTNode *node);
+void node_free_null_outputs(RTNode *node);
+bool node_output_is_null(const LiveGraph *lg, const RTNode *node,
+                         const float *buf);
+const float *ap_debug_node_null_outputs(LiveGraph *lg, int node_id,
+                                        int *capacity);
 int apply_add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
                    uint64_t logical_id, const char *name, int nInputs,
                    int nOutputs, const void *initial_state);
@@ -217,11 +372,15 @@ void process_live_block(LiveGraph *lg, int nframes);
 int add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
              const char *name, int nInputs, int nOutputs,
              const void *initial_state, size_t initial_state_size);
+int add_gain_node(LiveGraph *lg, float gain_value, const char *name);
 bool delete_node(LiveGraph *lg, int node_id);
 bool graph_connect(LiveGraph *lg, int src_node, int src_port, int dst_node,
                    int dst_port);
 void begin_graph_edit_batch(LiveGraph *lg);
 void end_graph_edit_batch(LiveGraph *lg);
+uint32_t graph_edit_queue_available(const LiveGraph *lg);
+uint64_t graph_edit_current_batch_serial(const LiveGraph *lg);
+uint64_t graph_edit_applied_batch_serial(const LiveGraph *lg);
 bool graph_disconnect(LiveGraph *lg, int src_node, int src_port, int dst_node,
                       int dst_port);
 
@@ -249,8 +408,25 @@ void retire_later(LiveGraph *lg, void *ptr, void (*deleter)(void *));
 bool add_node_to_watchlist(LiveGraph *lg, int node_id);
 bool remove_node_from_watchlist(LiveGraph *lg, int node_id);
 void *get_node_state(LiveGraph *lg, int node_id, size_t *state_size);
+bool get_node_state_into(LiveGraph *lg, int node_id, void *out,
+                         size_t out_capacity, size_t *state_size);
 
 void update_orphaned_status(LiveGraph *lg);
+
+// ===================== Node Output Meter API =====================
+
+// Claim a meter slot for node_id and ask the audio thread to meter it.
+// Returns the slot index, or -1 when the table is full.
+int graph_node_meter_attach(LiveGraph *lg, int node_id);
+// Re-send the attach edit for an already claimed slot (node id reused or the
+// edit was dropped). Idempotent.
+bool graph_node_meter_reattach(LiveGraph *lg, int slot);
+// Stop metering and release the slot.
+bool graph_node_meter_detach(LiveGraph *lg, int slot);
+// Take the peaks accumulated since the previous take (reset to zero) and the
+// running metered-block count.
+bool graph_node_meter_take(LiveGraph *lg, int slot, float *peak_l,
+                           float *peak_r, uint32_t *blocks);
 
 // ===================== Buffer API =====================
 
@@ -264,16 +440,12 @@ int create_buffer(LiveGraph *lg, int size, int channel_count,
 int hot_swap_buffer(LiveGraph *lg, int buffer_id, const float *source_data,
                     int size, int channel_count);
 
-// ===================== Telemetry API =====================
-// Graph-owned, small atomic slots for realtime-to-control communication.
-// Kernels write via ProcessContext; Swift/control code reads via LiveGraph.
-int create_telemetry(LiveGraph *lg, int slot_count);
-bool telemetry_read_u32(LiveGraph *lg, int telemetry_id, int slot, uint32_t *out);
-bool telemetry_read_i32(LiveGraph *lg, int telemetry_id, int slot, int32_t *out);
-bool telemetry_read_f32(LiveGraph *lg, int telemetry_id, int slot, float *out);
-void telemetry_store_u32(ProcessContext *ctx, int telemetry_id, int slot, uint32_t value);
-void telemetry_store_i32(ProcessContext *ctx, int telemetry_id, int slot, int32_t value);
-void telemetry_store_f32(ProcessContext *ctx, int telemetry_id, int slot, float value);
+// Bulk-write a block of floats into a node's state memory at dest_offset
+// (in floats). The write is queued and applied on the audio thread at a safe
+// point, like other graph edits. source_data is copied (caller may free it).
+// Returns true if the command was enqueued.
+bool write_node_state(LiveGraph *lg, int node_id, size_t dest_offset,
+                      const float *source_data, size_t count);
 
 // ===================== VTable Creation Functions =====================
 
