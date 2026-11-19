@@ -1806,9 +1806,14 @@ static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes) {
         if (lg->sched.is_orphaned[succ]) {
           continue;
         }
-        // Use release on decrement to ensure buffer writes are visible to successor
+        // Release publishes this node's output buffer to whoever runs the
+        // successor. Acquire is for the case where that is this thread: the
+        // decrement that reaches zero is then the only synchronisation with
+        // the successor's OTHER producers (no queue pop in between), so it
+        // must also acquire their buffer writes. With release alone the
+        // inline successor could read a stale input on weakly ordered CPUs.
         int prev_pending = atomic_fetch_sub_explicit(&lg->sched.pending[succ], 1,
-                                                     memory_order_release);
+                                                     memory_order_acq_rel);
         if (prev_pending == 1) {
           // Keep the most recent ready successor for ourselves; publish the
           // one we were holding so another thread can start on it now.
