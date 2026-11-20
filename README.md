@@ -344,6 +344,37 @@ When one output fans out to multiple destinations, all consumers **share the sam
 
 Edge allocation uses an **intrusive free-list** threaded through the edge pool. `alloc_edge()` pops from the head in O(1); `retire_edge()` pushes back. This replaces what was previously an O(n) linear scan of the edge pool.
 
+## Benchmarks
+
+Two real projects from [eseq](https://github.com/universalsequences/eseq), the sequencer this engine was built for, were recorded while playing: every node's cost in one render block and every connection. Each recording was then replayed on four engines, with every node replaced by a stand-in that costs what the real one did, so all four run the same graph and the same work.
+
+| project | nodes | connections | cost on one thread |
+|---|---|---|---|
+| 19 tracks | 2,774 | 4,570 | 13.2 ms |
+| 17 tracks | 1,878 | 3,117 | 7.0 ms |
+
+Time to render one 512-frame block at 48 kHz (deadline 10,667 µs), as median / slowest 1% / worst block in µs, with total CPU where it was recorded. Lower is better.
+
+| engine | 19 tracks, 5 threads | 19 tracks, 8 threads | 17 tracks, 5 threads | 17 tracks, 8 threads |
+|---|---|---|---|---|
+| **audiograph** | 3,615 / 3,672 / 4,330 (143%) | 2,704 / 2,743 / 2,897 (151%) | 3,435 / 3,478 / 3,508 (81%) | 3,153 / 3,187 / 3,258 (91%) |
+| [Tracktion Graph](https://github.com/Tracktion/tracktion_engine) | 3,680 / 3,809 / 4,402 | 2,977 / 3,097 / 3,303 | 3,555 / 3,660 / 3,819 | 3,350 / 3,418 / 3,496 |
+| [supernova](https://github.com/supercollider/supercollider) (SuperCollider) | 4,042 / 4,202 / 4,240 (188%) | 3,090 / 3,189 / 3,235 (230%) | 3,153 / 3,312 / 3,881 (148%) | 3,007 / 3,058 / 3,092 (222%) |
+| [libossia](https://github.com/ossia/libossia) (ossia score) | 3,745 / 4,161 / 4,331 | 2,895 / 3,142 / 3,490 (163%) | 3,495 / 3,716 / 3,830 | 3,266 / 3,424 / 3,487 |
+
+Five threads is what eseq runs (the audio callback plus four workers). Apple M1 Max, macOS, four repetitions of 1,000 blocks, blocks paced like a device callback inside an audio workgroup, output checked sample-for-sample against a one-thread render.
+
+What the numbers say:
+
+- On real projects the four engines are within about 15% of each other. A few dozen heavy nodes and the longest dependency chain decide the block time, and that leaves a scheduler little to win.
+- On the larger project audiograph is the fastest at every thread count, by 7–14% at 8 threads, and uses the least CPU.
+- On the smaller project supernova is 5–9% faster and uses about twice the CPU. audiograph is ahead of the other two.
+- These figures were taken with light background load, which keeps the cores at full speed. On a machine left completely alone every engine's worst blocks get slower and the order changes: Tracktion's semaphore pools had the steadiest worst case and missed no deadlines, audiograph missed 1 block in 96,000, libossia 17, supernova 728; and at 8 threads on the larger project libossia and supernova had lower medians than audiograph.
+
+Limits: one machine, one OS. The stand-ins are mono and reproduce each node's cost but not its memory traffic. Tracktion Graph is driven through its public node API, and supernova and libossia through their scheduler headers compiled unmodified, not through the full applications.
+
+The harness, the recorded graphs and every result file are in the eseq repository under [`tools/audiograph-bench`](https://github.com/universalsequences/eseq/tree/main/tools/audiograph-bench), along with results on synthetic graphs where the gaps between engines are much larger in both directions.
+
 ## Building
 
 ```bash
