@@ -136,6 +136,11 @@ bool apply_hot_swap(LiveGraph *lg, GEHotSwapNode *p) {
   n->state = new_state;
   n->state_size = p->state_size;
   n->vtable = p->vt;
+  // A different kernel: forget the old one's measured cost and time the next
+  // few blocks again (see update_node_priorities).
+  lg->sched.node_cost[id] = 0.0f;
+  lg->sched.cost_block = 0;
+  lg->sched.priority_stale = true;
 
   retire_later(lg, old_state, free);
 
@@ -234,6 +239,11 @@ bool apply_replace_keep_edges_internal(LiveGraph *lg, GEReplaceKeepEdges *p) {
   n->state = new_state;
   n->state_size = p->state_size;
   n->vtable = p->vt;
+  // A different kernel: forget the old one's measured cost and time the next
+  // few blocks again (see update_node_priorities).
+  lg->sched.node_cost[id] = 0.0f;
+  lg->sched.cost_block = 0;
+  lg->sched.priority_stale = true;
 
   retire_later(lg, old_state, free);
 

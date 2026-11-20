@@ -1327,8 +1327,12 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
   int32_t *new_source_nodes = malloc(new_source_capacity * sizeof(int32_t));
   int32_t *new_order = malloc((size_t)new_capacity * sizeof(int32_t));
   int32_t *new_pending_init = malloc((size_t)new_capacity * sizeof(int32_t));
+  float *new_node_cost = calloc((size_t)new_capacity, sizeof(float));
+  float *new_node_priority = calloc((size_t)new_capacity, sizeof(float));
+  int32_t *new_source_scratch = malloc((size_t)new_capacity * sizeof(int32_t));
 
-  if (!new_nodes || !new_pending || !new_completed || !new_indegree || !new_orphaned ||
+  if (!new_node_cost || !new_node_priority || !new_source_scratch ||
+      !new_nodes || !new_pending || !new_completed || !new_indegree || !new_orphaned ||
       !new_state_snapshots || !new_state_sizes || !new_source_nodes ||
       !new_order || !new_pending_init) {
     // Clean up any successful allocations
@@ -1350,6 +1354,9 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
       free(new_source_nodes);
     free(new_order);
     free(new_pending_init);
+    free(new_node_cost);
+    free(new_node_priority);
+    free(new_source_scratch);
     return false;
   }
 
@@ -1480,6 +1487,15 @@ static bool grow_node_capacity(LiveGraph *lg, int required_capacity) {
   lg->sched.order_count = -1;
   free(lg->sched.pending_init);
   lg->sched.pending_init = new_pending_init;
+  // Measured costs carry over; priorities are recomputed (dirty is set below).
+  if (lg->sched.node_cost)
+    memcpy(new_node_cost, lg->sched.node_cost, (size_t)old_capacity * sizeof(float));
+  free(lg->sched.node_cost);
+  lg->sched.node_cost = new_node_cost;
+  free(lg->sched.node_priority);
+  lg->sched.node_priority = new_node_priority;
+  free(lg->sched.source_scratch);
+  lg->sched.source_scratch = new_source_scratch;
   lg->sched.pending_init_count = 0; // rebuilt before use: dirty is set below
   lg->node_capacity = new_capacity;
   lg->sched.dirty = true;
@@ -1503,6 +1519,9 @@ fail:
   free(new_source_nodes);
   free(new_order);
   free(new_pending_init);
+  free(new_node_cost);
+  free(new_node_priority);
+  free(new_source_scratch);
   return false;
 }
 
@@ -1571,6 +1590,8 @@ int apply_add_node(LiveGraph *lg, NodeVTable vtable, size_t state_size,
   // They will be marked as non-orphaned when they get connected to the signal
   // path
   lg->sched.is_orphaned[node_id] = true;
+  lg->sched.node_cost[node_id] = 0.0f; // a reused id must not inherit a cost
+  lg->sched.node_priority[node_id] = 0.0f;
 
   // Update node_count to be highest allocated index + 1
   if (node_id >= lg->node_count) {
