@@ -103,6 +103,10 @@ static void graph_return_releases_waiters(void) {
         for (int i = 0; i < FRAMES; i++)
           assert(output[i] == (float)SOURCES);
         assert(atomic_load(&lg->sched.jobsInFlight) == 0);
+        // The block returns as soon as its jobs are done; workers leave the
+        // queue's wait just after. The engine waits for them here before the
+        // next block, an edit or a destroy.
+        engine_drain_work_session();
         assert(atomic_load(&lg->sched.readyQueue->waiters) == 0);
         assert(atomic_load(&g_engine.workSession) == NULL);
       }

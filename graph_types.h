@@ -278,21 +278,30 @@ typedef struct GraphEditQueue {
 #include <dispatch/dispatch.h>
 // macOS doesn't support POSIX unnamed semaphores, use dispatch_semaphore
 // instead
+// Three groups on separate cache lines: what every push and pop only reads,
+// the length every push and pop writes, and what only sleepers and the
+// block's end write.
 typedef struct {
   MPMCQueue *ring;            // Thread-safe node storage
+  dispatch_semaphore_t items; // Semaphore used for wakeups
+  char _pad0[AG_CACHE_LINE];
   _Atomic int qlen;           // Logical queue length
+  char _pad1[AG_CACHE_LINE];
   _Atomic int waiters;        // Number of threads waiting on items
   _Atomic bool finished;     // Completion is a wake condition, even with no items
-  dispatch_semaphore_t items; // Semaphore used for wakeups
+  char _pad2[AG_CACHE_LINE];
 } ReadyQ;
 #else
 #include <semaphore.h>
 typedef struct {
   MPMCQueue *ring;     // Thread-safe node storage
+  sem_t items;         // Semaphore used for wakeups
+  char _pad0[AG_CACHE_LINE];
   _Atomic int qlen;    // Logical queue length
+  char _pad1[AG_CACHE_LINE];
   _Atomic int waiters; // Number of threads waiting on items
   _Atomic bool finished;
-  sem_t items;         // Semaphore used for wakeups
+  char _pad2[AG_CACHE_LINE];
 } ReadyQ;
 #endif
 

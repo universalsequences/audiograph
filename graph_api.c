@@ -137,6 +137,7 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   lg->sched.source_nodes = calloc(lg->sched.source_capacity, sizeof(int32_t));
   lg->sched.source_count = 0;
   lg->sched.order = calloc((size_t)lg->node_capacity, sizeof(int32_t));
+  lg->sched.pending_init = calloc((size_t)lg->node_capacity, sizeof(int32_t));
   lg->sched.order_count = -1;
   lg->sched.cached_total_jobs = 0;
   lg->sched.has_cycle = false;
@@ -175,6 +176,8 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
 void destroy_live_graph(LiveGraph *lg) {
   if (!lg)
     return;
+  // Workers from the last rendered block may still be leaving its queue.
+  engine_drain_work_session_for(lg);
 
   // Free all edge buffers
   if (lg->edges) {
@@ -290,6 +293,7 @@ void destroy_live_graph(LiveGraph *lg) {
   if (lg->sched.source_nodes)
     free(lg->sched.source_nodes);
   free(lg->sched.order);
+  free(lg->sched.pending_init);
 
   // Free the graph itself
   free(lg);

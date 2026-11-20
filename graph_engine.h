@@ -136,15 +136,36 @@ typedef struct LiveGraph {
     int *indegree;         // maintained incrementally at edit time
     bool *is_orphaned;     // nodes unreachable from DAC
     ReadyQ *readyQueue;
+    // Written by whichever thread finishes a chain of nodes; everything around
+    // it is read by every thread for every node. Padded on both sides so those
+    // writes do not keep evicting the read-mostly fields from other cores.
+    char _pad_before_jobs[AG_CACHE_LINE];
     _Atomic int jobsInFlight;
+    char _pad_after_jobs[AG_CACHE_LINE];
     int32_t *source_nodes; // cached source node IDs (indegree=0, has outputs)
     int source_count;
     int source_capacity;
+    // Sources are handed out straight from source_nodes: a thread claims the
+    // next source_chunk of them by advancing this cursor. >= source_count
+    // means none left. Written only while sources remain, then read-only for
+    // the rest of the block.
+    int source_chunk;
+    char _pad_before_cursor[AG_CACHE_LINE];
+    _Atomic int source_cursor;
+    char _pad_after_cursor[AG_CACHE_LINE];
     // Serial plan: every scheduled node in a valid execution order, rebuilt
     // with the cache. order_count <= 0 means "no plan, use the ready queue".
     // Sized node_capacity and grown with the other per-node arrays.
     int32_t *order;
     int order_count;
+    // What each node's pending count starts a block at: its indegree, or -1
+    // if it is deleted or orphaned and must never run. Rebuilt with the cache
+    // (the job count and source list already depend on the same facts), so the
+    // per-block reset is one pass over this array instead of reading every
+    // node record. Sized node_capacity; valid for the first
+    // pending_init_count nodes (the node count at the last rebuild).
+    int32_t *pending_init;
+    int pending_init_count;
     int cached_total_jobs;
     bool has_cycle;
     bool dirty;            // true when topology changed, triggers cache rebuild
@@ -275,6 +296,20 @@ void engine_start_workers(int workers);
 // released all worker graph references, so their graphs may be destroyed while
 // the pool remains alive. Pool lifecycle calls are serialized by the host.
 void engine_stop_workers(void);
+// Blocks until no worker still references the last rendered graph. RENDER
+// THREAD ONLY: it clears the session the render thread publishes. The engine
+// calls it itself before each block.
+void engine_drain_work_session(void);
+// The same wait for one graph, safe from any thread while that graph is not
+// being rendered: used before the graph is freed. It leaves the session alone
+// if the render thread has since moved on to another graph.
+void engine_drain_work_session_for(LiveGraph *lg);
+
+// A deleted node slot: no process function and no ports.
+static inline bool node_is_deleted(const RTNode *node) {
+  return node && node->vtable.process == NULL && node->nInputs == 0 &&
+         node->nOutputs == 0;
+}
 void apply_params(LiveGraph *g);
 
 // Optional: supply an OS Workgroup object
