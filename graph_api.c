@@ -138,6 +138,12 @@ LiveGraph *create_live_graph(int initial_capacity, int block_size,
   lg->sched.source_count = 0;
   lg->sched.order = calloc((size_t)lg->node_capacity, sizeof(int32_t));
   lg->sched.pending_init = calloc((size_t)lg->node_capacity, sizeof(int32_t));
+  lg->sched.node_cost = calloc((size_t)lg->node_capacity, sizeof(float));
+  lg->sched.node_priority = calloc((size_t)lg->node_capacity, sizeof(float));
+  lg->sched.source_scratch = calloc((size_t)lg->node_capacity, sizeof(int32_t));
+  lg->sched.cost_block = 0;
+  lg->sched.cost_measuring = false;
+  lg->sched.priority_stale = false;
   lg->sched.order_count = -1;
   lg->sched.cached_total_jobs = 0;
   lg->sched.has_cycle = false;
@@ -294,6 +300,9 @@ void destroy_live_graph(LiveGraph *lg) {
     free(lg->sched.source_nodes);
   free(lg->sched.order);
   free(lg->sched.pending_init);
+  free(lg->sched.node_cost);
+  free(lg->sched.node_priority);
+  free(lg->sched.source_scratch);
 
   // Free the graph itself
   free(lg);

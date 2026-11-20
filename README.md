@@ -338,11 +338,52 @@ osc2 ──┘
 
 The SUM node grows its input count as more sources connect and **collapses back to a direct connection** when reduced to one input. Users see logical point-to-point connections; the SUM management is fully automatic. SUM nodes are tracked per-port via `fanin_sum_node_id[]` so each input port on a node can independently have its own auto-sum.
 
+### Critical-path-first scheduling
+
+A block cannot finish sooner than its longest chain of dependent nodes, so that chain should never wait. The engine times every node on the first few blocks after the graph changes and on one block in 128 after that. Between blocks the audio thread gives each node a priority: its own cost plus the largest priority among its successors, which is the time the block still needs once that node starts. Then:
+
+- sources are handed out in priority order,
+- a thread that makes two successors ready keeps the more urgent one and publishes the other,
+- ready nodes are taken before unclaimed sources.
+
+The bookkeeping is one linear pass over nodes and edges and a counting sort of the sources, with no allocation. Build with `-DAUDIOGRAPH_CRITICAL_PATH_FIRST=0` for the old order (sources first, then first-in-first-out).
+
 ### Edge Sharing & Free-List
 
 When one output fans out to multiple destinations, all consumers **share the same buffer** — no copying. A reference count tracks consumers; the edge is retired when the last consumer disconnects.
 
 Edge allocation uses an **intrusive free-list** threaded through the edge pool. `alloc_edge()` pops from the head in O(1); `retire_edge()` pushes back. This replaces what was previously an O(n) linear scan of the edge pool.
+
+## Benchmarks
+
+Two real projects from [eseq](https://github.com/universalsequences/eseq), the sequencer this engine was built for, were recorded while playing: every node's cost in one render block and every connection. Each recording was then replayed on four engines, with every node replaced by a stand-in that costs what the real one did, so all four run the same graph and the same work.
+
+| project | nodes | connections | cost on one thread | longest dependency chain |
+|---|---|---|---|---|
+| 19 tracks | 2,774 | 4,570 | 13.2 ms | 1.8 ms |
+| 17 tracks | 1,878 | 3,117 | 7.0 ms | 2.5 ms |
+
+Time to render one 512-frame block at 48 kHz, as median / slowest 1% / worst block in µs, with total CPU where it was recorded. Lower is better.
+
+| engine | 19 tracks, 7 threads | 19 tracks, 8 threads | 17 tracks, 7 threads | 17 tracks, 8 threads |
+|---|---|---|---|---|
+| **audiograph** | 2,532 / 2,588 / 2,855 (147%) | 2,303 / 2,341 / 2,546 (149%) | 2,743 / 2,769 / 2,790 (86%) | 2,745 / 2,774 / 2,894 (88%) |
+| [Tracktion Graph](https://github.com/Tracktion/tracktion_engine) | 3,077 / 3,258 / 4,127 | 2,963 / 3,114 / 3,492 | 3,434 / 3,506 / 3,716 | 3,367 / 3,463 / 3,567 |
+| [supernova](https://github.com/supercollider/supercollider) (SuperCollider) | 3,333 / 3,440 / 3,640 (218%) | 3,093 / 3,196 / 3,271 (230%) | 3,029 / 3,087 / 3,110 (197%) | 3,012 / 3,060 / 3,079 (222%) |
+| [libossia](https://github.com/ossia/libossia) (ossia score) | 3,093 / 3,417 / 3,622 (160%) | 2,893 / 3,125 / 3,442 (163%) | 3,329 / 3,504 / 3,665 (101%) | 3,259 / 3,430 / 3,485 (105%) |
+
+Seven threads is what eseq runs on this machine (the audio callback plus six workers). Apple M1 Max, macOS, four repetitions of 1,000 blocks, blocks paced like a device callback inside an audio workgroup, output checked sample-for-sample against a one-thread render, light background load so the cores stay at full speed.
+
+What the numbers say:
+
+- audiograph has the lowest median in every cell measured (both projects, a typical and the busiest recorded block, 5, 7 and 8 threads), by 2–20% over the next engine, and uses the least CPU.
+- On the 19-track project it leads by 18–20%. On the 17-track project it leads by 9% and no longer gains from more threads: the block is within 9% of the longest dependency chain, which no scheduler can go under.
+- The lead comes from scheduling order (see [Critical-path-first scheduling](#critical-path-first-scheduling)). Before it, the four engines were within about 15% of each other and supernova was 5–9% ahead on the 17-track project.
+- Inside eseq itself, playing the same two projects through the real audio device, that change lowered the callback median by 5% (17 tracks) and 15% (19 tracks).
+
+Limits: one machine, one OS. The stand-ins are mono and reproduce each node's cost but not its memory traffic. The recordings were taken while macOS had the cores clocked down, so the absolute times above are higher than eseq's at full speed (about 1.7–1.8 ms per block for both projects); the ratios between engines are what to read. Tracktion Graph is driven through its public node API, and supernova and libossia through their scheduler headers compiled unmodified, not through the full applications. On a machine left completely idle every engine's worst blocks get slower; in an earlier run of that kind Tracktion's semaphore pools had the steadiest worst case.
+
+The harness, the recorded graphs and every result file are in the eseq repository under [`tools/audiograph-bench`](https://github.com/universalsequences/eseq/tree/main/tools/audiograph-bench), along with results on synthetic graphs.
 
 ## Building
 

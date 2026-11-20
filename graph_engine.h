@@ -166,6 +166,18 @@ typedef struct LiveGraph {
     // pending_init_count nodes (the node count at the last rebuild).
     int32_t *pending_init;
     int pending_init_count;
+    // Critical-path-first scheduling (see update_node_priorities). node_cost
+    // is each node's measured run time in clock ticks, smoothed; node_priority
+    // is the cost of the longest chain from the node to the end of the graph.
+    // Both are sized node_capacity. node_cost is written by whichever thread
+    // runs the node, on measured blocks only; node_priority and the flags are
+    // written by the audio thread between blocks.
+    float *node_cost;
+    float *node_priority;
+    int32_t *source_scratch; // node_capacity; where the source list is re-sorted
+    uint32_t cost_block;     // blocks through the ready queue since the last rebuild
+    bool cost_measuring;     // nodes are being timed during this block
+    bool priority_stale;     // costs or topology changed since priorities were set
     int cached_total_jobs;
     bool has_cycle;
     bool dirty;            // true when topology changed, triggers cache rebuild

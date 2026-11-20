@@ -85,6 +85,22 @@ _Atomic uint64_t g_block_event_push_fail_count = 0;
 #define AUDIOGRAPH_CALLBACK_EMPTY_SPINS 64
 #endif
 
+// Critical-path-first scheduling: run the node that heads the longest
+// remaining chain of work before anything else that is ready. 0 restores the
+// old order (sources first, then first-in-first-out). With it on, ready
+// nodes are taken before unclaimed sources even before any cost is known.
+#ifndef AUDIOGRAPH_CRITICAL_PATH_FIRST
+#define AUDIOGRAPH_CRITICAL_PATH_FIRST 1
+#endif
+
+// Nodes are timed during the first few parallel blocks after a topology
+// change and then on one block in this many. Timing costs two clock reads per
+// node, so it is kept off most blocks.
+#ifndef AUDIOGRAPH_COST_MEASURE_PERIOD
+#define AUDIOGRAPH_COST_MEASURE_PERIOD 128
+#endif
+#define AUDIOGRAPH_COST_MEASURE_WARMUP 4
+
 // Polls before the callback's FIRST park after it last found work. The usual
 // reason it runs dry is that the block is nearly over and the workers are
 // finishing their last nodes, tens of microseconds away; a park there costs a
@@ -1288,7 +1304,18 @@ static void *worker_main(void *arg) {
       // Modest spin to catch bursts without kernel call, then short timed wait.
       // (A longer spin before the first park was measured: no effect on block
       // time at 1024 or 4096 polls.)
+      // Ready nodes before fresh sources: a ready node is further along a
+      // chain than any source, and sources are handed out most-urgent first.
+#if AUDIOGRAPH_CRITICAL_PATH_FIRST
+      // Sources this thread already claimed come first of all: nobody else
+      // can run them.
+      bool got = (src_next < src_end &&
+                  next_source_node(lg, &src_next, &src_end, &nid)) ||
+                 rq_try_pop(lg->sched.readyQueue, &nid) ||
+                 next_source_node(lg, &src_next, &src_end, &nid);
+#else
       bool got = next_source_node(lg, &src_next, &src_end, &nid);
+#endif
       for (int s = 0; !got && s < AUDIOGRAPH_WORKER_EMPTY_SPINS; s++) {
         if ((got = rq_try_pop(lg->sched.readyQueue, &nid)))
           break;
@@ -1823,6 +1850,96 @@ void bind_and_run_live(LiveGraph *lg, int nid, int nframes) {
 }
 
 
+#if AUDIOGRAPH_CRITICAL_PATH_FIRST
+// Monotonic clock in whatever unit is cheapest to read. Costs are only ever
+// compared with each other, so the unit does not matter.
+static inline uint64_t cost_clock(void) {
+#ifdef __APPLE__
+  return mach_absolute_time();
+#else
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+}
+
+// Sources are started in priority order, but only coarsely: priorities are
+// cut into this many bands, and sorting by band is stable. Exact order would
+// reshuffle hundreds of near-equal sources every time their measured costs
+// wobble; within a band they stay in the order they were in, which starts as
+// node-id order, the order their buffers were allocated in.
+#define SOURCE_PRIORITY_BANDS 64
+
+// Recompute every scheduled node's priority from the measured costs and put
+// the source list in priority order. Audio thread, between blocks, with no
+// worker in the session. No allocation, and linear: one pass over nodes and
+// edges and a counting sort of the sources.
+//
+// A node's priority is its own cost plus the largest priority among its
+// successors: the time the block still needs after this node starts, however
+// many threads there are. Running the highest-priority ready node first keeps
+// the longest dependency chain moving instead of leaving it queued behind
+// cheap unrelated nodes.
+static void update_node_priorities(LiveGraph *lg) {
+  lg->sched.priority_stale = false;
+  const int count = lg->sched.order_count;
+  if (count <= 0)
+    return; // no topological order to walk (cycle, or diagnostics build)
+  const int32_t *order = lg->sched.order;
+  float *priority = lg->sched.node_priority;
+  const float *cost = lg->sched.node_cost;
+  float top = 0.0f;
+  for (int k = count - 1; k >= 0; k--) {
+    const int nid = order[k];
+    const RTNode *node = &lg->nodes[nid];
+    float downstream = 0.0f;
+    for (int i = 0; i < node->succCount; i++) {
+      const int succ = node->succ[i];
+      if (succ < 0 || succ >= lg->node_count || lg->sched.is_orphaned[succ])
+        continue;
+      if (priority[succ] > downstream)
+        downstream = priority[succ];
+    }
+    priority[nid] = cost[nid] + downstream;
+    if (priority[nid] > top)
+      top = priority[nid];
+  }
+  const int n = lg->sched.source_count;
+  if (top <= 0.0f || n < 2 || n > lg->node_capacity)
+    return; // nothing measured yet, or nothing to order
+
+  // Stable counting sort, highest band first.
+  int32_t *src = lg->sched.source_nodes;
+  int32_t *sorted = lg->sched.source_scratch;
+  const float band_scale = (float)(SOURCE_PRIORITY_BANDS - 1) / top;
+  int start[SOURCE_PRIORITY_BANDS + 1] = {0};
+  for (int i = 0; i < n; i++)
+    start[SOURCE_PRIORITY_BANDS - 1 - (int)(priority[src[i]] * band_scale)]++;
+  for (int b = 0, at = 0; b < SOURCE_PRIORITY_BANDS; b++) {
+    const int in_band = start[b];
+    start[b] = at;
+    at += in_band;
+  }
+  for (int i = 0; i < n; i++)
+    sorted[start[SOURCE_PRIORITY_BANDS - 1 - (int)(priority[src[i]] * band_scale)]++] = src[i];
+  memcpy(src, sorted, (size_t)n * sizeof(int32_t));
+}
+
+// Start of a block that runs through the ready queue: fold in the costs
+// measured last block and decide whether to measure this one.
+static inline void begin_block_priorities(LiveGraph *lg) {
+  if (lg->sched.cost_measuring)
+    lg->sched.priority_stale = true;
+  if (lg->sched.priority_stale)
+    update_node_priorities(lg);
+  const uint32_t block = lg->sched.cost_block++;
+  // Without a serial plan priorities are never computed, so do not time.
+  lg->sched.cost_measuring = lg->sched.order_count > 0 &&
+                             (block < AUDIOGRAPH_COST_MEASURE_WARMUP ||
+                              block % AUDIOGRAPH_COST_MEASURE_PERIOD == 0);
+}
+#endif
+
 static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes) {
   // Runs `nid`, then keeps going on this thread with one of the successors it
   // made ready. A node whose last input just arrived cannot have been seen by
@@ -1847,6 +1964,26 @@ static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes) {
 #if AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
     atomic_store_explicit(&g_inflight_node_ids[g_current_execution_slot], nid,
                           memory_order_release);
+#endif
+#if AUDIOGRAPH_CRITICAL_PATH_FIRST
+    if (lg->sched.cost_measuring) {
+      const uint64_t started = cost_clock();
+      bind_and_run_live(lg, nid, nframes);
+      float took = (float)(cost_clock() - started);
+      // Smoothed, and a reading far above the running cost is clipped, so a
+      // run that was preempted moves the node a little, not to the front of
+      // the graph. A node never measured before (cost 0) has nothing to
+      // clip against and takes its first reading as is; the warm-up blocks
+      // that follow pull a bad one back.
+      float *cost = &lg->sched.node_cost[nid];
+      if (*cost > 0.0f) {
+        if (took > 4.0f * *cost)
+          took = 4.0f * *cost;
+        *cost += 0.25f * (took - *cost);
+      } else {
+        *cost = took;
+      }
+    } else
 #endif
     bind_and_run_live(lg, nid, nframes); // uses silence/scratch for missing ports
 
@@ -1875,8 +2012,18 @@ static inline void execute_and_fanout(LiveGraph *lg, int32_t nid, int nframes) {
         int prev_pending = atomic_fetch_sub_explicit(&lg->sched.pending[succ], 1,
                                                      memory_order_acq_rel);
         if (prev_pending == 1) {
-          // Keep the most recent ready successor for ourselves; publish the
-          // one we were holding so another thread can start on it now.
+          // Keep one ready successor for ourselves and publish the other so
+          // another thread can start on it now: the one heading the longer
+          // remaining chain stays here, where it starts with no queue
+          // round-trip. On a tie (no costs measured yet) the most recent
+          // one stays.
+#if AUDIOGRAPH_CRITICAL_PATH_FIRST
+          if (next >= 0 && lg->sched.node_priority[succ] <
+                               lg->sched.node_priority[next]) {
+            schedule_ready_node(lg, succ, nframes);
+            continue;
+          }
+#endif
           if (next >= 0)
             schedule_ready_node(lg, next, nframes);
           next = succ;
@@ -2710,6 +2857,11 @@ static void rebuild_scheduling_cache(LiveGraph *lg) {
 #if !AUDIOGRAPH_ENABLE_STALL_DIAGNOSTICS
   build_serial_order(lg, totalJobs);
 #endif
+  // The source list was just rebuilt in id order and the chains changed:
+  // re-derive priorities from the costs already known, and time the next few
+  // blocks to pick up nodes that are new.
+  lg->sched.priority_stale = true;
+  lg->sched.cost_block = 0;
   lg->sched.dirty = false;
 }
 
@@ -2867,6 +3019,9 @@ static void process_live_block_internal(LiveGraph *lg, int nframes, bool update_
     return;
   }
 
+#if AUDIOGRAPH_CRITICAL_PATH_FIRST
+  begin_block_priorities(lg);
+#endif
   int active_workers = choose_active_worker_count(lg);
   atomic_store_explicit(&g_engine.activeWorkerLimit, active_workers,
                         memory_order_release);
@@ -2907,8 +3062,15 @@ static void process_live_block_internal(LiveGraph *lg, int nframes, bool update_
 #endif
     int src_next = 0, src_end = 0; // the callback's claim on the source list
     while (atomic_load_explicit(&lg->sched.jobsInFlight, memory_order_acquire) > 0) {
+#if AUDIOGRAPH_CRITICAL_PATH_FIRST
+      if ((src_next < src_end &&
+           next_source_node(lg, &src_next, &src_end, &nid)) ||
+          rq_try_pop(lg->sched.readyQueue, &nid) ||
+          next_source_node(lg, &src_next, &src_end, &nid)) {
+#else
       if (next_source_node(lg, &src_next, &src_end, &nid) ||
           rq_try_pop(lg->sched.readyQueue, &nid)) {
+#endif
         if (!try_execute_ready_node(lg, nid, nframes)) {
           continue;
         }
